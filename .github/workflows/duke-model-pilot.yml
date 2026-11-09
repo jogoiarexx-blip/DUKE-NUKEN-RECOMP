@@ -1,0 +1,36 @@
+name: Duke GLB pilot - original art (sem disco)
+on:
+  push:
+    paths:
+      - "recomp/tools/local/build_duke_pilot.py"
+      - "recomp/tools/local/character_model.py"
+      - "recomp/tests/local/test_duke_pilot_generator.py"
+      - ".github/workflows/duke-model-pilot.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-pilot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Preview rendering dependency
+        run: python -m pip install "Pillow>=10,<13"
+      - name: Generate original 19-part GLB prototype
+        run: python recomp/tools/local/build_duke_pilot.py --out /tmp/duke-pilot
+      - name: Check native rig contract
+        run: |
+          python recomp/tools/local/character_model.py /tmp/duke-pilot/model.json --json
+          python -m unittest discover -s recomp/tests/local -p test_duke_pilot_generator.py -v
+      - name: Publish generated GLB and 3-angle image in Actions artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: duke-19-part-original-pilot-not-yet-in-game
+          path: /tmp/duke-pilot/
+          retention-days: 14
