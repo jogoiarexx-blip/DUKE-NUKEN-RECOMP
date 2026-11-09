@@ -1,0 +1,78 @@
+name: Windows x64 - recompiladores (sem disco do jogo)
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/windows-source-smoke.yml"
+      - "recomp/**"
+      - ".gitmodules"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-x64-source:
+    name: MSVC x64 - ferramentas de recompilacao
+    runs-on: windows-2022
+    timeout-minutes: 35
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Obter fonte e submodulos
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Preparar Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Validar arquivos e Python
+        run: |
+          python scripts/ci/check_repo.py
+          python -m compileall -q recomp/tools/local
+
+      - name: Aplicar patches do projeto ao framework
+        run: |
+          python recomp/tools/local/apply_runtime_patches.py
+          python recomp/tools/local/apply_runtime_patches.py
+
+      - name: Configurar e compilar verificador de imagem de disco
+        run: |
+          cmake -S recomp/tools/local -B build-windows/validator -G "Visual Studio 17 2022" -A x64 -DCMAKE_BUILD_TYPE=Release
+          cmake --build build-windows/validator --config Release --parallel 4
+
+      - name: Configurar recompiladores PS1 sem dependencias de midia comercial
+        run: |
+          cmake -S recomp/psxrecomp/recompiler -B build-windows/recompiler -G "Visual Studio 17 2022" -A x64 -DPSXRECOMP_ENABLE_CHD=OFF -DBUILD_TESTING=OFF
+
+      - name: Compilar emissor do jogo e emissor de BIOS no Windows
+        run: |
+          cmake --build build-windows/recompiler --config Release --target psxrecomp-game psxrecomp-bios --parallel 4
+
+      - name: Verificar arquivos de saida
+        run: |
+          $binaries = @(
+            "build-windows/validator/Release/sector_check.exe",
+            "build-windows/recompiler/Release/psxrecomp-game.exe",
+            "build-windows/recompiler/Release/psxrecomp-bios.exe"
+          )
+          foreach ($file in $binaries) {
+            if (-not (Test-Path $file)) { throw "Ferramenta ausente: $file" }
+            Write-Host "Compilado: $file"
+          }
+
+      - name: Disponibilizar ferramentas x64 para desenvolvimento (nao o jogo)
+        uses: actions/upload-artifact@v4
+        with:
+          name: duke-ttk-ferramentas-windows-x64-sem-jogo
+          if-no-files-found: error
+          retention-days: 7
+          path: |
+            build-windows/validator/Release/sector_check.exe
+            build-windows/recompiler/Release/psxrecomp-game.exe
+            build-windows/recompiler/Release/psxrecomp-bios.exe
