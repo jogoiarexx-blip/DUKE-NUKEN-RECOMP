@@ -31,6 +31,23 @@ static int g_ws_bd_stretch_on, s_bd_gate;
 static int s_geo_prog, s_geo_vao, s_geo_vbo, s_geo_uXoff, s_geo_uXhalf;
 static int s_geo_uXscale, s_geo_uXcenter;
 static int depth_enabled, draws, uploaded_n, expected_depth, wide_active;
+/* D50 deferred-wide mirroring state lives outside the extracted GEOV block.
+ * This harness tests flat depth batching, not the mirror command queue.
+ * Model its state so the real rendering functions still compile, and use
+ * immediate wide draws to exercise both canonical and wide output. */
+static uint64_t s_fd_flat, s_fd_fv, s_mir_logged;
+static int s_depth_only_run, s_order_flush;
+static int s_mask_check, s_area_y1, s_area_y2;
+typedef struct {
+    unsigned char kind, hz, mask, mask_check, pre_depth_only;
+    signed char semi;
+    int first, n, dx, ay1, ay2;
+} MirOp;
+#define MIR_OPS 16
+#define MIR_GV 8190
+static MirOp s_mo[MIR_OPS];
+static int s_mo_n, s_mgv_n;
+static float s_mgv[MIR_GV * 8];
 enum { TEST_GEOV=8 };
 static float uploaded[8190*TEST_GEOV];
 static void gs_enable(int cap){if(cap==GL_DEPTH_TEST) depth_enabled=1;}
@@ -61,6 +78,9 @@ static void glDrawArrays(int mode,int first,int n){
 #define host_depth_run_state(...) ((void)0)
 #define host_depth_run_end(...) ((void)0)
 #define flush_tex_batch(...) ((void)0)
+#define mirror_sync_flush(...) ((void)0)
+#define mirror_drain(...) ((void)0)
+#define mir_defer_on(...) 0
 #define flush_cpu_upload(...) ((void)0)
 #define mark_prim_dirty(...) ((void)0)
 #define mirror_x_center_only(...) 0
