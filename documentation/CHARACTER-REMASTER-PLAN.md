@@ -1,4 +1,44 @@
-# Duke Nukem: Time to Kill — Projeto de substituição dos personagens (P0)
+# Duke Nukem: Time to Kill — Projeto de substituição dos personagens (P0/P1)
+
+## Atualização P1 — primeiro modelo Duke original de teste
+
+**P1, entregável de geometria: executado. Integração no runtime: pendente.**
+Há um gerador determinístico que cria o Duke piloto em GLB 2.0 com:
+19 nós (17 com geometria, dois attachments), 5.148 triângulos, materiais
+de cores próprias, cabelo loiro, óculos escuros, roupa vermelha, calça
+azul e botas. Isso é um **modelo de estudo**, não a aparência
+final e nem uma adaptação já calibrada dos figurinos do disco.
+
+O comando abaixo não lê mídia comercial e gera quatro arquivos principais:
+
+    python recomp/tools/local/build_duke_pilot.py --out /tmp/duke-pilot
+
+- duke-pilot.glb: **19 partes independentes com coordenadas locais**, o
+  arquivo validado que será usado como ponto de partida da integração
+  futura às matrizes nativas.
+- duke-pilot-assembled-preview.glb: **modelo montado somente para
+  visualização**, com deslocamentos ilustrativos da T-pose. Não carregar
+  em runtime: as posições foram estimadas e não provêm de HIE.
+- duke-pilot-preview.png: três vistas (frente, perfil, 3/4) da geometria
+  do modelo, não uma imagem produzida por IA.
+- model.json + pilot-report.json: nomes das 19 partes, SHA-256, contagem
+  de triângulos e limites de compatibilidade.
+
+O build do protótipo e a regressão sem disco estão em
+\`.github/workflows/duke-model-pilot.yml\`. O workflow guarda um ZIP
+de artefatos contendo arquivos para importar em Blender/Meshy e
+inspecionar o modelo. Os testes exigem GLB determinístico,
+identidade dos 19 nomes, ausência de animações e contagem de polígonos
+abaixo do orçamento.
+
+**Atenção:** o preview é arte própria de teste e não possui as proporções
+ou os pivôs aferidos do Duke retail. Para preservar as animações reais,
+o próximo passo é extrair a bind pose de \`DB00HIE.BIN\` de uma cópia
+legítima do jogo, ajustar coordenadas/escala das peças e interceptar
+somente a renderização daquela junta. Não alterar os frames ANM/FRM/ROT,
+colisão, arma, transformações de gameplay ou saves.
+
+---
 
 Status: primeira etapa técnica implementada no fork. **Há validador de malhas GLB
 e testes de contrato; ainda não há substituição de personagem no jogo.**

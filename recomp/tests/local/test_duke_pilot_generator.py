@@ -41,6 +41,12 @@ class DukePilotTest(unittest.TestCase):
         from PIL import Image
         with Image.open(self.path/"duke-pilot-preview.png") as im:
             self.assertEqual(im.size,(1500,640))
+        assembled=self.path/"duke-pilot-assembled-preview.glb"
+        self.assertTrue(assembled.is_file())
+        self.assertNotEqual(assembled.read_bytes(),
+                            (self.path/"duke-pilot.glb").read_bytes())
+        assembled_doc,_=read_glb(assembled)
+        self.assertEqual(len(assembled_doc["nodes"]),19)
         with tempfile.TemporaryDirectory() as td:
             other=build(Path(td)/"duke")
             self.assertEqual(other["model_sha256"],self.report["model_sha256"])
