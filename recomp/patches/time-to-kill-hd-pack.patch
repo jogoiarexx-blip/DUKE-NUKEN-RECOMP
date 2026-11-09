@@ -198,7 +198,7 @@ diff --git a/runtime/src/gpu_gl_renderer.c b/runtime/src/gpu_gl_renderer.c
  }
 diff --git a/runtime/src/ttk_texture_pack.h b/runtime/src/ttk_texture_pack.h
 new file mode 100644
---- a/runtime/src/ttk_texture_pack.h
+--- /dev/null
 +++ b/runtime/src/ttk_texture_pack.h
 @@ -0,0 +1,71 @@
 +/* Optional HD texture pack list for D16 exact-identity samples.
