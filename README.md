@@ -1,0 +1,92 @@
+# Duke Nukem: Time to Kill - native PC recompilation
+
+[![CI](https://github.com/MusicMonsterMod/duke-nukem-time-to-kill-recomp/actions/workflows/ci.yml/badge.svg)](https://github.com/MusicMonsterMod/duke-nukem-time-to-kill-recomp/actions/workflows/ci.yml)
+[![Listed on recomp.board](https://img.shields.io/badge/recomp.board-listed-c8102e?labelColor=1a1a1a)](https://recomp.fyi/game/duke-nukem-time-to-kill-ps1)
+
+Modernized play by default (WASD, mouse aim, and quality-of-life), with the faithful original game one flag away (`--vanilla`). **No retail game data is included.** You need your own USA SLUS-00583 disc. Europe/PAL (SLES-01515) is a different SKU and will not work.
+
+- [Game manual](GAME_MANUAL.md) - controls and player-facing behavior
+- [Documentation index](documentation/README.md) - engineering notes and evidence
+- [Current status](documentation/00-status.md)
+- [Modernization jobs](MODERNIZATION_JOBS.md) - the canonical backlog
+- [recomp.board listing](https://recomp.fyi/game/duke-nukem-time-to-kill-ps1) - our entry on the community board of who's recompiling what; it reads [`.recomp.json`](.recomp.json) daily
+
+The implementation is tracked under **[recomp/](recomp/)**: title source,
+controls, renderer integration, runtime patches, build tools and tests. Pinned
+upstream framework/UI sources are Git submodules. Our framework modifications
+are included in the complete tracked patch, applied automatically by the build.
+No ROM, generated game code, compiled game, player save or extracted retail art
+is distributed.
+
+## Build and play (Linux)
+
+```bash
+git clone --recurse-submodules https://github.com/MusicMonsterMod/duke-nukem-time-to-kill-recomp.git
+cd duke-nukem-time-to-kill-recomp
+python3 -m venv .venv
+.venv/bin/pip install -r recomp/requirements-local.txt
+```
+
+Install the compiler/CMake and graphics development prerequisites described in
+[build instructions](documentation/04-build-and-run.md). Put your owned USA
+SLUS-00583 dump in `game/` (a subfolder is fine): `.cue`/`.bin`, CloneCD
+`.img`/`.ccd`/`.sub`, or a raw MODE2/2352 image. **Everything in game/ except
+README.md is gitignored.** Then:
+
+```bash
+.venv/bin/python recomp/tools/local/build.py --jobs 4
+python3 recomp/tools/local/run.py
+```
+
+The game starts in Modernized. For the accepted quality target, use
+`python3 recomp/tools/local/run.py --frame-rate 120` (options save your
+preferences). `run.py --vanilla` plays the original game for one launch.
+
+For an existing clone, run `git submodule update --init --recursive` first.
+Builds generate the game code locally from your disc. Research, generated code,
+build outputs, personal settings, captures and saves remain ignored. Fonts and
+HUD icons are extracted from your disc during the build; no Duke Nukem 3D art is
+used (see the build notes).
+Linux is the validated platform; Windows execution remains unverified.
+
+**D17A and D17B are accepted.** 120 FPS is the primary quality/regression target;
+180 FPS+ remains excellent high-refresh support, 240 FPS+ robustness/compatibility,
+and Unlimited stress/debug. There is no 120 FPS ceiling. See the
+[accepted baseline and remaining focused bugs](documentation/86-d17-acceptance-and-regression-baseline.md).
+
+## Credits
+
+- **[PSXRecomp](https://github.com/RetroPortingToolKit/psxrecomp)**, the
+  PlayStation static recompiler this port is built on, by Matthew Stanley (mstan)
+  and the RetroPortingToolkit team (PolyForm Noncommercial 1.0.0). Our framework
+  changes are in `recomp/patches/time-to-kill-accepted-source.patch`. The components it
+  credits, including PCSX-Redux's OpenBIOS (MIT) and libchdr (BSD-3-Clause), are
+  listed in its
+  [THIRD_PARTY_ATTRIBUTION.md](https://github.com/RetroPortingToolKit/psxrecomp/blob/main/THIRD_PARTY_ATTRIBUTION.md).
+- **[Alexbeav's PS1 Recomps](https://github.com/alexbeavs-ps1-ports/psxrecomp-ports)**
+  by Alexbeav (Alexandros Mandravillis): the PS1 recompilation ports and build kits
+  this project follows. Our `recomp/psxrecomp` submodule is pinned from Alexbeav's
+  PSXRecomp fork ([Alexbeav/psxrecomp](https://github.com/Alexbeav/psxrecomp)).
+- **[recomp-ui](https://github.com/RetroPortingToolKit/recomp-ui)**, the shared
+  launcher and in-game UI, by RetroPortingToolkit (MIT), pinned as `recomp/recomp-ui`.
+- **[3x5 Microfont](https://github.com/nimaid/microfont)** by nimaid (CC0 1.0):
+  the Modernized inventory switcher digits. It is kept with its licence in
+  `recomp/assets/ui/fonts/microfont/`.
+- **Original UI art** by MusicMonsterMod: 17 distinct designs covering the
+  inventory selection frame, crosshair, mission-item icons (keys/keycards,
+  three energy crystals, notes/paper and Family Jewel), medkit, steroids,
+  invincibility, invisibility, Double Duke, challenge-item icon and used-item
+  tick. [UI art inventory](recomp/assets/ui/README.md).
+- **Custom Bio Mask first-person mesh** by MusicMonsterMod.
+- **Piano interpolation of "Grabbag" by Lee Jackson**, performed by
+  MusicMonsterMod, for the playable saloon piano.
+- **Bio Mask audio**: adapted from [Gas Decompression](https://pixabay.com/sound-effects/film-special-effects-gas-decompression-329819/)
+  by **CreatorsHome**, under the Pixabay Content License.
+- **Night-vision audio**: adapted from [Old camera flash](https://pixabay.com/sound-effects/technology-old-camera-flash-6800/)
+  by **MichelleGrobler** (Freesound), distributed through **freesound_community**
+  on Pixabay under the Pixabay Content License.
+  [Audio source, license and processing notes](recomp/assets/audio/README.md).
+
+Third-party licenses remain applicable: the title scaffold has its license in
+`recomp/LICENSE`; framework/UI dependencies retain their own licenses. The
+root MIT notice does not relicense those dependencies.
