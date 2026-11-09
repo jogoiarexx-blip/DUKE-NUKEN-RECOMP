@@ -177,6 +177,8 @@ def preview(output):
 
 def build(out):
     out=Path(out).resolve();out.mkdir(parents=True,exist_ok=True)
+    # Repeated generator calls in tests or an editor session must be byte-identical.
+    for group in parts.values(): group.clear()
     make_geometry()
     binary,count=glb()
     (out/"duke-pilot.glb").write_bytes(binary)
