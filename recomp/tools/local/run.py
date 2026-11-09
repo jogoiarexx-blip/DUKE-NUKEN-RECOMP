@@ -18,6 +18,7 @@ def main(argv=None):
     p.add_argument('--diagnostics', action='store_true', help='retain dispatch and stopped guest diagnostics')
     p.add_argument('--debug-port', type=int, default=9123)
     p.add_argument('--renderer', choices=profiles.RENDERERS, help='save renderer for the selected profile')
+    p.add_argument('--texture-pack', type=Path, help='private HD texture pack manifest (.ttkpack), Modernized OpenGL only; launch-only option')
     p.add_argument('--graphics-preset', choices=profiles.GRAPHICS_PRESETS, help='save Modernized visual settings: original (1x), balanced (2x), remastered (4x); not an HD texture pack')
     p.add_argument('--internal-scale', type=int, choices=profiles.INTERNAL_SCALES, help='save internal 3D resolution for the selected profile: 1 original, 2..4 times')
     p.add_argument('--display', choices=profiles.DISPLAYS, help='save how the selected profile opens; a fullscreen choice is also the F11 target')
@@ -180,6 +181,13 @@ def main(argv=None):
             if a.invert_y is not None: controls['invert_y'] = a.invert_y == 'on'
             settings['profiles']['modernized']['controls'] = profiles.validate_controls(controls)
             changed = True
+        if a.texture_pack is not None:
+            if settings['active'] != 'modernized':
+                raise ValueError('--texture-pack requires Modernized; remove --vanilla')
+            if settings['profiles']['modernized']['presentation']['renderer'] != 'opengl':
+                raise ValueError('--texture-pack requires OpenGL')
+            if not a.texture_pack.is_file():
+                raise ValueError('--texture-pack manifest not found: ' + str(a.texture_pack))
         if a.settings:
             edited = profiles.menu(settings)
             if edited is None:
@@ -236,6 +244,10 @@ def main(argv=None):
     # Preserve an explicit override; profiling sessions can opt back in.
     env.setdefault('PSX_GL_PERF', '1' if env.get('PSX_REPLAY_PROFILE') == '1' else '0')
     env['DNTTK_INPUT_MODE'] = settings['active']
+    if a.texture_pack is not None:
+        env['DNTTK_TEXTURE_PACK'] = str(a.texture_pack.resolve())
+    elif settings['active'] != 'modernized':
+        env.pop('DNTTK_TEXTURE_PACK', None)
     env['DNTTK_INPUT_BINDINGS'] = pc_input.wire(settings['profiles'][settings['active']]['bindings'])
     controls = settings['profiles'][settings['active']]['controls']
     env['DNTTK_CONTROL_SCHEME'] = controls['scheme'] if settings['active'] == 'modernized' else 'legacy'
