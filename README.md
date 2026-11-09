@@ -18,6 +18,13 @@ are included in the complete tracked patch, applied automatically by the build.
 No ROM, generated game code, compiled game, player save or extracted retail art
 is distributed.
 
+## Gráficos Remasterizados — perfis do fork
+
+O modo Modernized tem a opção --graphics-preset original|balanced|remastered,
+que combina recursos gráficos já presentes (resolução, geometria, textura,
+widescreen e iluminação). Não existe ainda um pacote HD para todas as fases.
+Veja [o plano e instruções em português](documentation/REMASTER-GRAFICOS.md).
+
 ## Build and play (Linux)
 
 ```bash
