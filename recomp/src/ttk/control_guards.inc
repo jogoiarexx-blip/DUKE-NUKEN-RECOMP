@@ -1,0 +1,312 @@
+// SLUS-00583 code SHA-256 guards; derived read-only from the owned executable.
+static const Guard guards[] = {
+    {0x80051544, 608, "98f7733839a24afde3b977dfca0fa25e9ac84218242acfffc7442fbcc541e6f4"}, // D38 native committed-use selector
+
+    {0x8004157c, 148, "0d354e8f37ce3e12e2565f0e540de57cfbdba916d6248c1a55522879230ff05c"}, // D35J5 native freeze timer and thaw flags
+    {0x8004e894, 184, "0736b11803466911a650e08998dce7ba16580ba96bf8b52e60bb08bead26ada5"}, // D08A24 native Bio Mask/gas contract
+    {0x800409e0, 276, "4dcc4e5ec9d01517a7b30367f135b1e4643d6f1cffe7dededd2acdadada9b03a"}, // D08A24 native Bio Mask/gas contract
+    {0x80018aec, 80, "a9b1a67f2c75119ad12217b4abe922dd7a036ea6c5dd710dd97d2ca418b35838"}, // D08A24 native Bio Mask/gas contract
+
+    {0x8008acc8, 56, "398d8778b88560ab75a97f65db780f684d8a034dde560a5af4e2ca20b6fd89e0"}, // D08A25 effects slider scale and global volume address
+    {0x8004e94c, 212, "655e6eed09f072c0bbb2216883023b873d2b41fb001329e51d899717ba30f64a"}, // D08A23 goggles endpoints and native charge lifecycle
+    {0x800420bc, 332, "26fda3e6f59ab68e952635660300cb067cd2c884a1b736cad58080f2e67f4007"}, // D08A23 goggles endpoints and native charge lifecycle
+
+    {0x8007d65c, 1780, "6f1b5d370899b655e31796625ed140d74535454cc1d02e2a764ded87b5d86430"}, // D35I native wall movement queries
+    {0x8007cf28, 792, "a223e311f1cb7e062cacbc02e601cf7150d5d98510d13c0d2e13e81c76eb5d15"}, // D35I native wall movement queries
+    {0x8007d240, 1052, "a336e6b82e194e714e8aa815ef2feed73680c9fbf0590c80f0a5b816a90f5ec6"}, // D35I native wall movement queries
+
+    {0x8002e6d4, 16, "d94e0d822df0c031155537cdb6686705409db4fb6b60adc81d608b799d6acefa"}, // D35F1 supplemental pole draw
+    {0x80031d10, 1620, "8ed8575e0fd05c6291209498ae990fb0048fd0cfb15990e8cc7914cfa9fe96b2"}, // D35F1 supplemental pole draw
+    {0x800b4d2c, 12, "4ecf2f5bbdb450de400e5eeafac260aaf27c3f5d36b3f67ef8ceb47855a2e800"}, // D35E native arm near-cull contract
+    {0x8007cde8, 1968, "a6c00d0da87e09a5e37db645d2cd728032ca3aefe2726f7c2e1a147b6b9a9583"}, // D08T8 original pull-up and clearance queries
+    {0x8007ec4c, 856, "dab8fa288d3921481d3b5f15bc54a30c591cfbfe8097a3e9847776954e814131"}, // D08T7 original object line-up
+
+    {0x80089388, 68, "97a79166b6b9f5a27274fa376ce0d4b5ece8699509573c6cfd582338054eefa6"},
+    {0x800884bc, 512, "dd3cb47e323e65e31c25a5e0b536d62ba7cf5bcd3c25ebb134eb9f867b2cbc0e"},
+    {0x80051890, 880, "90ae0e9221234d58c58fcb2e0f1bb485b51891384815ce98bda1298dfdd2548c"},
+    {0x80077f28, 196, "33103a8345c55d2dda0778483a4aaa9885a199e646c84301197cdd2f71bae23b"},
+    {0x80077ccc, 604, "da5643be3feb7032050d733386b2ed8826b30cf148da01626350e4321950c7c3"},
+    {0x80081a48, 5156, "c2fb6e1832fce876558ce0a3b711a5e41170c092344183e1bc5ec2f565ebceec"},
+    {0x8003d738, 364, "b59c6ccbe5971b2c57c20bf89e1233e9b04e985cbcc7fc75d3fc6c51d8dc435f"},
+    {0x800839a8, 116, "8fb5298e4163128310326df6ee907514d3379b3c5a81cfbf484226cc70afe46f"},
+    {0x800827e8, 68, "fcc46db5526f5afc319f8d6c8583493c1f9a2e5df5451fa8a7f21d5dd8b109f8"},
+    {0x800414a0, 96, "c6ab88d7ab0e00dffea1b764fc6bc5cb35b94ccf0a2f3fd3af5ee34c313e4add"}, // D08A4 steroid timer drain
+    {0x800a4154, 68, "ef2b64393d2664bf0b274068e30b2878b33d116519561afabbd478941d3859ce"}, // D08A4 steroid damage cut
+    {0x800a40a8, 1812, "ddf5d91011d7c097e4b4a10119ba4c851deb74a8994b6e0c8857f9fb92d37906"}, // D08A13 Duke's damage handler (steroid shield read only at 0x800a4154)
+    {0x8003df40, 112, "4ea6073ef1fb33df7c1a8758c56c47534428bbc4b1aa4b01666c38c6a90a6c94"},
+    {0x80096cac, 152, "dea5cbd67e2dd8a547e816893fda17b29c333182c1e10e8308fb6c4deb5df7b5"},
+    {0x800952ec, 1088, "9ac990d76da3988f8690941a26f670dd70b2fe6af813840feb7e0bd3c20df0ea"},
+    {0x80095a74, 520, "41d7386f2f043ada440ca4eeaeb36bb1c7df8159c91ae4bcc2fb32ac8fb6100a"}, // D26E CreateObject
+    {0x80096614, 1148, "f0c5fb1450cfddcd1669dac6a62be016ab09fe73d4f66c7664f35eb363e96522"},
+    {0x80098d70, 728, "aa455e6bd27610765c6542d4b732d0f1527dae39a244a99e899644bbf1a5adf1"},
+    {0x80099534, 224, "7b16be901a70c1bf00c88013fd69be1e70d3a96bfc38a985ed5e600b67595560"},
+    {0x8003f060, 320, "1ad8afe49deea69e7a24bbb1155823ea7daf6bc29a6bb58e0c6b2ea501b52bd6"},
+    {0x80055904, 1068, "0cb799f7de673f3110370251c474cc8df3fa4490c8738a586e943723db2000b9"},
+    {0x800789a8, 612, "39e567caaa4216932d98b43b35e7afaeb45d8d900a5ac6a9ea0b0527be3b9bc9"},
+    {0x800493a4, 660, "a003398fd05004663e2a0554e8142d8595d7ccba3065c279bd21ebbaac59b839"},
+    {0x8005492c, 460, "76ca2fc741c90f4bfb7630fce7aeb64c0e10dd55276ddd79a077ea7f5ee763f9"},
+    {0x800797f4, 296, "71551c20402e7cc91211c74672390079a4eb8baaedceb341714ee484abdf7192"},
+    {0x80014410, 868, "3036a8b890023dfb58863ef85daee6380ef4a5ce73bea551ae6d4f8eecc949bc"},
+    {0x80013a40, 60, "d9aa8555f0413013f64cdbc542b6e65cfb8d3f92195ca6576751e1fb3933a75c"},
+    {0x800c27c8, 88, "267d36ef9f45eda5355ec1ae21a05a78d95213bc7dde4137ebd451fdbaf226b9"},
+    {0x8001412c, 56, "01112fa66fb214b45151bf140d304fa1dd0f82c70c3f282f8e976389212f6bae"},
+
+    {0x8004dea4, 2040, "c115e0f9f7395b808c62158bc6258365b723cb8c3fad05bd00b5b00ff9539574"},
+    // D08A12: throw charge, held-throwable and draw-completion weapon tables,
+    // the sound start's negative-id refusal and the sparks' brightness path.
+    {0x8004dc74, 560, "772740a29587393d87c4f724c70ba6e691221e40807371a6e72050a211ebee6e"},
+    {0x80014ce8, 56, "ff972e00a6d85aa36c144af9821b9c4f90e552b953d9711c9609cf5164c6e000"},
+    {0x80014d20, 56, "d51e6633c3ead2b98daee3a33c6ce4f46c319d0f43e7d8a85cd1cd52385084e7"},
+    {0x8006b270, 52, "336aaf4890e85890839314018743280490da5fc7649a4a255b1117e75171d70f"},
+    {0x8006d594, 100, "f0adf0b382c729c8569158ee8ea6361cc96029d00baddab1b7808012773cfb1f"},
+    {0x80029ab4, 24, "cd7e3878783d7619a14d8a245b1de2e88fe684e2191c3270ec77e537697ee336"},
+    {0x800517a4, 236, "f20cfde3335bc985a50803f5d8d2a82d2474592b01259b548b7cef9324d332fb"},
+    {0x80014da8, 1112, "449e12a6f164db0d2a3088eb9a8e989987851e6eaa5c995649da54254c8e4de6"},
+    {0x800153e0, 1100, "63f0dd35547773e7c0ed1f8876c00ea654aa1da12d2ec5113e2a3ec31abec0e8"},
+    {0x80050344, 4252, "cc3d01fb8873d1daaf83e997bf88ca6e73f07e611a5ca0783086aa82fadf075a"},
+    {0x8004e840, 88, "ec6f71d738e488cd323ace41f2769016d587f4f6442627184f6a7338f5b0e31d"},
+    // D08A29: two-handed run-ready weapon request and gait selection.
+    {0x8004ee84, 468, "880db5b70a72d85ad05eef79018a2976e445ce054d48f032e04262f20d757ebd"},
+    {0x8001bb70, 376, "4b59b26bd1566f7cf6827282683c28967c4fb44cd0337894e75bb8ec813679d7"},
+    {0x800bcbb4, 64, "b9bfeae05a1c7d9213d5f68ab6d417b01b9ca4700c448dda0a06e36ea89dbd98"},
+    {0x80026800, 280, "b6901b33316c180d8437076bae42e1218d864d87e570ba3e3362f1f129b8c317"},
+    {0x80054308, 352, "331cb3ee43cc26954c45696acf005f3a9cca3f4e48a96be26df62e7fafbaf80c"},
+    {0x80053038, 592, "8689c849de8ecb3d7f725ee1cbc91c57f012691efea4f1df76f2ecb9e4beae23"}, // D08K13 native idle timeout and crouch fidget
+    {0x80052c3c, 892, "344ea85f1267bccfd3ea4a08ac14bc34837dc28566731469446b5f3d1f8e7f41"},
+    {0x8001426c, 36, "b385f5b1abc3b185ba5de69519780096330795e9c1b1360f0360aabfc26ff7ae"},
+    {0x8004d5f8, 680, "62d792558177a2cdd5a5269cabd9f65e0489257160dd1c959352c88683e02ee4"},
+
+    {0x8005a210, 1796, "445e0ca0d5763e2d153ad8541bf80696bca764905e6490215d69b99d0d67260c"},
+    {0x80059db0, 1120, "9ba12011e809161c20b4d58a6a1e575350c6a115436279eec901db60c1da9c84"},
+    {0x8007765c, 236, "70decd3801cfda1e88c35f99257213edec8ded6cfe7c654d1cd46d606f554d28"},
+    {0x8005d358, 512, "590c73267946859fa7538e4131895ae1e1a7536ca09cfaf4b955ab7c48bb4075"},
+    {0x80041060, 344, "8da369fbced880c7f2311b6cf6a448a9d533c68a66f1e0fb59c5386bb5e06840"},
+    {0x8004bde0, 784, "ffe20d0b07eea94fb40b14451f94df8901c82b360d65105e545c5824401da984"},
+    {0x8005484c, 224, "750131f462c55ef5b70153f56fa66a88748784b4641dc6d4d379d66f080b9635"},
+
+    {0x800402d0, 692, "c94c7db91afe22ae957326a8d4c748e35ab5af6760663bb3e76b55a0ffe87fe2"},
+    // D08Q2: original jetpack transition completion and pending-bit contract.
+    {0x8004001c, 288, "4641523e96a580972cd758e78405001129f59474bac55092332a713d5a13e9f7"},
+    {0x8003ff6c, 176, "504d9dfc3af34467c5e485072cbd01ee500aaa6aea070666da40b80635e63fd0"},
+    {0x80088134, 264, "b5f58266df17263c220add0d06eb0fc64fd04ce58dec15388cba92de6e36b02e"},
+    {0x80088074, 192, "415122ff9b46fe23396bb1d0647b0f040e2177f8af31261f6ea7af0d3aadddc2"},
+    // (The upper-body animation flag table 0x800c2824 is game state in part:
+    // see state_guards below.)
+    {0x80089428, 176, "df4f7bdfaa1927f6e0e96d3f39cc5f633b87bab3545ff3152fca534a958f4262"},
+
+    {0x80078c0c, 292, "40254053d0240a93ae11d9fb7ca3d709199752b1267c539f2ba9a61388f688d6"},
+    {0x80043eb8, 3432, "44cacacf391eb2c94ad968072378883773e3190e53dc3c7edf8ba4ce14f41bf5"},
+    {0x800471ec, 2052, "ebe4299ad1488fa3a4102304c50afe3f3c0698b9be6cc65b00c6526212bc2c6f"},
+    {0x8004b594, 176, "650f17039fb39aa7ec63f5025c92c1a87f23d9213d6fe58fd4849e61898f5dc8"},
+    {0x80013dd0, 260, "39629b5e439b966ba9a2a358b1a24931746c679e18c763172b353618fc4d0960"},
+    {0x80014070, 52, "daa96f5cfc8566f74daca1e8f3e443c0a52af3bf5c0d3b72c8a1574ef18e25c7"},
+    {0x800494dc, 120, "2340a3398a7b4263b00f09f2a2759ce0f445342dfa900c0e0037de564fbd1c37"},
+    {0x80014148, 12, "985e965888f6b575af1b7be23b22de5c9ca9b526a28821f32a9cea544f2a2707"},
+    {0x800144b0, 8, "399d30afd608bae52330b4bdb9212dba7f4ec5d4ab0872117b6c692f100e0b33"},
+    {0x80049484, 52, "00684b29e9241af6a3ae7c84c5807640925c524d7a0c002240e362554c5d0ba8"},
+    {0x8003e2d0, 480, "1020c5f1601e07bda3d9b90f95c8d0b327890ba278922d220252a7cdb377f5d8"},
+    {0x80054c04, 1084, "0a43a4843c82f2c76154aa71297b8d6a08864cabd316792d6cc2fc568f8e30f0"},
+    {0x8003df40, 552, "73cedbeaef13cd705e2949998c1c6e64de043f7da13982953509fbfd78b6192b"},
+    {0x800405c0, 872, "001065afd380624b0cdac607af8fbe33274b41bf4185f28d61187db637326384"},
+    {0x800c4590, 1320, "a5d40de57ff11fa3b4a84efe5e7e29cfea9fa24131e9bad0ee83365d743d72f5"},
+    {0x8004b644, 1688, "3f524b5fcd67d63a762afa1dc3857d9150a45d00d7680d26cea1e2c196c6192e"},
+    {0x8004b620, 36, "1e18b6a2a66af55f860c5357b3daea656301237550ebb17feaea0df0fb4bcf40"},
+    {0x80049238, 32, "29af658c24995bc89cf4d41252919963e7415a197ca66389774ef5d75c8a5b2c"},
+    {0x8001414c, 8, "dfc8ce8176e239747860f79dc901550d9525deab302f9c5c8079e30a4556bec0"},
+    {0x800557f8, 880, "62ced50fcdb59f2a6a9ed22808cfb695caf79eb60d8d95c6ca02f3503264209e"},
+    {0x8003ebf4, 332, "0a0b8b7f95633200f3150baac485db4716e776bf752140993730da438087f203"},
+    // D08Z1: the flight sweep and its result finalizer (wall normal +0x194,
+    // result 1 wall / 2 floor / 3 ceiling), run in isolation by jump_walls.inc.
+    {0x8007a98c, 884, "0bd360aeaecc69300dea8353746542fdee9043e555f1d5664b61e7f210289d45"},
+    {0x80079f4c, 248, "85f09992847a3ea087b091d7057e35feb09bacd5c3401b1ddd771815cc097e8b"},
+    // D08Z1 safety net: the bounce 0x8003ef08 and deflection 0x8003ef78 (their
+    // return address at sp+0x24 when they rerun the integration).
+    {0x8003ef08, 200, "8d26016f889b53acbc9d6b82a4dc171fb287551b47fcce712a6ea7d6af7cc4a7"},
+    // D08Z5: the slope slide's steep-side choice 0x8005446c (143/145) and the
+    // slide handler 0x80054568, whose fall start 0x8003f060 wall_backflip.inc changes.
+    {0x8005446c, 124, "b567d41d550b612e4173eec593e5dd113d1e9b6f19561061f8eb890aa7a0bf85"},
+    {0x80054568, 740, "5e960ebb643eba7201bee2b42e344742e4657ddbffbd1a4b23e36b3346dee6eb"},
+    // D08Z3: the landing-pose handler for 105/106 (collision and root step, no
+    // input), which landing.inc leaves at the ground dispatcher 0x80048410.
+    {0x80052fb8, 128, "3ab421327a51edaeafbfc92a176241564a63e332c859d64ff4658f93ab3811d3"},
+    {0x80028f2c, 884, "35c2c146e55820c71db887223353624a1e667698ecf422b988801ec3600efe79"},
+    {0x8002a7fc, 32, "ebbdf98ec0abdf3efd50810400db3afa4a8bc47b80058549dcf0b5da19c49b9d"},
+    {0x8005201c, 3108, "ad97e2be5256897d26af51f5c09ffc0662a91cff7c6ffd3c04daf7ec3d5e37ee"},
+    {0x80014124, 8, "b6eb2b054eedd3bc16ce2bcd342dad59207eaa761b0bb0b6b5ac7682a612c55a"},
+    {0x800490c0, 24, "ce3a8c233689a8cd91f605f0df8d3095e7ebf0a82bdf1fd4034b298072957038"},
+    {0x80097a44, 332, "52491ecf9c5cf75122cc9db4b02a5e6f6f9badf22817c424ab3d32c613a2cf77"},
+    {0x800978f8, 332, "6ff9609db3e191901f305881e4ffa530bb3206638f5dc4c139b26af821ac1fff"}, // D08J6B one-arm aim reads +0x124
+    {0x80058120, 444, "4bbb668b95d81ad1724c2100e399474306fe1f1eb261c077ae557c0503c5db49"},
+    {0x80041c34, 24, "3534ca46e45c01db7b4d5f8370b110c548b31323f8179f46674c1f4108be359b"},
+    {0x80048410, 104, "71c7cf24760f422a21e0f05c3b7b6b81d97b4b0144deb0732ddb2890356311ed"},
+    {0x800140a8, 68, "f4f884fdc9c5d463b56287b642a3f1f6adc199711b9af7ea097a7f2da315fe90"},
+    {0x800487b4, 96, "55aaae72890aa57210ffa69d86ba114ed9029c45933c9312c7f6c376f977a6e1"},
+    {0x80054218, 240, "b0571f72064f59cc42378094a3fce03635e04ebf3b9e44db2eaf34254d40fe22"},
+    {0x800485b0, 144, "e8900cf9c8f6a02f5c4ded541d45a23d1a2edc352c8024a02257df51b7b4e542"},
+    {0x80053404, 252, "a3a453eb68ef70eeb6ff4ab94cb077d536716055ab259441f882b689d4671cc4"},
+    {0x8003accc, 280, "1b945b722149702c29c4344c7eb444994aeedaf18e019688befaa670de4603a7"},
+    {0x8003ade4, 1680, "544fa7cdde4e0b8471d389f443b0cd0e773a45e5d72bd03f1f1e7634f5937bc6"},
+    {0x80097c04, 1536, "e4e9f63fa7c73ad4e7584d11ad170fe94e70dc9c02c047c91cd87553b7f4c32f"},
+    {0x80053500, 1248, "0de971047b2289758498e87cdd5c70aefc481337cc86d99f0f8be1064e4e39af"},
+    {0x80057230, 2400, "11b8e7c6643026323fc60c5238f3c567af5cf2f1eaca43682fb6b46e632ecddf"},
+    {0x80056770, 412, "4c89156f567ee0c2c2ae64a0977e0bbff557f9ac81842474b43b27ec7a48d880"},
+    {0x800598f0, 1216, "82a40fb73583d1b0c2f2e2e8b0e09a7cd43286bdc0dd0624dea9e161b0e766d6"},
+    {0x8007926c, 1420, "af30770736def9fa017f926e1919ea92c6d7bb7f781b363084600e5fc035d1ec"},
+    {0x80039c7c, 340, "a1af204f95a09d50a9d8222288275eb91f868a25fc83504d9fb68b78f85b59f4"},
+    {0x8003aa48, 644, "0216588c0928c7f1a28857a49478589fc11fbdf240b39a5a7aed3de3ecdd778a"},
+    {0x80025e80, 144, "5a02631492e87e056636954744e9116e6a35fb33c0d1f9cf92a08049cfa69908"},
+    {0x80048640, 112, "2d21bc16bb315ad3e8f76961fcfa246fe2c30a366564746e1c7a6fdc922482b1"},
+    // D08P mid-depth wade: gait dispatcher wade cases, the 80/81 state handler
+    // and its collision step, owned at the handler entry.
+    {0x800486b0, 260, "db9d31f510cfff36b25e60cfe601aa6c2b1a505dbb8e7875273a2042b9ba0a76"},
+    {0x800539f8, 452, "137b077dabfda3f11cb5c48556ef78a072b2d4a5f5091fa5da4941d21691d961"},
+    {0x800788e0, 200, "7e55f1b4011ea6e8eda89ad50dcd2248857e2725b08d54c3a84c1cb959c158c2"},
+    {0x800780b4, 1236, "c71c5670b8757fe218865906b0664f2507b0168fa3bfbab72d74c67c7c846324"},
+    {0x80028e1c, 908, "abc7e1fdca7d819abce83e931290333c74d4c28b43ea7f0ff523516619018d13"},
+    {0x80066e34, 80, "ea2f10909814fb3257e9cea8479ee0c02356b664a5fe9cc00ef92ed384e1caac"},
+    // D08Q8: collision subqueries and cached head-point address contract.
+    {0x8003964c, 36, "95f9d9648bcf817dbfddb350e031744ce462eb66055f7d4ba9a4ee3b17f7f293"},
+    {0x8007991c, 1016, "d540e0b4e02698a376f6419cbc8cf78d9a94eeb444c1c39ee6fdc890e4382711"},
+    {0x80079d14, 568, "49f6b6df3d2447b50ba4ee49b5691e0c4e90e439685664de7de704032e853f5e"},
+    // D08Q jetpack: mode-10 entry (Square + 358 bits + fuel), root apply with
+    // the landing probe, and the flight handler (pads, hover lock, fuel).
+    {0x8004aaf8, 272, "36c4e2f6c2f3832963f1a157fb61a2f1d3ce633dc06482f42f93724337811f1e"},
+    {0x8004ac08, 472, "086082490e7abc6a12eafe1e63ca42c43b35b886b97f854322d358ec4545e5be"},
+    {0x8004ade0, 1972, "1148d066e948ba700dea67c48424f179d6a2aabd0cc0567c7ea66fb0305bc725"},
+    // D12 first-person weapon: the actor draw (joint loop registers, hand and
+    // attached-draw call sites) and the muzzle-flash routine (its stack matrix).
+    {0x800348d8, 3112, "fa5b20b17a5964109586d0a40c2eeebdfa92c5c083ff8f0713aa56cdc409ed1f"},
+    {0x800341e4, 700, "6935a45ab01e59b6866b10012a8978b5fba7e4b5f2e1d4cc89e35e341c297abd"},
+    // D08T pushable objects: the walk/Up-into-obstacle action (Cross bit and
+    // climb/ladder selection), grab 121's Up/Down push-pull choice and the
+    // dispatcher's 119..121 table entries.
+    {0x80051cf0, 812, "661e85fd56727f88ddec7b0140466cecd8623de8b34e37835b3f21ce3887e8b9"},
+    // D08T3: original push displacement and object room membership.
+    {0x80048e84, 380, "e845d70f5be1dca2c9df2bf28895903f653fd423a2649012f49be892fc3b02ed"},
+    {0x80095cb0, 236, "98afbfc20f761fdaff80d2c4878f102f555221194a68187e7303078cc0a47c89"},
+    {0x80048c74, 240, "aa570a9f6c633a71de8d7e1a3d1e61da4e4f24e321dfa56f817f58e3be7e719e"},
+    {0x80014188, 12, "b978e2b97b5ca40863a4e771aa6d3f7d942a88410571918b5a02e9ccd58942fc"},
+    // D12A first-person quick kick: the boot dispatcher case 112..115 (sphere
+    // arguments and damage formula), its table entries, the damage sphere and
+    // the sound routine it calls.
+    {0x80049044, 124, "817433908f6d1e856dc6c71a1cfdcad11dab3398427e1204e08e2ea513919905"},
+    {0x8001416c, 16, "ceb680feaf12de713fac4a70946fa5bb5373f9498071fd3834f766ff219de404"},
+    {0x800a979c, 1116, "3b254c1879cddf5743391954cee028efc4b61b54f1ecd4c575fa78dcf2976916"},
+    {0x8006b270, 448, "988893d01896252cfdcb52649de75cb0352295d4bd3a7ee384cc77a9438f9a6c"},
+    // D12C kick impact: the wall bump (animation 94/95, rumble, 0x8006b270(0x2007,
+    // Duke+4, 0x800)) whose thud the kick plays.
+    {0x800537f4, 0xd0, "ae0f59b77b2bfdc657eece42b780595375afdea75d2432b6152dd32d58a03c25"},
+    // D12C: the sound call with a pitch argument the impact uses, and the
+    // voice setup's pitch read (0x40 = random spread, else table + value).
+    {0x8006b73c, 452, "65d6d0593ac28eb9f691b8201552a52062f9733782cdce4c889fdb11d41c4cd4"},
+    {0x80068738, 104, "54f1d3ee93201d0049fbf50cfbe5a25578a279c45529ecab74e85595bd88178a"},
+    // D12C: the stop the impact uses for an already-playing 0x2007.
+    {0x80068900, 52, "9f8a5470fa4a0cf1673484e6f97ae4f41d885cc49d741630c9b7884cb4d3941f"},
+    // D12C: the voice update's reads of the sound's volume +0x6a (ramp, set).
+    {0x80068ddc, 180, "6e06c75ee40b7aaf578b62f58441fdfd9c285e3d84eb1fedce02cca9c278ebc5"},
+    {0x80069004, 16, "ef5d2a90fe57552346f7988f32d4f5571d463df1eeae71315ebca85dc167009e"},
+    // D08U top-of-ladder mount: the hang-to-ladder transfer 156's end (-> 186)
+    // and its dispatcher table entry, and the collision-box lookup whose
+    // index-0 layout ladder_top.inc reads.
+    {0x8004d1fc, 24, "786a06bfa8593e670548d620aa78d1bf4c3101dd08a2c096d9e8d85ee1a1d4d4"},
+    {0x800148ec, 4, "9e4eae74f2e079bd1e918bd169f3c34f0c8a02b525743f5da03fcc9cdc99e810"},
+    {0x80073ae8, 148, "ba01249a732b841f0fc021bb10978e71ca9096239f9b6f75efec72c4580224bc"},
+    // D08J5 poles and chains: the hang-climb rest/step cases (0x8004421c..,
+    // their 0x8007d65c down calls returning to 0x80044340 / 0x80044434) and the
+    // probe itself (floor at sp+0x4c, read at 0x8007d8d4 after the bone call
+    // returning to 0x8007d7fc).
+    {0x8004421c, 748, "8e5705009b24e4958092a918db7c4a3f696b3391236a1d36ba8c65f9acd5916e"},
+    {0x8007d65c, 1784, "e6ac983c8c12c0397a55f13aa808acadf9e105da765894ef8c5874fa14b9e9bb"},
+    // D08AF: native plunge drag, displacement and completion threshold.
+    {0x8003e4b0, 804, "c756eec1b7e3926a7a804d91eb7483f32a83e8c416210156ef4012c520b0623f"},
+    // D08O1 fire while swimming: the swim state handler and its anim table
+    // (Cross tested before Square in idle 127 / thrust 128-130), the player
+    // update callbacks and the next step (80055e80) that restores the word.
+    {0x800455bc, 7216, "f6ace376b2a30e36ac2fe2ea8423c756707637e5c576b1f79d487e1ca1d448dd"},
+    {0x80013ed8, 48, "7784739458d476aae570170c14eed8ea8334de985f111947c34f2e53a5fbbeb4"},
+    {0x800c2754, 16, "d6789d8973ece682e4712a86c894b3a4acc1acdb3c73fa2a95a92e8e3096e70e"},
+    {0x80055e80, 1364, "994868d98769dc710f6c742ec402bb372502dbcfb887c055ee30336f80f48bf6"},
+    // D08O2: the last call before the player update picks Duke's model build
+    // (0x800411b8, contact notify) and that choice up to the build call.
+    {0x800411b8, 236, "ecdb24257bebeddf082df00b952cab648dee2e09cadfddde8f8a8a00929fa4d5"},
+    // D08O2A: the plain build and the matrix composition it uses for the shoulders.
+    {0x800987cc, 672, "13e4e3dcca6b6f011db95d4825e6f968375a4b2341ea18fdd86a8cc676dbede5"},
+    {0x800b42ec, 352, "484fff1d2984fac9730786048ad50065c006672118c2d6b4698dfb787d7b155c"},
+    {0x80042634, 308, "49f96d37c9a2d3b97d8ac57a6f3cd2e68fb38107f0996ee7c4bdd80f9bf93d70"},
+    // D27A: the player update's walk/run toggle (0x8004178c..0x800419f0), whose
+    // click 0x8006bbd8(1) run_click.inc keeps silent in Modernized.
+    {0x8004178c, 612, "146c93993f541dfe24ed30aac3cb7c5f96ba29fd2994303605c81060643e1ec8"},
+};
+// D08V1: original data the game rewrites in place, compared with those bits
+// masked off (code_identity.h masked_identity). The upper-body animation flag
+// table (280 entries, 0x800c2824 + 4 * anim): bit 0x40 of any entry is game
+// state. The pole/hang side probe 0x800439e4 sets or clears it on the entry of
+// Duke's current animation (196 on a chain top exit, 2026-10-07 lockout), the
+// object hang 0x80055438 clears and the ledge hang 0x8004c768/7f0/8b0 set it
+// on 149/152/153. The bonus levels' BONUS.OVR (DB21..DB26) stores the low
+// halfword of entry 265 (0x800c2c48). Every other bit stays authenticated.
+// Audited from the owned disc by tools/local/guard_writer_audit.py.
+// D08J9: entry 116 (the door kick, 0x800c29f4) also lends bit 0x20000 to
+// the weapon for the animation runner of an armed door use (door_use.inc).
+struct MaskedGuard { uint32_t address, size, mask; const char* digest; };
+static const MaskedGuard state_guards[] = {
+    {0x800c2824, 464, 0xffffffbf, "76c377dad4603bd28d686d20df6cc052af0d89d0d0dcded81c1127e03ef8a59c"},
+    {0x800c29f4, 4, 0xfffdffbf, "631dc582a2f076bbbf7f7795b7afe0ea7927d335c7b1403adbce952d5c7d9c04"},
+    {0x800c29f8, 592, 0xffffffbf, "e0cbb6d00c7f4e5615b16f5816b5006a82c69b231f13815a44e9c5d59ee10bb4"},
+    {0x800c2c48, 4, 0xffff0000, "df3f619804a92fdb4057192dc43dd748ea778adc52bc498ce80524c014b81119"},
+    {0x800c2c4c, 56, 0xffffffbf, "c2c056fe219456a149c9145199b715844a62c1b2a701bbe6d2942075e4c13b89"},
+};
+// Authenticated level overlays (D22A, D22B). Every LEVELxx.OVR loads at
+// 0x800ca968 and starts with its level tag word; the tag picks the one body
+// that must match. Each overlay is its tag, strings, jump tables and code, then
+// one data block. A body covers all of it except the trailing bytes the level
+// itself writes during play: variables it stores and the hit-position vectors
+// it passes to 0x8007177c (LEVEL00 from 0x800cb1a4, LEVEL01 from 0x800cbe48).
+// Generated and checked from the owned disc by
+// tools/local/level_overlay_guards.py for the 21 levels the original
+// level-select cheat offers; any other tag fails closed.
+struct LevelOverlay { uint32_t tag; Guard body[1]; };
+static const LevelOverlay level_overlays[] = {
+    // LEVEL00.OVR, 9668 bytes, code to 0x800ccd28; 16-byte scratch tail.
+    {0x3, {{0x800ca968, 9652, "274d71ddd8aeb6e1ca12c0229eea5087c7750a39f442785b94f0efeec81a25b3"}}},
+    // LEVEL01.OVR, 12196 bytes, code to 0x800cd68c; 16-byte scratch tail.
+    {0x4, {{0x800ca968, 12180, "b3fa174b2bb6732dbd341725f59a853b8d75a0eee19ed180e2a0b841c1732445"}}},
+    // LEVEL02.OVR, 10780 bytes, code to 0x800cd188; no scratch tail.
+    {0x5, {{0x800ca968, 10780, "af33ba1a7bcf98dea8a923c19742eca432c57c8c50955501ccecb72e04fe3af9"}}},
+    // LEVEL03.OVR, 8808 bytes, code to 0x800cc9cc; 16-byte scratch tail.
+    {0x6, {{0x800ca968, 8792, "5c14c693289be6c47fe546b32132d12da45bddd0eb766691ea909a5986f6ad2a"}}},
+    // LEVEL05.OVR, 14148 bytes, code to 0x800cde9c; 4-byte scratch tail.
+    {0x8, {{0x800ca968, 14144, "8f32c3d4e7ce7efc0d8a9d7074c0cfd769852bef5d0cc9c376845bc216ac1b99"}}},
+    // LEVEL06.OVR, 8504 bytes, code to 0x800cc89c; no scratch tail.
+    {0x9, {{0x800ca968, 8504, "1359bd0bc3a01a8476e19f57884ca8552e5ab6254a517b25f6acd4480ace3a86"}}},
+    // LEVEL07.OVR, 8660 bytes, code to 0x800cc944; no scratch tail.
+    {0xa, {{0x800ca968, 8660, "c23b7dadce0ee274e2bf9a0e16d340c37cbed707d7e4fe0daaa69077e39a7c30"}}},
+    // LEVEL08.OVR, 3700 bytes, code to 0x800cb5e8; no scratch tail.
+    {0xb, {{0x800ca968, 3700, "936610feed89836640ba4b3f63894175b1a9e48c825c40d7af2155579112390e"}}},
+    // LEVEL09.OVR, 12832 bytes, code to 0x800cd90c; 20-byte scratch tail.
+    {0xc, {{0x800ca968, 12812, "dd3103cd988f192f102f77b5202f99bb87ac26e74981e57e2a7ea0cc3b7ea699"}}},
+    // LEVEL10.OVR, 8266 bytes, code to 0x800cc7c0; 2-byte scratch tail.
+    {0xd, {{0x800ca968, 8264, "bed0d49718ea8cc3f1f2fd14418e8dbfb71d311b1efb625ab98c02f7e068faa0"}}},
+    // LEVEL11.OVR, 7704 bytes, code to 0x800cc590; no scratch tail.
+    {0xe, {{0x800ca968, 7704, "1fe8365cdb6113b0686c47e6191fed345eb0b1ac538e0e7e92a4835c230161ab"}}},
+    // LEVEL12.OVR, 13496 bytes, code to 0x800cdc10; no scratch tail.
+    {0xf, {{0x800ca968, 13496, "ade37e2ff55ede44db0efcf272fa9d3ffb8778aad78ed60ba8e8d61900b2d083"}}},
+    // LEVEL21.OVR, 720 bytes, code to 0x800caa80; no scratch tail.
+    {0x13, {{0x800ca968, 720, "cec21c550c21d07f04b15e55f75614ea8bfc46a3a8eaa8a1e3fb92001e879967"}}},
+    // LEVEL22.OVR, 720 bytes, code to 0x800caa80; no scratch tail.
+    {0x14, {{0x800ca968, 720, "38945110df06c5123a2a9cf8b16b23ee5097ef0f1a095f3c0c29e1311d129cc9"}}},
+    // LEVEL23.OVR, 4012 bytes, code to 0x800cb740; no scratch tail.
+    {0x15, {{0x800ca968, 4012, "5fe4d319a0605d56391ed0940ccdd73a8f3651882271f0d751875b19a0ccb08a"}}},
+    // LEVEL24.OVR, 724 bytes, code to 0x800caa84; no scratch tail.
+    {0x16, {{0x800ca968, 724, "bd3fea2e0719368977dff64e0670e14f63bc2883fe41cba3dab6513f2696f0f6"}}},
+    // LEVEL25.OVR, 2336 bytes, code to 0x800cb0d0; no scratch tail.
+    {0x17, {{0x800ca968, 2336, "ed454f198bd30fd1dbff52acc6160e313b4762a39bc273c73d1226800e2215a2"}}},
+    // LEVEL26.OVR, 4784 bytes, code to 0x800cba44; no scratch tail.
+    {0x18, {{0x800ca968, 4784, "1a4a1715d1fc6b72399aacf52e0bc65083fc02e3f106bc8068b192b4358371ac"}}},
+    // LEVEL27.OVR, 5712 bytes, code to 0x800cbdd0; 4-byte scratch tail.
+    {0x19, {{0x800ca968, 5708, "10cad7388bb9732c9770b186a0765de399282b5037dcad9545381abfd68b6f38"}}},
+    // LEVEL28.OVR, 4416 bytes, code to 0x800cb8d4; no scratch tail.
+    {0x1a, {{0x800ca968, 4416, "ccd47ab1b24b9f310ad28bd259e9f35a0d6c7132bb359a96e95acfcfcad5d739"}}},
+    // LEVEL29.OVR, 6356 bytes, code to 0x800cc058; no scratch tail.
+    {0x1b, {{0x800ca968, 6356, "a0b806bb11ca11a4d35cbf74b85e812aa2e7d5335913386cc2e48e893bc7c08e"}}},
+};

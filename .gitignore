@@ -1,0 +1,152 @@
+# Track implementation source, patches, tools and documentation.
+# Original media, generated game code, player data and build output stay local.
+
+# --- Original game / retail media (never commit) ---
+# Player dump drop folder (README is tracked; dumps are not).
+/game/*
+!/game/README.md
+
+# Legacy CloneCD / Redump drop folders.
+/Duke Nukem*/
+*.img
+*.sub
+*.ccd
+*.bin
+*.cue
+*.iso
+*.chd
+*.ecm
+*.mds
+*.mdf
+*.nrg
+*.pbp
+*.toc
+
+# Duke3D / Build archives and related packs (e.g. DUKE3D.GRP).
+*.grp
+*.GRP
+*.wad
+*.WAD
+*.pk3
+*.PK3
+*.rff
+*.RFF
+*.ssi
+*.con
+*.VOC
+*.voc
+
+# BIOS, memory cards, save data.
+SCPH*.BIN
+SCPH*.bin
+bios.cfg
+disc.cfg
+rom.cfg
+*.mcd
+*.mcr
+*.mcs
+*.gme
+*.vmp
+*.VMP
+memcard*
+
+# --- Recomp source is tracked; local inputs and outputs are not ---
+/recomp/disc/
+/recomp/generated/
+/recomp/analysis/
+/recomp/saves/
+/recomp/config/
+/recomp/build*/
+/recomp/assets/fonts/
+/recomp/assets/*.pack
+/recomp/assets/*.provenance.json
+
+# EDuke32 checkout, GRP, manuals, fonts, inventory tiles, reference configs.
+/research/
+
+# --- Local tools and Python ---
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+*.egg-info/
+.Python
+
+# --- Build / generated / runtime ---
+build/
+build-*/
+out/
+dist/
+release-stage/
+generated/
+*.o
+*.a
+*.so
+*.dylib
+*.dll
+*.exe
+*.obj
+*.lib
+*.exp
+*.pdb
+*.ilk
+CMakeCache.txt
+CMakeFiles/
+cmake-build-*/
+compile_commands.json
+.ninja_deps
+.ninja_log
+*.ninja
+
+# --- Diagnostics, captures, logs ---
+/documentation/logs/
+*.log
+*.bmp
+*.dmp
+core
+core.*
+psx_crash.txt
+psx_last_run_report.json
+psx_screenshot.bmp
+psx_freeze_heartbeat.json
+psx_*dump*
+starvation_dump.jsonl
+overlay_captures.json
+overlay_captures.json.d/
+
+# --- Personal / secrets / editor ---
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+credentials.json
+secrets.*
+.idea/
+.vscode/
+.cursor/*
+!.cursor/rules/
+!.cursor/rules/**
+.claude/*
+!.claude/skills/
+!.claude/skills/**
+.vs/
+*.user
+*.suo
+*.swp
+*.swo
+*~
+*.orig
+.DS_Store
+Thumbs.db
+desktop.ini
+ehthumbs.db
+*.tmp
+*.temp
+.cache/

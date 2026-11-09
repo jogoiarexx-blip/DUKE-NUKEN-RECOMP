@@ -1,0 +1,106 @@
+import json, struct, subprocess, sys, tempfile, unittest
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[2]
+IMAGE, EXE = ROOT / 'disc/time-to-kill.bin', ROOT / 'disc/SLUS_005.83'
+sys.path.insert(0, str(ROOT / 'tools/local'))
+
+
+@unittest.skipUnless(IMAGE.exists() and EXE.exists(), 'prepared owned disc required')
+class DiscFontPack(unittest.TestCase):
+    """D24A: the Modernized text glyphs come from the player's disc only."""
+
+    def build(self, tmp):
+        out = Path(tmp) / 'fonts.pack'
+        subprocess.run([sys.executable, str(ROOT / 'tools/local/build_ttk_fonts.py'), '--output', str(out)],
+                       check=True, capture_output=True)
+        return out.read_bytes()
+
+    def test_reproducible_three_sets(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            first, second = self.build(tmp), self.build(tmp)
+        self.assertEqual(first, second)
+        self.assertEqual(first[:8], b'TTKFONT2')
+        size, digest = struct.unpack_from('<II', first, 8)
+        payload = first[16:]
+        self.assertEqual(size, len(payload))
+        h = 2166136261
+        for b in payload:
+            h = ((h ^ b) * 16777619) & 0xffffffff
+        self.assertEqual(h, digest)
+        self.assertEqual(struct.unpack_from('<I', payload, 0)[0], 16)  # D08A19: 12 mission_used; D43: 13 level_title; D20I: 14, 15
+        line, scale, shadow, _, colour = struct.unpack_from('<BBBBI', payload, 4 + 13 * 768)
+        self.assertEqual((line, scale, shadow, colour), (19, 1, 1, 0xff140000))  # D43: red 1x, near-black shadow
+        # D20I LEVEL STATS: Medium Italic 1x, red letters and beige values, each its own shadow.
+        for s, want_colour in ((14, 0xff180400), (15, 0xff180c04)):
+            line, scale, shadow, _, colour = struct.unpack_from('<BBBBI', payload, 4 + s * 768)
+            self.assertEqual((line, scale, shadow, colour), (13, 1, 1, want_colour))
+        # line height, scale, shadow: messages, headings, console, then the D24B panel
+        # title, slot, selected slot, text and dim text, then the D08A5 FOUND text
+        # and the three 2x Microfont mission sets.
+        expected = [(19, 1, 1), (19, 2, 0), (13, 1, 1), (19, 1, 1), (13, 1, 1), (13, 1, 1), (10, 1, 0), (10, 1, 0),
+                    (10, 1, 0), (7, 2, 0), (7, 2, 0), (7, 2, 0)]
+        for s, want in enumerate(expected):
+            line, scale, shadow, _, colour = struct.unpack_from('<BBBBI', payload, 4 + s * 768)
+            self.assertEqual((line, scale, shadow), want)
+            if shadow:
+                self.assertEqual(colour, 0xff0c0c18)
+            # All caps: 'a' draws exactly as 'A'.
+            rec = lambda c: struct.unpack_from('<BBBBI', payload, 4 + s * 768 + 8 + 8 * (ord(c) - 32))
+            pix = lambda r: payload[r[4]:r[4] + r[0] * r[1] * 4]
+            self.assertEqual(rec('a')[:4], rec('A')[:4])
+            self.assertEqual(pix(rec('a')), pix(rec('A')))
+
+    def test_exclamation_from_own_font(self):
+        """D24C: '!' in the italic sets is drawn from the font's own I and period,
+        not the 8x8 system font; the console prompt '>' is a native glyph too."""
+        with tempfile.TemporaryDirectory() as tmp:
+            payload = self.build(tmp)[16:]
+        for s, height in ((0, 17), (1, 17), (2, 11), (3, 17), (4, 11), (5, 11)):
+            rec = lambda c: struct.unpack_from('<BBBBI', payload, 4 + s * 768 + 8 + 8 * (ord(c) - 32))
+            bang, i_rec = rec('!'), rec('I')
+            self.assertEqual(bang[1], height)
+            self.assertEqual(bang[0], i_rec[0])
+            self.assertEqual(rec('>')[1], height)
+            pixels = struct.unpack_from(f'<{bang[0] * bang[1]}I', payload, bang[4])
+            rows = [any(pixels[y * bang[0]:(y + 1) * bang[0]]) for y in range(height)]
+            # stem, a clear gap, then the dot
+            self.assertTrue(rows[0])
+            self.assertIn(False, rows[:max(y for y in range(height) if rows[y])])
+
+    def test_parentheses_and_percent_from_own_font(self):
+        """D24D/D24E: '(' and ')' from the font's own O, '%' from its '/' and
+        two periods; none fall back to the system font in the italic sets."""
+        with tempfile.TemporaryDirectory() as tmp:
+            payload = self.build(tmp)[16:]
+            fallback = json.loads((Path(tmp) / 'fonts.json').read_text())['sets']
+        for s, height in ((0, 17), (1, 17), (2, 11), (3, 17), (4, 11), (5, 11)):
+            self.assertFalse(set('()%') & set(fallback[s]['system_font_fallback']))
+            rec = lambda c: struct.unpack_from('<BBBBI', payload, 4 + s * 768 + 8 + 8 * (ord(c) - 32))
+            for ch in '()%':
+                self.assertEqual(rec(ch)[1], height)
+            # Each parenthesis is narrower than the O it comes from; the percent
+            # sign is wider than its slash.
+            self.assertLess(rec('(')[0], rec('O')[0])
+            self.assertLess(rec(')')[0], rec('O')[0])
+            self.assertGreater(rec('%')[0], rec('/')[0])
+
+    def test_ui_sprite_pack(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.build(tmp)
+            ui = (Path(tmp) / 'ttk-ui.pack').read_bytes()
+        self.assertEqual(ui[:8], b'TTKUI1\0\0')
+        count, offset, ids = struct.unpack_from('<I', ui, 8)[0], 12, []
+        for _ in range(count):
+            ident, w, h = struct.unpack_from('<HHH', ui, offset)
+            ids.append((ident, w, h)); offset += 6 + w * h * 4
+        self.assertEqual(offset, len(ui))
+        self.assertEqual(ids, [(1, 16, 16), (2, 16, 16), (3, 16, 16), (4, 16, 16), (5, 16, 16), (6, 96, 96)])
+
+    def test_builder_never_reads_research(self):
+        source = (ROOT / 'tools/local/build_ttk_fonts.py').read_text()
+        self.assertNotIn('research', source.replace('no research', ''))
+
+
+if __name__ == '__main__':
+    unittest.main()

@@ -1,0 +1,2645 @@
+#include <chrono>
+// D11B: near clipping for the Modernized eye view.
+//
+// Two hand-written mesh renderers draw the level:
+// - 0x80011020, the world renderer (rooms, walls, floors; callers ra
+//   0x80037344/0x80037c54/0x80062db8). It projects vertices with RTPT, drops a
+//   polygon when any vertex has SZ 0 (at or behind the eye) and projects
+//   vertices nearer than H/2 with the GTE divide saturated. Its screen-space
+//   subdivision (0x80012960) reuses those points.
+// - 0x80010000, the object renderer (props and actor joints). It drops a
+//   polygon only when every vertex is nearer than H, so a polygon with some
+//   vertices nearer than H/2 is drawn with saturated coordinates.
+// In first person that tears or removes walls, floors and props beside the eye.
+//
+// While the near path is live (Modernized eye view, third person and
+// widescreen), polygons are drawn here instead: clipped against the view
+// frustum in view space and emitted with the original colors, fog, light
+// table, texture animation, command bits, packet arena and ordering-table
+// rule of their renderer, with host depth. The original routine then runs on
+// a copy of the mesh without those polygons. Since D17AM3 (unified geometry)
+// that is every world, prop and actor polygon at every distance; the sky,
+// the first-person layer and a mesh a frame cannot afford keep the earlier
+// rule, where only polygons with an unsafe vertex (divide saturated, IR
+// clamped, or projected outside +-1000) or within the near boundary are taken
+// and the rest stay on the original path. Vanilla never reaches this code,
+// and Duke's own model is left to the original (D12).
+//
+// World mesh (0x80011020): +0x14 vertex count (half), +0x18 offset of the
+// polygon list, +0x1c vertices (8 bytes: x/y/z grid bytes and a color index
+// byte, then an RGBC word). The vertex pass reads vertices in threes, so up
+// to two records past the count are read (and may get their color index
+// nibble cleared); the copy keeps those bytes in place. Groups are a word
+// (type | count << 16), 0x60 GT3 / 0x61 GT4 8-byte records, 0xff ends.
+// Object mesh (0x80010000): +6 vertex count (byte), +0x10 vertex pointer
+// (SVECTOR, followed by a color word table), +0x14 polygon list pointer.
+// Record sizes: 0x20 F3 8, 0x28 F4 8, 0x30 G3 12, 0x38 G4 12, 0x24 FT3 16,
+// 0x2c FT4 16, 0x34 GT3 20, 0x3c GT4 20. The top 7 bits of the flags word are
+// double-sided, flat-color source, OT -1, OT +1, semi-transparent, animated.
+// Render context 0x800d67a8: +0 packet cursor, +4 arena start, +8 arena end,
+// +0x48/+0x4c command/tpage bits, +0x50 flags, +0x54/+0x5c flat colors,
+// +0x58 texture table, +0x60 animation table, +0x68 light table, +0x6c fog
+// start, +0x78 OT depth limit. Ordering table 0x800d27a0 (2048 head/tail
+// pairs) and its bitmap 0x800d26a0.
+#include "near_clip.h"
+#include "sky_render.h"
+#include "sky_borrow.h"
+#include "bio_mask_mesh.h"
+#include "bio_mask_atlas.h"
+#include "pgxp.h"
+#include "modern_controls.h"
+#include "pc_input.h"
+#include "cpu_state.h"
+#include "mod_plugins.h"
+#include "code_identity.h"
+#include "live_env.h"
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <cmath>
+#include <cstdio>
+#include <cstdint>
+#include <cstring>
+#include <cstdlib>
+#include <string_view>
+#include <vector>
+#include <unordered_map>
+#include <sstream>
+#include <iomanip>
+#ifdef _WIN32
+#include <process.h>
+#else
+#include <unistd.h>
+#endif
+
+extern "C" uint8_t* g_psx_ram;
+extern "C" uint32_t g_dirty_ram_code_gen;
+namespace ttk {
+// D17AT6 (host_visibility.inc): rooms Polymorph showed this frame.
+bool host_visibility_room_shown(uint32_t room);
+namespace {
+struct Guard { uint32_t address, size; const char* digest; };
+const Guard near_guards[]={
+    {0x80026164,0x16c,"2f7723597bd0c04e95aaf4be6eacfa8504cdd5b05632a7aa2edad1af86a17f38"},
+    {0x80010000,0xd18,"cf197784e09dc094b6c5552df68f71230c5b90ac416612abf3788a811e038acd"},
+    {0x80011020,0xd4c,"f5a4dfa2c0f306b1c3d3250a160717afec9244d79fd5e321f39e767df1587e75"},
+    {0x8002ee50,0x140,"51137c3bebd7496a800d365fab7182a782adf13dd118c13ed37862d88bd4246d"},
+    {0x80031fa0,0xe0,"1b0716bbbd34f60bef3a25c3dd0d6c5ffc05b0c5aac3790876d97901e89afb47"},
+    {0x8003226c,0x1c,"1099921f82b3198498a863d215b859610e50600def43159cace74903a7091f47"},
+};
+constexpr uint32_t context=0x800d67a8, ordering=0x800d27a0, bitmap=0x800d26a0;
+constexpr uint32_t color_table=0x800c37e4;
+constexpr uint32_t copy_size=0x10000;
+// Guard band (angular ratio vx/vz or vy/vz) and near plane. Expressed as a
+// ratio so the threshold is independent of the GTE H register (FOV). The
+// values 3.0 and 1.5 are guard_x/h_native = 480/160 and guard_y/h_native =
+// 240/160, preserving the native-FOV guard exactly while widening it for
+// larger H values (wider FOV). A triangle inside stays within the GPU's
+// 1023x511 primitive limit at any FOV.
+constexpr double guard_xr=3.0, guard_yr=1.5, near_z=16;
+int env_int(const char* name,int fallback,int lo,int hi) {
+    const char* t=std::getenv(name);char* end=nullptr;const long v=t?std::strtol(t,&end,10):0;
+    return t && end && !*end && v>=lo && v<=hi ? (int)v : fallback;
+}
+// Developer tuning (not saved preferences).
+// D17A: host prop pieces outside unified geometry (the sky, and meshes a
+// frame cannot afford) sort four OT slots (128 units) nearer than their
+// average depth. Props stand flush against world walls (the apartment
+// wardrobe); with both surfaces subdivided and sorted by average depth, wall
+// pieces behind otherwise won the sort in a comb pattern. Actors keep no
+// bias. DNTTK_NEAR_OBJECT_BIAS overrides.
+int object_bias() {static const int v=env_int("DNTTK_NEAR_OBJECT_BIAS",-4,-8,8);return v;}
+// DNTTK_NEAR_TINT=1 (developer): host world pieces red, object pieces blue.
+bool tint() {static const bool v=env_int("DNTTK_NEAR_TINT",0,0,1)==1;return v;}
+// D17A host precise vertices: every emitted piece carries exact positions
+// that follow the original renderer's edges, plus per-vertex depth and
+// texture coordinates, so the GPU maps it with correct perspective. Pieces
+// outside unified geometry are split only to keep their sort depth local.
+uint64_t precise_triangles;
+double precise_split_pixels() {static const double v=env_int("DNTTK_NEAR_SPLIT_PX",192,32,1024);return v;}
+double precise_depth_ratio() {static const double v=env_int("DNTTK_NEAR_SPLIT_RATIO",150,105,400)/100.0;return v;}
+// D17AM unified geometry (Modernized default since D17AM3, notes 324-326):
+// every world, prop and actor polygon is drawn here at every distance, with
+// one rule set: each piece in its source polygon's native ordering slot (no
+// per-piece keys, object bias or depth-locality splits), unclipped quads as
+// one packet on the native 1-2 diagonal (clipped ones as their two native
+// halves), one prop contact allowance, the D17W coplanar rank, and
+// translucent faces painter-only (no depth). Sky meshes, water tiles and the
+// first-person layer keep their paths; a mesh the frame cannot afford is
+// drawn with the earlier near-boundary rules (below) and scene depth.
+// DNTTK_UNIFIED_GEOMETRY=0 (developer) restores those rules everywhere.
+// D40: otherwise the live renderer decides (Classic: off).
+bool unified() {
+    static const int v=ttk_env_switch("DNTTK_UNIFIED_GEOMETRY");
+    return (v<0 ? !ttk_world_classic() : v==1) && input_modernized();
+}
+// The vertex pass of the mesh renderer (0x80011170) clears the colour-index
+// nibble of every vertex it reads (vertex groups of three). Lights such as the
+// muzzle flash set it on the vertices they reach, so a mesh that is never
+// drawn keeps its light.
+void clear_color_index(uint32_t mesh,unsigned count) {
+    const unsigned read_verts=(count+2)/3*3;
+    for(unsigned i=0;i<read_verts;++i) {
+        const uint32_t b=mesh+0x1c+8*i+3;const uint8_t v=psx_mod_read_byte(b);
+        if(v&0xf) psx_mod_write_byte(b,v&0xf0);
+    }
+}
+constexpr unsigned max_depth=12;
+// Packet arena (D17R1). Host packets have their own arena in the GPU DMA
+// aperture (24-bit OT links reach it), never the game's render ring (ctx+4..+8,
+// 139744 bytes). Sharing that ring capped host packets at 60% of it per frame,
+// and with the extended draw distance the game alone fills 61% in the medieval
+// canal: every later mesh, the sky last of all, fell back to the original path,
+// whose near rejection left stair-stepped holes in the clouds. The arena is
+// one 512 KB allocation (unchanged since D17R1, so savestates keep their
+// layout and the D20C mirror word after it). D17AR2: it is split into two
+// 256 KB regions, one per frame in turn (D17R1 had four of 128 KB). The GPU
+// walks a frame's list serially after that frame is built, so frame N's list
+// is done before frame N+1's starts, and its region is rewritten only while
+// frame N+2 is built. Host world visibility at jetpack height over the level-6
+// moat needs about 230 KB a frame; the distant pieces that did not fit went
+// back to the original renderer, which drew them black. Short of budget,
+// pieces stop splitting, and a mesh that cannot be afforded stays entirely on
+// the original path.
+constexpr uint32_t arena_bytes=512*1024, host_regions=2, host_frame_bytes=arena_bytes/host_regions;
+constexpr uint32_t split_reserve=8*1024, takeover_reserve=6*1024;
+// Outside unified geometry (the sky, unaffordable meshes and the developer
+// comparison), polygons with a corner this near are drawn here. The PS1 maps textures
+// affinely; where an original polygon meets a subdivided one the shared edge
+// would map differently and the texture kinks. Past this depth the difference
+// is below a pixel or two on 1024-unit cells.
+constexpr uint32_t perspective_z=1536;
+// Props are taken over further out: an original prop polygon sorts by its
+// whole average depth, and a host wall piece beside it could cover it (the
+// apartment wardrobe's inner door, about 2000 units away).
+constexpr uint32_t object_perspective_z=3072;
+struct Frame;
+bool unified_scene(const Frame& f);
+// Per-frame demand (bytes emit wanted, written or not) and host hook time.
+uint32_t frame_demand_bytes,demand_peak;uint64_t demand_frames,demand_over,demand_total;
+uint64_t frame_hook_us,hook_us_peak,hook_us_total,hook_frames,frame_emits,emits_peak;
+// Demand by owner: world, prop (and water), actor, sky, first-person layer.
+uint32_t frame_kind_bytes[5],kind_peak[5];uint64_t kind_total[5];
+// D17AR2: the packets the props and actors (which follow the room walk) drew
+// last frame plus what the meshes refused the host path would have needed (a
+// quad each): a reserve sized from what they drew alone would shrink once
+// they were squeezed.
+uint32_t frame_after_missed=0,last_after_walk_bytes=0;
+void measure_rollover() {
+    if(frame_demand_bytes || frame_hook_us) {
+        ++demand_frames;demand_total+=frame_demand_bytes;demand_peak=std::max(demand_peak,frame_demand_bytes);
+        demand_over+=frame_demand_bytes>host_frame_bytes;
+        ++hook_frames;hook_us_total+=frame_hook_us;hook_us_peak=std::max(hook_us_peak,frame_hook_us);
+        emits_peak=std::max(emits_peak,frame_emits);
+        for(int k=0;k<5;++k){kind_peak[k]=std::max(kind_peak[k],frame_kind_bytes[k]);kind_total[k]+=frame_kind_bytes[k];}
+    }
+    if(frame_demand_bytes) last_after_walk_bytes=frame_kind_bytes[1]+frame_kind_bytes[2]+frame_after_missed;
+    frame_after_missed=0;
+    for(auto& b:frame_kind_bytes) b=0;
+    frame_demand_bytes=0;frame_hook_us=0;frame_emits=0;
+}
+
+struct Stats { uint64_t seen,taken,polys,culled,triangles,budget_hits,skipped; };
+Stats world_stats,object_stats;
+uint64_t refused,copy_overflows,duke_skips,fades_skipped,fade_tests;
+uint32_t empty_rect;
+uint32_t copy_base;
+int32_t last_zsf3;
+uint32_t arena_size;uint64_t packet_skips,mesh_fallbacks;
+// Frame accounting: a frame starts when the OT bitmap is still empty.
+uint32_t frame_first_cursor,frame_host_bytes,frame_used_peak,host_bytes_peak;
+uint32_t mask_arena;
+uint64_t mask_draws,mask_triangles;
+// Keep the accepted 1174-triangle capacity for asset rollback. Four regions
+// coexist with the 512 KiB world arena and 320 KiB animation overrides.
+// Reserve before any savestate load: importing a saved allocation tail must
+// not fill the aperture while this process still has a null mask_arena.
+constexpr uint32_t mask_frame_bytes=47*1024;
+// The Bio Mask allocation keeps its four blocks (savestate layout); each
+// region takes two neighbouring ones (94 KB) after its host block.
+constexpr uint32_t mask_blocks=4, region_mask_bytes=mask_frame_bytes*(mask_blocks/host_regions);
+static_assert(mask_blocks%host_regions==0,"regions share the Bio Mask blocks evenly");
+struct HeldPacket { uint32_t prim,tag; double z; };
+std::vector<HeldPacket> held_packets;
+uint32_t held_frame;
+// D20C: the region in use is mirrored in the word after the arena (mod memory,
+// which savestates carry with the arena). A loaded frame's ordering table links
+// into the region it was built in, so after a load the next frame moves on from
+// that one rather than from this process's, which could be the same region and
+// overwrite it. A state without mod memory reads an end-of-list fill: any region.
+// D17AR2: the mirror holds the region plus mirror_tag, so a state saved with
+// the four 128 KB regions (values 0-3) is told apart from one saved with the
+// two 256 KB regions (values 4-5); the next region after a load is the one its
+// frame's packets do not occupy, in either layout.
+constexpr uint32_t mirror_tag=4;
+uint32_t host_arena_base,host_region,region_mirror,region_loads;
+// A displayed frame's packets all go in one region (see the arena above).
+// Besides the composition, a pass that starts on an empty OT (the world
+// renderer called from 0x80037c54 and the object filter from 0x80038c94 in
+// the level-0 club, D17AR3) also resets the frame; rotating at each of them
+// took three regions a frame there, so with two the frame's last pass
+// overwrote its first before the GPU drew it (garbage lines, then GP0 0x1F /
+// 0xFD halts). The first reset after a flip picks the frame's region; later
+// ones keep appending to it. Cleared by near_clip_flip().
+bool region_chosen=false;
+void region_mirror_store() {if(region_mirror) psx_mod_write_word(region_mirror,host_region+mirror_tag);}
+uint32_t region_after(uint32_t mirrored) {
+    if(mirrored>=mirror_tag && mirrored<mirror_tag+host_regions) return (mirrored-mirror_tag+1)%host_regions;
+    if(mirrored<4) return (mirrored*128*1024/host_frame_bytes+1)%host_regions; // D17R1 layout
+    return 0;
+}
+// Reserved at startup (see the constructor below), not at the first packet: a
+// state loaded before that would find the aperture unmapped, and the loaded
+// ordering table's links into it would fold into main RAM and draw garbage.
+// A zeroed mirror reads as D17R1 region 0, whose packets lie in region 0, so
+// a load moves on to region 1.
+// D17AX: each region also gets 1 MB of the second GPU DMA aperture after
+// its host and Bio Mask blocks (the first aperture is full), about 1.35 MB a
+// frame. The jetpack vista over the level-6 moat filled the 350 KB region in
+// about half its frames, and the distant pieces that did not fit went back to
+// the original renderer, which drew them dark: they flickered between the
+// two. The vista peaks near 480 KB. Savestates carry that aperture as an
+// optional tail and the first aperture's layout is unchanged, so existing
+// saves load. The two regions take alternate 64 KB chunks of it, so what a
+// frame uses sits at the start of the aperture for either region: replay
+// images and savestates copy only the part ever written. Developer
+// DNTTK_EXTRA_ARENA=0: without it.
+constexpr uint32_t extra_region_bytes=1024*1024,extra_chunk=64*1024;
+uint32_t extra_arena=0;
+uint32_t host_arena() {
+    if(!host_arena_base) {
+        host_arena_base=psx_mod_alloc_gpu_dma_memory(arena_bytes+16,16);
+        if(host_arena_base) region_mirror=host_arena_base+arena_bytes;
+    }
+    static const bool extra=env_int("DNTTK_EXTRA_ARENA",1,0,1)!=0;
+    if(extra && !extra_arena) extra_arena=psx_mod_alloc_gpu_dma_extra_memory(extra_region_bytes*host_regions,16);
+    return host_arena_base;
+}
+// D20H: a state is usually saved part way through drawing a frame, and the
+// loaded game resumes that frame. Its ordering table links into the packets
+// already written to the mirrored region, while this process's cursor came
+// from whatever it drew before the load. Continuing at that cursor (until the
+// next frame boundary, where this used to be checked) could overwrite those
+// packets in the same region, so the GPU followed links into the middle of
+// new packets: garbage commands that corrupted VRAM (the extreme colours)
+// and could halt on an unknown GP0 command. Checked at every hook and packet,
+// the rest of a loaded frame goes to the next region from its start, and
+// first-person packets held from before the load are dropped.
+void scene_depth_cancel();
+void region_after_load() {
+    const uint32_t loads=psx_mod_savestate_loads();
+    if(loads==region_loads || psx_mod_replay_active()) return;
+    region_loads=loads;
+    held_packets.clear();scene_depth_cancel();
+    if(!region_mirror) return;
+    host_region=region_after(psx_mod_read_word(region_mirror));
+    frame_host_bytes=0;region_chosen=true;
+    region_mirror_store();
+}
+// A new frame's packets start a fresh region; an unused one is kept. Later
+// resets before the next flip continue in the same region.
+void measure_rollover();
+void host_frame_reset() {
+    measure_rollover();
+    if(region_chosen) return;
+    if(frame_host_bytes) host_region=(host_region+1)%host_regions;
+    frame_host_bytes=0;region_chosen=true;
+    region_mirror_store();
+}
+// D17AM2: a frame's region is its host block plus its Bio Mask space (one
+// 47 KB block then; since D17AR2 a 256 KB block and two Bio Mask blocks),
+// filled through one cursor (frame_host_bytes). The two GPU DMA allocations,
+// their order and the D20C mirror word are unchanged, so savestates keep their
+// layout. No packet straddles the two parts.
+constexpr uint32_t base_region_bytes=host_frame_bytes+region_mask_bytes;
+uint32_t region_bytes() {return base_region_bytes+(extra_arena?extra_region_bytes:0);}
+uint32_t region_address(uint32_t offset) {
+    const uint32_t r=host_region%host_regions;
+    if(offset<host_frame_bytes) return host_arena()+r*host_frame_bytes+offset;
+    if(offset<base_region_bytes) return mask_arena+r*region_mask_bytes+(offset-host_frame_bytes);
+    const uint32_t o=offset-base_region_bytes;
+    return extra_arena+((o/extra_chunk)*host_regions+r)*extra_chunk+o%extra_chunk;
+}
+// D12 first-person weapon. Every polygon of the hand, weapon, flash and held
+// item meshes is drawn here while first_person_weapon_drawing(). Their packets
+// are written as usual but linked only when Duke's draw ends: sorted by depth
+// and appended to ordering-table slot 1, drawn after everything but slot 0
+// (the HUD and geometry nearer than 32 units), so a wall between the eye and
+// the weapon cannot cover or cut it.
+// Slot 1, not 0: the HUD (health and ammo boxes) is in slot 0 and must stay
+// on top of the weapon.
+constexpr uint32_t viewmodel_slot=1;
+
+uint64_t viewmodel_meshes,viewmodel_packets,viewmodel_discards;
+uint64_t game_view_drops;   // D52: object faces left to the original in a game-owned view
+
+// DNTTK_NEAR_CLIP (developer A/B, not a saved preference): 0 off, "world" or
+// "object" for one renderer only; anything else, or unset, both.
+unsigned renderers() {
+    static const unsigned value=[]{
+        const char* t=std::getenv("DNTTK_NEAR_CLIP");
+        if(!t) return 3u;
+        const std::string_view v(t);
+        return v=="0"?0u:v=="world"?1u:v=="object"?2u:3u;
+    }();
+    return value;
+}
+bool enabled() {return renderers()!=0;}
+bool identity() {
+    static std::array<std::vector<uint32_t>,std::size(near_guards)> expected;
+    static IdentityMemo memo;
+    const uint64_t frame=input_host_frame();
+    if(!memo.valid(frame,g_dirty_ram_code_gen))
+        memo.set(frame,g_dirty_ram_code_gen,code_identity(near_guards,expected,psx_mod_read_word,g_psx_ram));
+    return memo.ok;
+}
+int32_t clamp(int64_t v,int64_t lo,int64_t hi){return (int32_t)std::min(hi,std::max(lo,v));}
+// Hardware divide (psx-spx UNR), as the runtime's gte_divide.
+uint8_t div_table[0x101];
+int32_t gte_divide(uint16_t h,uint16_t sz) {
+    static const bool ready=[]{
+        for(uint32_t d=0x8000;d<0x10000;d+=0x80) {
+            uint32_t xa=512;
+            for(unsigned i=1;i<5;++i) xa=(xa*(1024u*512u-((d>>7)*xa)))>>18;
+            div_table[(d>>7)&0xff]=(uint8_t)(((xa+1)>>1)-0x101);
+        }
+        div_table[0x100]=div_table[0xff];return true;
+    }();(void)ready;
+    if((uint32_t)sz*2<=h) return 0x1ffff;
+    unsigned shift=0;while(shift<16 && !(sz&(0x8000u>>shift)))++shift;
+    const uint32_t n=(uint32_t)h<<shift,d=(uint32_t)sz<<shift;
+    const uint16_t dd=(uint16_t)(d|0x8000);
+    const int32_t x=0x101+div_table[((dd&0x7fff)+0x40)>>7];
+    const int32_t t=(((int32_t)dd*-x)+0x80)>>8;
+    const int32_t r=((x*(131072+t))+0x80)>>8;
+    const uint32_t q=(uint32_t)(((uint64_t)n*(uint32_t)r+32768)>>16);
+    return (int32_t)std::min<uint32_t>(q,0x1ffff);
+}
+NearGte read_gte(const CPUState* cpu) {
+    NearGte g{};
+    const uint32_t* c=cpu->gte_ctrl;
+    g.r[0][0]=(int16_t)c[0];g.r[0][1]=(int16_t)(c[0]>>16);g.r[0][2]=(int16_t)c[1];
+    g.r[1][0]=(int16_t)(c[1]>>16);g.r[1][1]=(int16_t)c[2];g.r[1][2]=(int16_t)(c[2]>>16);
+    g.r[2][0]=(int16_t)c[3];g.r[2][1]=(int16_t)(c[3]>>16);g.r[2][2]=(int16_t)c[4];
+    for(int i=0;i<3;++i){g.tr[i]=(int32_t)c[5+i];g.fc[i]=(int32_t)c[21+i];}
+    g.ofx=(int32_t)c[24];g.ofy=(int32_t)c[25];g.h=(uint16_t)c[26];
+    return g;
+}
+
+// e: the GTE's integer screen position minus the true projection (original
+// corners); new points carry it interpolated along their edge, so a piece's
+// edge runs exactly where the original renderer's neighbouring polygon has it.
+// n (D41H): world-space shading normal of a lit model corner (0: none).
+struct Vertex { double p[3],uv[2],rgb[3]; int original; double ex=0,ey=0; double n[3]={0,0,0}; };
+// One polygon to draw here: attributes resolved as its renderer would.
+struct Poly {
+    uint32_t source=0;
+    bool phone_back=false;
+    bool native_order=false;int native_slot=-1;
+    unsigned count;int idx[4];uint32_t colors[4],uv[4],clut,tpage,command;bool textured;int bias;
+    // D41H: smoothed world normal per corner (zero: the face's own) and
+    // whether the face is seen from both sides (light from either side).
+    float n[4][3]{};bool two_sided=false;
+    bool actor;
+    // Shared source depth for world polygons and coplanar prop groups.
+    double key_z;
+    NearDepthPlane depth_plane;
+    // D17W: coplanar overlapping faces of the same mesh the original paints
+    // over this one (rank_coplanar).
+    unsigned coplanar_rank=0;
+    // Units the depth plane moves away from the eye (near water tiles).
+    double depth_push=0;
+    // D17AT3: test depth but never write it (water surfaces).
+    bool depth_test_only=false;
+    // D17AT5: write depth without colour (the depth pass of a decal).
+    bool depth_only=false;
+    // D17AT6: raster depth from the unshifted plane, then scaled (below 1:
+    // nearer). Moving a plane toward the eye by s scales every depth on it by
+    // 1 - s/|d|; doing it after the raster fallback keeps a decal's two
+    // passes in their order even where a shifted plane would fall back.
+    double depth_scale=1;
+    // D17AU: corners at the exact projection of their view positions, not
+    // the game's GTE screen positions (see model_link).
+    bool exact_screen=false;
+};
+struct Frame {
+    bool biomask=false;
+    // D17AM2: world/prop/actor geometry the unified rules apply to (not the
+    // sky, first-person layer, fixed-projection limbs, Bio Mask or water).
+    bool scene=false;
+    bool trace=false;uint64_t trace_call=0;uint32_t mesh=0,instance=0,caller=0;
+    double coverage=1.0;
+    bool far=false; // scene mesh with every vertex at least far_z away
+    NearGte g;bool object,viewmodel;bool sky=false;bool borrowed=false;uint32_t far_limit,zsf3,zsf4;
+    // D41C: a primary-Duke presentation draw (first-person weapon layer,
+    // display or contact limbs) that takes the frame's lights.
+    bool duke_lit=false;
+    bool glow=false; // D41D1: a neon sign prop: gives light, never lit
+    std::vector<NearProjected> verts;unsigned emitted;Stats* stats;
+};
+
+bool unified_scene(const Frame& f) {return f.scene && unified();}
+
+// D17L diagnostic only: opt in with DNTTK_PRIMITIVE_TRACE=/absolute/prefix.
+// Create prefix.enable to record, remove it to stop. Each process has a separate
+// append-only JSONL file, including frozen workers; no inherited buffered writes.
+// Records identify source decisions, not proof of native GPU submission/visibility.
+long trace_pid() {
+#ifdef _WIN32
+    return _getpid();
+#else
+    return getpid();
+#endif
+}
+const char* trace_path() {static const char* p=std::getenv("DNTTK_PRIMITIVE_TRACE");return p;}
+void trace_record(const Frame& f,const char* event,uint32_t face,const std::string& extra={}) {
+    if(!f.trace) return;
+    static long owner=0;static FILE* out=nullptr;static unsigned count=0;
+    const long pid=trace_pid();
+    if(owner!=pid) {
+        if(out) std::fclose(out);
+        owner=pid;count=0;
+        const std::string path=std::string(trace_path())+"."+std::to_string(pid)+".jsonl";
+        out=std::fopen(path.c_str(),"a");
+        if(out) std::setvbuf(out,nullptr,_IONBF,0);
+    }
+    static const unsigned limit=env_int("DNTTK_PRIMITIVE_TRACE_LIMIT",200000,1,2000000);
+    if(!out || count>=limit) return;
+    ++count;
+    std::ostringstream line;
+    line << "{\"event\":\"" << event << "\",\"pid\":" << pid
+         << ",\"call\":" << f.trace_call << ",\"host_frame\":" << input_host_frame()
+         << ",\"load_epoch\":" << psx_mod_savestate_loads()
+         << ",\"replay\":" << psx_mod_replay_active() << ",\"frame_cursor\":" << frame_first_cursor
+         << ",\"mesh\":" << f.mesh << ",\"instance\":" << f.instance
+         << ",\"caller\":" << f.caller << ",\"object\":" << f.object
+         << ",\"face\":" << face << extra << "}\n";
+    const std::string text=line.str();std::fwrite(text.data(),1,text.size(),out);
+    if(count==limit) std::fputs("{\"event\":\"limit\"}\n",out);
+}
+void trace_begin(Frame& f,const CPUState* cpu) {
+    if(!trace_path() || !*trace_path()) return;
+    const std::string enable=std::string(trace_path())+".enable";
+    FILE* gate=std::fopen(enable.c_str(),"r");if(!gate) return;std::fclose(gate);
+    f.mesh=cpu->gpr[4];f.caller=cpu->gpr[31];
+    // s2 identifies the static instance only at this authenticated caller.
+    f.instance=f.object && f.caller==0x80032288 ? cpu->gpr[18] : 0;
+    static const uint32_t filter=[] {const char* p=std::getenv("DNTTK_PRIMITIVE_TRACE_MESH");return p?(uint32_t)std::strtoul(p,nullptr,0):0u;}();
+    if(filter && filter!=f.mesh) return;
+    static uint64_t serial=0;f.trace_call=++serial;f.trace=true;
+    std::ostringstream x;x << ",\"context_flags\":" << psx_mod_read_word(context+0x50)
+      << ",\"command_bits\":" << psx_mod_read_word(context+0x48)
+      << ",\"limits\":[" << psx_mod_read_word(context+0x6c) << ',' << psx_mod_read_word(context+0x70) << ','
+      << psx_mod_read_word(context+0x74) << ',' << psx_mod_read_word(context+0x78) << "],\"rect\":[" << (int16_t)psx_mod_read_half(context+0x18) << ','
+      << (int16_t)psx_mod_read_half(context+0x1a) << ',' << (int16_t)psx_mod_read_half(context+0x1c) << ','
+      << (int16_t)psx_mod_read_half(context+0x1e) << "],\"gte\":[";
+    for(int i=0;i<32;++i) {if(i)x<<',';x<<cpu->gte_ctrl[i];}x<<']';
+    trace_record(f,"mesh",0,x.str());
+}
+void trace_vertices(const Frame& f) {
+    if(!f.trace) return;
+    std::ostringstream x;x << std::setprecision(12) << ",\"vertices\":[";
+    for(size_t i=0;i<f.verts.size();++i) {
+        if(i)x<<',';const auto& v=f.verts[i];
+        x<<'['<<(int16_t)v.sxy<<','<<(int16_t)(v.sxy>>16)<<','<<v.sz<<','<<v.safe;
+        for(double p:v.view)x<<','<<p;x<<']';
+    }
+    x<<']';trace_record(f,"vertices",0,x.str());
+}
+void trace_face(const Frame& f,uint32_t face,unsigned corners,const char* decision) {
+    if(!f.trace) return;
+    std::ostringstream x;x<<",\"decision\":\""<<decision<<"\",\"indices\":[";
+    const uint32_t w=psx_mod_read_word(face);
+    for(unsigned i=0;i<corners;++i){if(i)x<<',';x<<((w>>(8*i))&255);}x<<']';
+    trace_record(f,"face",face,x.str());
+}
+
+// The GPU skips a primitive wider than 1023 or taller than 511 pixels, so a
+// polygon whose corners project safely can still vanish when it fills the
+// view up close (the apartment wardrobe). Such polygons are drawn here.
+bool oversize(const Frame& f,const int* idx,unsigned corners) {
+    int x0=4096,x1=-4096,y0=4096,y1=-4096;
+    for(unsigned j=0;j<corners;++j) {
+        const uint32_t p=f.verts[idx[j]].sxy;const int x=(int16_t)p,y=(int16_t)(p>>16);
+        x0=std::min(x0,x);x1=std::max(x1,x);y0=std::min(y0,y);y1=std::max(y1,y);
+    }
+    return x1-x0>1023 || y1-y0>511;
+}
+// Bytes still available to host packets this frame.
+// Bio Mask worn: the flags its draw tests (first_person.inc), read from guest
+// RAM so live frames and in-between images reserve alike.
+bool mask_worn() {
+    constexpr uint32_t player=0x800d7198u;
+    return (psx_mod_read_half(player+0x35c)&2) && psx_mod_read_half(player+0x35e);
+}
+// Cursor limit for a packet's owner. Current renderer: host pieces and the
+// weapon keep the host block as before; the mask and frozen tint use the
+// rest. Unified: everything but the mask leaves the mask what the built mesh
+// needs while it is worn (one packet per triangle; the tint's otherwise); all
+// but the first-person layer leave it 8 KB; all but the sky and that layer
+// leave 32 KB for the sky, which is drawn last (the medieval canal's sky
+// peaks near 25 KB at FOV 120).
+// D17AM3: a scene mesh whose nearest vertex is at least far_z away leaves
+// 48 KB for nearer ones. In the heaviest view found (level 28 at FOV 120:
+// world 114 KB, props 30 KB, actors 5.5 KB) meshes drawn first otherwise
+// took the scene budget and near props and walls later in the frame fell
+// back whole to the original renderer, without near clipping. Now distant
+// meshes are downgraded first: they have no polygon near enough to be drawn
+// here, so they stay native with scene depth (the accepted D17AE renderer).
+// DNTTK_UNIFIED_FAR_RESERVE_KB (developer) overrides the 48 KB.
+constexpr uint32_t viewmodel_reserve=8*1024, sky_reserve=32*1024, tint_reserve=256, far_z=4096;
+uint32_t far_reserve() {static const uint32_t v=1024u*env_int("DNTTK_UNIFIED_FAR_RESERVE_KB",48,0,96);return v;}
+// D17AR2: the host world pass draws its pieces nearest first, so each of
+// them, near or distant, leaves room only for what is drawn after the room
+// walk: the props and actors (the sky and first-person layer keep their own
+// reserves). Without it the wider world selection could take the whole frame
+// and every prop fell back.
+// It leaves what they asked for last frame plus a quarter, two meshes' takeover
+// allowance (each mesh is admitted only with its own) and 4 KB, between 24 and
+// 64 KB. Before, distant pieces went back to
+// the original renderer once a frame held about 80 KB, and it drew them black.
+// In such a frame the props and actors themselves no longer leave the far
+// reserve: the world already left them their share.
+bool host_piece=false,host_frame=false;
+uint32_t after_walk_reserve() {
+    return std::clamp<uint32_t>(last_after_walk_bytes+last_after_walk_bytes/4+2*takeover_reserve+4096,24*1024,64*1024);
+}
+constexpr uint32_t mask_reserve=(uint32_t)std::size(bio_mask_mesh)*0x28+tint_reserve;
+static_assert(mask_reserve<=mask_frame_bytes,"Bio Mask mesh exceeds its block");
+uint32_t cursor_limit(const Frame& f) {
+    if(f.biomask) return region_bytes();
+    if(!unified()) return host_frame_bytes;
+    return region_bytes()-(mask_worn()?mask_reserve:tint_reserve)-(f.viewmodel?0:viewmodel_reserve)-(f.viewmodel || f.sky?0:sky_reserve)-(host_piece?after_walk_reserve():f.far && !(host_frame && f.object)?far_reserve():0);
+}
+uint32_t budget(const Frame& f) {
+    if(!host_arena() || !mask_arena) return 0;
+    const uint32_t limit=cursor_limit(f);
+    return frame_host_bytes<limit?limit-frame_host_bytes:0;
+}
+// One packet's address in this frame's region, or 0 when it does not fit.
+uint32_t packet_alloc(const Frame& f,uint32_t size) {
+    region_after_load();
+    uint32_t at=frame_host_bytes;
+    if(at<host_frame_bytes && at+size>host_frame_bytes) at=host_frame_bytes;
+    if(at<base_region_bytes && at+size>base_region_bytes) at=base_region_bytes;
+    if(at>=base_region_bytes && (at-base_region_bytes)/extra_chunk!=(at+size-1-base_region_bytes)/extra_chunk)
+        at=base_region_bytes+((at-base_region_bytes)/extra_chunk+1)*extra_chunk;
+    if(!host_arena() || !mask_arena || at+size>cursor_limit(f)) return 0;
+    frame_host_bytes=at+size;host_bytes_peak=std::max(host_bytes_peak,frame_host_bytes);
+    return region_address(at);
+}
+void screen(const Frame& f,const Vertex& v,double& x,double& y) {
+    x=f.g.ofx/65536.0+f.g.h*v.p[0]/v.p[2];y=f.g.ofy/65536.0+f.g.h*v.p[1]/v.p[2];
+}
+// New corners are floored like the GTE (the host vertex carries the exact
+// sub-pixel position). Original corners keep the GTE value.
+uint32_t packed_xy(const Frame& f,const Vertex& v) {
+    if(v.original>=0) return f.verts[v.original].sxy;
+    double x,y;screen(f,v,x,y);x+=v.ex;y+=v.ey;
+    const int32_t sx=clamp((int64_t)std::floor(x),-0x400,0x3ff),sy=clamp((int64_t)std::floor(y),-0x400,0x3ff);
+    return (uint32_t)(uint16_t)sx | (uint32_t)(uint16_t)sy<<16;
+}
+bool tint_object;
+uint32_t rgb_word(const Vertex& v) {
+    if(tint()) return tint_object?0xc04020u:0x2040c0u;
+    uint32_t w=0;
+    for(int i=0;i<3;++i) w|=(uint32_t)clamp(std::lround(v.rgb[i]),0,255)<<(8*i);
+    return w;
+}
+uint32_t uv_word(const Vertex& v) {
+    return (uint32_t)clamp(std::lround(v.uv[0]),0,255) | (uint32_t)clamp(std::lround(v.uv[1]),0,255)<<8;
+}
+// Ordering-table slot: world 0x800117d0 (source maximum SZ >> 5), object 0x800104a8
+// (AVSZ3 >> 3 with the polygon's +-1 bias). -1 when past the depth limit.
+int slot_index(const Frame& f,const Poly& poly,const Vertex* v) {
+    if(poly.native_order) return poly.native_slot;
+    uint32_t sz[3];
+    for(int i=0;i<3;++i) sz[i]=(uint32_t)clamp(std::lround(poly.key_z>0?poly.key_z:v[i].p[2]),1,0xffff);
+    if(!f.object) {
+        const uint32_t nearest=(sz[0]+sz[1]+sz[2])/3;
+        if((int32_t)(nearest>>2)>=(int32_t)f.far_limit) return -1;
+        return (int)std::min<uint32_t>(nearest>>5,0x7ff);
+    }
+    const int32_t otz=clamp(((int64_t)f.zsf3*(sz[0]+sz[1]+sz[2]))>>12,0,0xffff);
+    if(otz>=(int32_t)f.far_limit) return -1;
+    return clamp((otz>>3)+poly.bias+(poly.actor?0:object_bias()),0,0x7ff);
+}
+// D41A: view to world (relative to the eye) for lit corners: v = M d / 4096,
+// so d = 4096 M^-1 v. Set by the host walk each frame, cleared at its start.
+bool light_frame=false,light_smooth=false;double light_inv[9];
+// D41C: Duke's own layers too (weapon, held item, display arms and legs):
+// their view-space corners are where they appear before the eye, so world
+// lights reach them where the player sees them. The first-person layer's
+// translucent faces (the muzzle flash itself) keep their own colour.
+bool lit_frame(const Frame& f,const Poly& poly) {
+    if(!light_frame || f.sky || f.biomask || poly.depth_only || f.glow) return false;
+    if(f.duke_lit) return unified() && !(f.viewmodel && (poly.command&0x02000000u));
+    return unified_scene(f) && !f.viewmodel;
+}
+// D41C: Duke's third-person body is host-drawn (like the screen-door body)
+// while this image carries lights, so it takes them and the dimmed painted
+// light. DNTTK_DUKE_LIGHT=0 (developer) leaves him to the original renderer.
+bool duke_light_on() {static const bool v=env_int("DNTTK_DUKE_LIGHT",1,0,1)!=0;return v;}
+// Packet allocation (0x800117a8/0x80010480) and single-packet OT insert.
+// n is 3, or 4 for a quad in PS1 corner order (the GPU draws 0-1-2, 1-2-3).
+void emit(Frame& f,const Poly& poly,const Vertex* v,unsigned n=3) {
+    tint_object=f.object;
+    const int index=f.viewmodel?0:slot_index(f,poly,v);
+    if(index<0) {trace_record(f,"far_reject",poly.source);return;}
+    const uint32_t size=n==4?(poly.textured?0x34:0x24):(poly.textured?0x28:0x1c);
+    if(!f.biomask) {
+        frame_demand_bytes+=size;++frame_emits;
+        frame_kind_bytes[f.viewmodel?4:f.sky?3:!f.object?0:poly.actor?2:1]+=size;
+    }
+    const uint32_t prim=packet_alloc(f,size);
+    if(!prim) {++packet_skips;trace_record(f,"packet_budget",poly.source);return;}
+    // Gouraud packets: colour, position and (textured) CLUT/TPAGE/UV per corner.
+    const uint32_t stride=poly.textured?12:8,quad=n==4?0x08000000u:0;
+    for(unsigned i=0;i<n;++i) {
+        const uint32_t at=prim+4+stride*i;
+        psx_mod_write_word(at,(i?0:poly.command|quad)|rgb_word(v[i]));
+        psx_mod_write_word(at+4,packed_xy(f,v[i]));
+        if(poly.textured) psx_mod_write_word(at+8,(i==0?poly.clut<<16:i==1?poly.tpage<<16:0)|uv_word(v[i]));
+    }
+    const uint32_t slot=ordering+(uint32_t)index*8,head=psx_mod_read_word(slot),tag=((size>>2)-1)<<24;
+    if(f.viewmodel) {
+        double z=0;for(unsigned i=0;i<n;++i) z+=v[i].p[2]/n;
+        held_packets.push_back({prim,tag,z});
+    } else if(!head) {
+        psx_mod_write_word(prim,tag);psx_mod_write_word(slot,prim);psx_mod_write_word(slot+4,prim);
+        const uint32_t word=bitmap+((uint32_t)index>>5)*4;
+        psx_mod_write_word(word,psx_mod_read_word(word)|(0x80000000u>>(index&31)));
+    } else {
+        psx_mod_write_word(slot,prim);psx_mod_write_word(prim,tag|(head&0xffffff));
+    }
+    // Host precise vertices (D17A): new corners at their exact sub-pixel
+    // position, original mesh corners at the GTE's integer one (they meet the
+    // original renderer's neighbouring polygons exactly), every corner with its
+    // view depth so the GPU maps the texture with correct perspective instead
+    // of the PS1's affine warp across a polygon beside the eye.
+    double trace_raster[4][4];
+    // D17AM2: translucent faces keep painter order (no depth test or write).
+    const bool painter=f.viewmodel || f.sky || (unified_scene(f) && (poly.command&0x02000000u));
+    const bool lit=lit_frame(f,poly);
+    {
+        for(unsigned i=0;i<n;++i) {
+            const uint32_t addr=prim+8+stride*i,word=psx_mod_read_word(addr);
+            int32_t x16=(int32_t)(int16_t)word*65536,y16=(int32_t)(int16_t)(word>>16)*65536;
+            if(pgxp_mesh_geometry() && v[i].original>=0) {
+                x16=f.verts[v[i].original].x16;y16=f.verts[v[i].original].y16;
+            } else if(v[i].original<0) {
+                double x,y;screen(f,v[i],x,y);x+=v[i].ex;y+=v[i].ey;
+                const double fx=std::floor(x),fy=std::floor(y);
+                if(fx==(double)(int16_t)word && fy==(double)(int16_t)(word>>16)) {
+                    x16=(int32_t)std::lround(x*65536.0);y16=(int32_t)std::lround(y*65536.0);
+                }
+            }
+            // The first-person weapon is drawn last on purpose (D12): exact
+            // perspective, but never depth-tested against the room.
+            // Screen snapping moves a corner along the source plane, not in Z.
+            // Re-evaluate depth at that raster position so independent floor /
+            // prop subdivisions cannot turn a shared plane into intersecting
+            // triangles. Keep texture perspective and visible PS1 snapping.
+            static const bool depth_fix=env_int("DNTTK_PLANE_DEPTH",1,0,1)!=0;
+            const double depth=(depth_fix ? near_raster_depth(poly.depth_plane,f.g,x16/65536.0,y16/65536.0,v[i].p[2]) : v[i].p[2])*poly.depth_scale;
+            if(f.trace) {trace_raster[i][0]=x16/65536.0;trace_raster[i][1]=y16/65536.0;trace_raster[i][2]=v[i].p[2];trace_raster[i][3]=painter?-v[i].p[2]:depth;}
+            (poly.depth_only?psx_mod_gpu_host_vertex_depth_only:poly.depth_test_only?psx_mod_gpu_host_vertex_test_only:f.borrowed?psx_mod_gpu_host_vertex_foreign:psx_mod_gpu_host_vertex_coverage)(addr,word,x16,y16,(float)v[i].p[2],poly.textured?(float)std::clamp(v[i].uv[0],0.0,255.0):-1.0f,poly.textured?(float)std::clamp(v[i].uv[1],0.0,255.0):-1.0f,(float)(painter?-v[i].p[2]:depth), (float)f.coverage);
+            if(lit) {
+                const double* p=v[i].p;const double* m=light_inv;
+                const float wx=(float)(m[0]*p[0]+m[1]*p[1]+m[2]*p[2]),wy=(float)(m[3]*p[0]+m[4]*p[1]+m[5]*p[2]),wz=(float)(m[6]*p[0]+m[7]*p[1]+m[8]*p[2]);
+                const double* nv=v[i].n;
+                if(nv[0]!=0 || nv[1]!=0 || nv[2]!=0) psx_mod_gpu_host_vertex_world_normal(addr,word,wx,wy,wz,(float)nv[0],(float)nv[1],(float)nv[2]);
+                else psx_mod_gpu_host_vertex_world(addr,word,wx,wy,wz);
+            }
+        }
+        ++precise_triangles;
+    }
+    if(f.trace) {
+        std::ostringstream x;x<<std::setprecision(12)<<",\"packet\":"<<prim<<",\"slot\":"<<index
+          <<",\"command\":"<<poly.command<<",\"rank\":"<<poly.coplanar_rank;
+        if(poly.textured) x<<",\"clut\":"<<poly.clut<<",\"tpage\":"<<poly.tpage<<",\"uv\":["<<poly.uv[0]<<','<<poly.uv[1]<<','<<poly.uv[2]<<','<<poly.uv[3]<<']';
+        x<<",\"xy_depth\":[";
+        for(unsigned i=0;i<n;++i) {
+            if(i)x<<',';x<<'[';for(int j=0;j<4;++j){if(j)x<<',';x<<trace_raster[i][j];}x<<']';
+        }
+        x<<']';trace_record(f,"emit",poly.source,x.str());
+    }
+    ++f.emitted;f.stats->triangles+=n-2;
+}
+Vertex mid(const Vertex& a,const Vertex& b,double t) {
+    Vertex m{};
+    for(int i=0;i<3;++i){m.p[i]=a.p[i]+(b.p[i]-a.p[i])*t;m.rgb[i]=a.rgb[i]+(b.rgb[i]-a.rgb[i])*t;}
+    for(int i=0;i<2;++i) m.uv[i]=a.uv[i]+(b.uv[i]-a.uv[i])*t;
+    for(int i=0;i<3;++i) m.n[i]=a.n[i]+(b.n[i]-a.n[i])*t;
+    // The snap error is linear along the edge on screen: screen parameter from
+    // the view-space one (perspective) where both ends are in front of the eye.
+    const double den=a.p[2]+t*(b.p[2]-a.p[2]);
+    const double sp=a.p[2]>0 && b.p[2]>0 && den>0 ? t*b.p[2]/den : t;
+    m.ex=a.ex+(b.ex-a.ex)*sp;m.ey=a.ey+(b.ey-a.ey)*sp;
+    m.original=-1;return m;
+}
+// Screen extent past which the GPU would skip a primitive (1023x511), with
+// a margin for corner snapping.
+bool unified_oversize(const Frame& f,const Vertex* v,size_t n) {
+    double x0=1e9,x1=-1e9,y0=1e9,y1=-1e9;
+    for(size_t i=0;i<n;++i) {double x,y;screen(f,v[i],x,y);x0=std::min(x0,x);x1=std::max(x1,x);y0=std::min(y0,y);y1=std::max(y1,y);}
+    return x1-x0>1000 || y1-y0>500;
+}
+// Split in view space, so each piece is perspective-correct at its corners
+// and sorts by its own depth.
+void subdivide(Frame& f,const Poly& poly,const Vertex* v,unsigned depth) {
+    double sx[3],sy[3];
+    for(int i=0;i<3;++i) screen(f,v[i],sx[i],sy[i]);
+    int longest=0;double length=0;
+    for(int i=0;i<3;++i) {
+        const int j=(i+1)%3;const double l=std::hypot(sx[j]-sx[i],sy[j]-sy[i]);
+        if(l>length){length=l;longest=i;}
+    }
+    double zmin=v[0].p[2],zmax=v[0].p[2];
+    for(int i=1;i<3;++i){zmin=std::min(zmin,v[i].p[2]);zmax=std::max(zmax,v[i].p[2]);}
+    // The GPU maps textures with correct perspective, so pieces outside
+    // unified geometry are split only to keep their sort depth local
+    // (a long wall must not sort as one polygon against what stands by it).
+    // D17AM2: pieces share their source's ordering slot, so the only reason
+    // left to split is the GPU's primitive size limit.
+    const bool wanted=unified_scene(f) ? unified_oversize(f,v,3)
+        : length>precise_split_pixels() || (zmax>zmin*precise_depth_ratio() && length>32);
+    if(!wanted || depth>=max_depth || budget(f)<split_reserve) {
+        if(wanted) ++f.stats->budget_hits;
+        emit(f,poly,v);return;
+    }
+    const int a=longest,b=(longest+1)%3,c=(longest+2)%3;
+    // Split where the edge's dominant texture coordinate is a whole texel:
+    // packets carry integer UVs, and near the eye one texel spans many
+    // pixels, so a rounded midpoint would kink straight texture lines.
+    double t=0.5;
+    const int axis=std::abs(v[b].uv[0]-v[a].uv[0])>=std::abs(v[b].uv[1]-v[a].uv[1])?0:1;
+    const double span=v[b].uv[axis]-v[a].uv[axis];
+    if(std::abs(span)>=2) t=std::clamp((std::round(v[a].uv[axis]+span/2)-v[a].uv[axis])/span,0.25,0.75);
+    const Vertex m=mid(v[a],v[b],t);
+    const Vertex first[3]={v[a],m,v[c]},second[3]={m,v[b],v[c]};
+    subdivide(f,poly,first,depth+1);subdivide(f,poly,second,depth+1);
+}
+// The point where edge a-b crosses a plane, computed from the edge's
+// lexicographically smaller end. Two polygons sharing an edge walk it in
+// opposite directions; mid(a,b,t) and mid(b,a,1-t) differ in the last bits,
+// and after flooring to whole pixels the shared corner could land one pixel
+// apart: a hairline crack that moved with the camera (D17 showed it on most
+// in-between images beside door frames and wall corners).
+bool vertex_less(const Vertex& a,const Vertex& b) {
+    for(int i=0;i<3;++i) if(a.p[i]!=b.p[i]) return a.p[i]<b.p[i];
+    return false;
+}
+Vertex edge_cut(const Vertex& a,const Vertex& b,double da,double db) {
+    if(vertex_less(b,a)) return mid(b,a,db/(db-da));
+    return mid(a,b,da/(da-db));
+}
+// Inside when >= 0: near plane and the four guard-band planes.
+// Guard planes use angular ratios (see guard_xr/guard_yr), but never less
+// than the native 480x240-pixel band: at wide FOVs H is small (92 at FOV 120)
+// and the ratio alone ended near the 4:3 edge, so host pieces in the 16:9
+// margins were clipped away (D17AM2).
+double plane(const Vertex& v,int k,double h) {
+    const double gx=std::max(guard_xr,480/h),gy=std::max(guard_yr,240/h);
+    switch(k) {
+        case 0: return v.p[2]-near_z;
+        case 1: return gx*v.p[2]-v.p[0];
+        case 2: return gx*v.p[2]+v.p[0];
+        case 3: return gy*v.p[2]-v.p[1];
+        default: return gy*v.p[2]+v.p[1];
+    }
+}
+double det(const double* a,const double* b,const double* c) {
+    return a[0]*(b[1]*c[2]-b[2]*c[1])-a[1]*(b[0]*c[2]-b[2]*c[0])+a[2]*(b[0]*c[1]-b[1]*c[0]);
+}
+// Clip and draw one polygon. Quads are PS1 order (v0 v1 v2 v3 = two rows),
+// so the outline is 0 1 3 2.
+// World and object matrices quantize their translations independently.
+// Resolve the resulting contact uncertainty in favour of static props,
+// matching their existing foreground OT priority, within two game units
+// along the surface normal. Never give actors or weapons this tolerance.
+// D17AC: the retail payphone's textured back is embedded about 10-11 world
+// units in its mounting wall. Preserve its raster/UV geometry and native
+// ordering, but allow that verified panel 16 units of contact depth from the
+// open side only. It still loses to nearer occluders.
+// D17AL: host pieces and scene-depth native packets share this rule, so a
+// prop's depth does not change where it moves between the two paths.
+// Returns the amount to subtract from a view-space plane distance d.
+double prop_contact_shift(double d,bool phone_back) {
+    static const int contact=env_int("DNTTK_PROP_CONTACT",2,0,2);
+    static const bool phone_depth=env_int("DNTTK_PHONE_BACK_DEPTH",1,0,1)!=0;
+    const int allowance=phone_back && phone_depth && d>0 ? 16:contact;
+    return std::copysign(std::min((double)allowance,std::abs(d)*0.5),d);
+}
+// D17AV: smooth quad shading (draw). The break shows as a change of slope
+// along the diagonal, which the eye picks out even when small: slot 8's left
+// panel breaks at a twist of 7 (corner 0x39 against 0x32), clearly visible.
+// Below 2 (one colour step) there is nothing to see.
+constexpr int smooth_quad_twist=2;
+uint64_t smooth_quad_count=0,smooth_quad_joins=0;
+// Developer console "smoothquads [on|off|default]" overrides it for the
+// session in live frames (A/B shots at 60 Hz; redraw workers keep the
+// switch).
+std::atomic<int> smooth_quads_override{-1};
+bool smooth_quads() {
+    static const bool on=env_int("DNTTK_SMOOTH_QUADS",1,0,1)!=0;
+    const int o=smooth_quads_override.load(std::memory_order_relaxed);
+    return o<0 ? on : o!=0;
+}
+bool smooth_twist(const uint32_t* colors) {
+    for(int c=0;c<3;++c) {
+        auto ch=[&](int k) {return (int)((colors[k]>>(8*c))&0xff);};
+        if(std::abs(ch(0)+ch(3)-ch(1)-ch(2))>=smooth_quad_twist) return true;
+    }
+    return false;
+}
+// D17AV: whether corner s's texture coordinates follow from triangle p q r's
+// map over their plane (within half a texel): then any split of the four
+// corners shows the same texture.
+bool one_texture_map(const Vertex& p,const Vertex& q,const Vertex& r,const Vertex& s) {
+    double u[3],v[3],w[3];
+    for(int k=0;k<3;++k) {u[k]=q.p[k]-p.p[k];v[k]=r.p[k]-p.p[k];w[k]=s.p[k]-p.p[k];}
+    auto dot=[](const double* a,const double* b) {return a[0]*b[0]+a[1]*b[1]+a[2]*b[2];};
+    const double uu=dot(u,u),uv=dot(u,v),vv=dot(v,v),wu=dot(w,u),wv=dot(w,v),den=uu*vv-uv*uv;
+    if(std::abs(den)<1e-9) return false;
+    const double alpha=(wu*vv-wv*uv)/den,beta=(wv*uu-wu*uv)/den;
+    for(int k=0;k<2;++k)
+        if(std::abs(p.uv[k]+alpha*(q.uv[k]-p.uv[k])+beta*(r.uv[k]-p.uv[k])-s.uv[k])>=0.5) return false;
+    return true;
+}
+// D17AV: a flat square the level builds from two triangles has the same
+// break along their shared edge (slot 8's left panel: (60,79,78) and
+// (60,79,61), corner 60 lit). Two opaque triangles of one world mesh that
+// share an edge, lie in one plane, form a convex quad, carry one texture
+// mapping (the fourth corner's texture coordinates follow from the other
+// triangle's) and the same rank are drawn as that quad, so draw() shades it
+// smoothly; only when the colours would break. polys: one mesh's, ranked.
+void join_smooth_pairs(const Frame& f,std::vector<Poly>& polys) {
+    std::vector<bool> gone(polys.size(),false);
+    auto sub=[](const double* a,const double* b,double* o) {for(int k=0;k<3;++k) o[k]=a[k]-b[k];};
+    auto dot=[](const double* a,const double* b) {return a[0]*b[0]+a[1]*b[1]+a[2]*b[2];};
+    auto cross=[](const double* a,const double* b,double* o) {o[0]=a[1]*b[2]-a[2]*b[1];o[1]=a[2]*b[0]-a[0]*b[2];o[2]=a[0]*b[1]-a[1]*b[0];};
+    for(size_t i=0;i<polys.size();++i) {
+        Poly& a=polys[i];
+        if(gone[i] || a.count!=3 || (a.command&0x02000000u)) continue;
+        for(size_t j=i+1;j<polys.size();++j) {
+            const Poly& b=polys[j];
+            if(gone[j] || b.count!=3 || b.coplanar_rank!=a.coplanar_rank || b.command!=a.command || b.textured!=a.textured
+               || (a.textured && (b.clut!=a.clut || b.tpage!=a.tpage)) || b.depth_push!=a.depth_push) continue;
+            // Shared edge: corners of a found in b.
+            int in_b[3],shared=0,lone_a=-1;
+            for(int x=0;x<3;++x) {
+                in_b[x]=-1;for(int y=0;y<3;++y) if(a.idx[x]==b.idx[y]) in_b[x]=y;
+                if(in_b[x]>=0) ++shared; else lone_a=x;
+            }
+            if(shared!=2) continue;
+            int lone_b=-1;for(int y=0;y<3;++y) if(b.idx[y]!=a.idx[(lone_a+1)%3] && b.idx[y]!=a.idx[(lone_a+2)%3]) lone_b=y;
+            bool same=true;
+            for(int x=0;x<3;++x) if(in_b[x]>=0) same&=a.colors[x]==b.colors[in_b[x]] && (!a.textured || a.uv[x]==b.uv[in_b[x]]);
+            if(!same) continue;
+            const int ip=lone_a,iq=(lone_a+1)%3,ir=(lone_a+2)%3;
+            const double* P=f.verts[a.idx[ip]].view;const double* Q=f.verts[a.idx[iq]].view;
+            const double* R=f.verts[a.idx[ir]].view;const double* S=f.verts[b.idx[lone_b]].view;
+            double u[3],v[3],w[3],n[3];sub(Q,P,u);sub(R,P,v);sub(S,P,w);cross(u,v,n);
+            const double len=std::sqrt(dot(n,n));
+            if(len<1e-9 || std::abs(dot(n,w))/len>1e-3) continue;
+            // Convex: P and S on opposite sides of the shared edge Q-R.
+            double e[3],pq[3],sq[3],c1[3],c2[3];sub(R,Q,e);sub(P,Q,pq);sub(S,Q,sq);cross(e,pq,c1);cross(e,sq,c2);
+            if(dot(c1,c2)>=0) continue;
+            // S = P + alpha*u + beta*v; its texture coordinates must follow.
+            const double uu=dot(u,u),uv=dot(u,v),vv=dot(v,v),wu=dot(w,u),wv=dot(w,v),den=uu*vv-uv*uv;
+            if(std::abs(den)<1e-9) continue;
+            const double alpha=(wu*vv-wv*uv)/den,beta=(wv*uu-wu*uv)/den;
+            if(a.textured) {
+                bool follows=true;
+                for(int k=0;k<2;++k) {
+                    auto t=[&](uint32_t word) {return (double)((word>>(8*k))&0xff);};
+                    const double want=t(a.uv[ip])+alpha*(t(a.uv[iq])-t(a.uv[ip]))+beta*(t(a.uv[ir])-t(a.uv[ip]));
+                    follows&=std::abs(want-t(b.uv[lone_b]))<0.5;
+                }
+                if(!follows) continue;
+            }
+            // PS1 quad order: v0 v1 v2 v3 with outline 0 1 3 2: P Q R S.
+            Poly q=a;q.count=4;
+            const int from[4]={ip,iq,ir,-1};
+            for(int k=0;k<3;++k) {q.idx[k]=a.idx[from[k]];q.colors[k]=a.colors[from[k]];q.uv[k]=a.uv[from[k]];}
+            q.idx[3]=b.idx[lone_b];q.colors[3]=b.colors[lone_b];q.uv[3]=b.uv[lone_b];
+            if(!smooth_twist(q.colors)) continue;
+            q.native_slot=std::max(a.native_slot,b.native_slot);q.key_z=std::max(a.key_z,b.key_z);
+            a=q;gone[j]=true;++smooth_quad_joins;
+            break;
+        }
+    }
+    size_t out=0;
+    for(size_t i=0;i<polys.size();++i) if(!gone[i]) polys[out++]=polys[i];
+    polys.resize(out);
+}
+void draw(Frame& f,const Poly& poly) {
+    ++f.stats->polys;
+    static const bool source_order=env_int("DNTTK_SOURCE_ORDER",1,0,1)!=0;
+    // At most four corners plus one per clip plane: no heap per polygon.
+    struct Shape {
+        Vertex v[12];unsigned n=0;
+        size_t size() const {return n;}
+        Vertex* data() {return v;}
+        Vertex* begin() {return v;} Vertex* end() {return v+n;}
+        const Vertex* begin() const {return v;} const Vertex* end() const {return v+n;}
+        Vertex& operator[](size_t i) {return v[i];}
+        const Vertex& operator[](size_t i) const {return v[i];}
+        void push_back(const Vertex& x) {v[n++]=x;}
+        void clear() {n=0;}
+    } shape;
+    static const int order3[3]={0,1,2},order4[4]={0,1,3,2};
+    const int* order=poly.count==3?order3:order4;
+    for(unsigned j=0;j<poly.count;++j) {
+        const int k=order[j],i=poly.idx[k];
+        Vertex v{};
+        for(int a=0;a<3;++a){v.p[a]=f.verts[i].view[a];v.rgb[a]=(poly.colors[k]>>(8*a))&0xff;}
+        v.uv[0]=poly.uv[k]&0xff;v.uv[1]=(poly.uv[k]>>8)&0xff;
+        for(int a=0;a<3;++a) v.n[a]=poly.n[k][a];
+        v.original=f.verts[i].safe && !poly.exact_screen?i:-1;
+        if(v.original>=0 && v.p[2]>0) {
+            double x,y;screen(f,v,x,y);
+            v.ex=(pgxp_mesh_geometry()?f.verts[i].x16/65536.0:(int16_t)f.verts[i].sxy)-x;
+            v.ey=(pgxp_mesh_geometry()?f.verts[i].y16/65536.0:(int16_t)(f.verts[i].sxy>>16))-y;
+        }
+        shape.push_back(v);
+    }
+    Poly local=poly;
+    local.depth_plane=near_depth_plane(shape[0].p,shape[1].p,shape[2].p);
+    // A warped quad is two PS1 triangles, not one plane. Preserve its native
+    // 1-2 diagonal before clipping; otherwise fan triangulation changes the
+    // surface and disabling plane depth lets snapped pieces intersect floors.
+    bool warped=false;
+    for(const auto& v:shape) {
+        const auto& p=local.depth_plane;
+        warped|=std::abs(p.n[0]*v.p[0]+p.n[1]*v.p[1]+p.n[2]*v.p[2]-p.d)>1e-5;
+    }
+    static const bool warped_split=env_int("DNTTK_WARPED_QUADS",1,0,1)!=0;
+    // D17Z: even a planar world quad can have non-affine UVs. The native
+    // renderer uses the 1-2 diagonal; clipping its perimeter and fanning
+    // from corner 0 instead changes the texture map (and changes it again
+    // at takeover). Preserve the native halves before clipping, including
+    // their attributes. Original textures retain their existing path.
+    const bool world_texture_split=!f.object && poly.textured && pgxp_mesh_textures();
+    // D17AM2: a quad wholly inside the clip planes and the GPU size limit is
+    // one packet, which the GPU draws on the native diagonal; any other quad
+    // is drawn as its two native halves.
+    // D17AP: so is a warped quad, as D17X requires. As one packet it had no
+    // depth plane, so its snapped corners took raw vertex depth and the grave
+    // soil's corners cut into the floor (slot 9) again.
+    // D17AV: the GPU shades a quad as two triangles on its 1-2 diagonal, so
+    // a quad with one lit corner shows a hard-edged bright triangle (slot 8's
+    // wall panels; the original does the same). A flat world quad whose
+    // corner colours do not blend evenly is drawn as four triangles meeting
+    // at its centre, which takes the average of the four corner colours: the
+    // break along one diagonal becomes a blend across the whole face.
+    // DNTTK_SMOOTH_QUADS=0 (developer) keeps the two-triangle shading.
+    bool smooth=false;
+    // Only where one texture map covers the quad (corner 3's coordinates
+    // follow from corners 0-2): otherwise its two halves map the texture
+    // differently (D17Z) and a centre corner would move it.
+    if(smooth_quads() && unified_scene(f) && !f.object && poly.count==4 && !warped && smooth_twist(poly.colors))
+        smooth=!poly.textured || one_texture_map(shape[0],shape[1],shape[3],shape[2]);
+    bool whole=false;
+    // DNTTK_UNIFIED_QUADS=0 (developer) draws every quad as its two halves.
+    static const bool quads=env_int("DNTTK_UNIFIED_QUADS",1,0,1)!=0;
+    if(quads && unified_scene(f) && poly.count==4 && !smooth) {
+        whole=!unified_oversize(f,shape.data(),shape.size());
+        for(const auto& v:shape) for(int k=0;k<5 && whole;++k) whole=plane(v,k,f.g.h)>=0;
+    }
+    const bool halves=!smooth && (unified_scene(f)?!whole || (warped && warped_split):world_texture_split || (warped && warped_split));
+    if(halves && poly.count==4) {
+        --f.stats->polys; // each native half is counted by its recursive draw
+        static const int triangles[2][3]={{0,1,2},{2,1,3}};
+        for(const auto& indices:triangles) {
+            Poly tri=poly;tri.count=3;
+            for(unsigned j=0;j<3;++j) {
+                tri.idx[j]=poly.idx[indices[j]];
+                tri.colors[j]=poly.colors[indices[j]];
+                tri.uv[j]=poly.uv[indices[j]];
+                for(int a=0;a<3;++a) tri.n[j][a]=poly.n[indices[j]][a];
+            }
+            // Keep the source world's maximum-depth key across both halves.
+            if(!f.object && source_order)
+                for(unsigned j=0;j<4;++j) tri.key_z=std::max(tri.key_z,(double)f.verts[poly.idx[j]].sz);
+            draw(f,tri);
+        }
+        return;
+    }
+    if(warped) local.depth_plane={};
+    if(f.object && !poly.actor && !f.viewmodel) {
+        auto& p=local.depth_plane;
+        p.d-=prop_contact_shift(p.d,poly.phone_back);
+    }
+    // D17W: push a face the original paints over slightly behind its plane
+    // (about 0.8 units at 3400), so the depth test keeps the original's winner.
+    if(poly.coplanar_rank) local.depth_plane.d*=1+poly.coplanar_rank/4096.0;
+    // Positive moves the plane away from the eye, negative toward it.
+    if(poly.depth_push) local.depth_plane.d+=(local.depth_plane.d<0?-1:1)*poly.depth_push;
+    if(whole) {const Vertex quad[4]={shape[0],shape[1],shape[3],shape[2]};emit(f,local,quad,4);return;}
+    // Keep the original world polygon's farthest-corner ordering key.
+    // 0x80011654/0x80011684/0x800116b4 skip smaller depths, so this is
+    // a maximum, not a minimum. Sorting subdivisions individually lets a
+    // near floor piece overwrite native decals/props that were ordered in
+    // front of the whole floor. Host depth still resolves host-host overlap.
+    if(source_order && !f.object) {
+        for(unsigned j=0;j<poly.count;++j)
+            local.key_z=std::max(local.key_z,(double)f.verts[poly.idx[j]].sz);
+    }
+    Shape pieces[4];unsigned piece_count=1;
+    if(smooth) {
+        // shape is the outline (corners 0 1 3 2). The centre of a flat quad
+        // is the mean of its corners in position, texture and colour; it
+        // follows the corners' snap to the GTE's integer positions.
+        Vertex centre{};centre.original=-1;
+        for(const auto& v:shape) {
+            for(int a=0;a<3;++a) {centre.p[a]+=v.p[a]/4;centre.rgb[a]+=v.rgb[a]/4;centre.n[a]+=v.n[a]/4;}
+            centre.uv[0]+=v.uv[0]/4;centre.uv[1]+=v.uv[1]/4;centre.ex+=v.ex/4;centre.ey+=v.ey/4;
+        }
+        for(unsigned i=0;i<4;++i) {pieces[i].push_back(shape[i]);pieces[i].push_back(shape[(i+1)%4]);pieces[i].push_back(centre);}
+        piece_count=4;++smooth_quad_count;
+    } else pieces[0]=shape;
+    for(unsigned piece=0;piece<piece_count;++piece) {
+    Shape& shape=pieces[piece];
+    for(int k=0;k<5 && shape.size()>=3;++k) {
+        // Most compact props are wholly inside the guard band. Preserve their
+        // vertices directly instead of allocating/copying five temporary
+        // polygons per source polygon. Mixed edges use the exact old clipper.
+        bool inside=false,outside=false;
+        for(const auto& v:shape) {if(plane(v,k,f.g.h)>=0) inside=true;else outside=true;}
+        if(!outside) continue;
+        if(!inside) {shape.clear();break;}
+        Shape out;
+        for(size_t i=0;i<shape.size();++i) {
+            const Vertex& a=shape[i];const Vertex& b=shape[(i+1)%shape.size()];
+            const double da=plane(a,k,f.g.h),db=plane(b,k,f.g.h);
+            if(da>=0) out.push_back(a);
+            if((da>=0)!=(db>=0)) out.push_back(edge_cut(a,b,da,db));
+        }
+        shape=out;
+    }
+    if(shape.size()<3) {++f.stats->culled;trace_record(f,"clip_reject",poly.source);continue;}
+    if(f.trace) trace_record(f,"clip",poly.source,",\"corners\":"+std::to_string(shape.size()));
+    for(size_t i=1;i+1<shape.size();++i) {
+        const Vertex tri[3]={shape[0],shape[i],shape[i+1]};
+        subdivide(f,local,tri,0);
+    }
+    }
+}
+// NCLIP's sign equals the sign of det(v0,v1,v2) in view space.
+bool front_facing(const Frame& f,const Poly& poly,uint32_t flags,bool second_triangle) {
+    const double* v0=f.verts[poly.idx[0]].view;const double* v1=f.verts[poly.idx[1]].view;const double* v2=f.verts[poly.idx[2]].view;
+    const double sign=(flags&0x400)?-1:1;
+    if(sign*det(v0,v1,v2)>0) return true;
+    // World quads with 0x400 clear also accept a front-facing (v3,v1,v2).
+    return second_triangle && poly.count==4 && !(flags&0x400) && -det(f.verts[poly.idx[3]].view,v1,v2)>0;
+}
+// D17AE/D17AK scene depth. Since D17AM3 this covers only what unified
+// geometry does not draw itself: a mesh a frame cannot afford, and every mesh
+// under DNTTK_UNIFIED_GEOMETRY=0. The original has no depth buffer: it paints world
+// faces by their farthest corner and props by their average, so a distant
+// prop can sort in front of a nearer world face (the club's exterior sign
+// post over the door header) and adjacent panels can swap at some angles.
+// Every opaque packet the original draws for a world or scenery mesh is given
+// its corners' view depth through the host-vertex channel, so the depth test
+// resolves real overlap. Packets, ordering slots, UVs and colours stay
+// native. Translucent packets, sprites, sky, water and the first-person
+// layer keep painter order. A mesh's packets are matched by their integer
+// corner positions after it is drawn; ambiguous or unmatched packets keep
+// painter order. DNTTK_SCENE_DEPTH=0 (developer) disables.
+// D17AL: prop packets take the same contact allowance as host prop pieces
+// (prop_contact_shift), including the verified payphone back; otherwise an
+// embedded prop is hidden by its wall at a distance and appears only once
+// the near path takes it over. DNTTK_SCENE_PROP_CONTACT=0 (developer)
+// gives prop packets exact depth for comparison.
+bool scene_depth() {static const bool v=env_int("DNTTK_SCENE_DEPTH",1,0,1)!=0;return v;}
+struct SceneDepthMesh { bool live=false,prop=false,phone=false;uint32_t cursor=0;std::vector<NearProjected> verts;std::vector<std::pair<uint32_t,uint16_t>> keys; };
+SceneDepthMesh scene_pending;
+void scene_depth_cancel() {scene_pending.live=false;}
+uint64_t scene_depth_meshes,scene_depth_packets,scene_depth_ambiguous,scene_depth_wraps,scene_depth_polygons,scene_depth_unmatched,scene_depth_breaks;
+void scene_depth_flush() {
+    if(!scene_pending.live) return;
+    scene_pending.live=false;
+    const uint32_t from=scene_pending.cursor,to=psx_mod_read_word(context);
+    const uint32_t start=psx_mod_read_word(context+4),end=psx_mod_read_word(context+8);
+    if(to==from) return;
+    if(!(end>start && from>=start && from<end && to>from && to<=end)) {++scene_depth_wraps;return;}
+    const auto& keys=scene_pending.keys;const auto& verts=scene_pending.verts;
+    const bool geometry=pgxp_mesh_geometry(),textures=pgxp_mesh_textures();
+    for(uint32_t p=from,guard=0;p<to && guard<16384;++guard) {
+        const uint32_t n=psx_mod_read_word(p)>>24;
+        if(!n || n>12 || p+4*(n+1)>to) {++scene_depth_breaks;break;}
+        const uint32_t cmd=psx_mod_read_word(p+4),op=cmd>>24;
+        const uint32_t packet=p;p+=4*(n+1);
+        if(op<0x20 || op>0x3f || (op&2)) continue;
+        ++scene_depth_polygons;
+        const bool quad=op&8,textured=op&4,gouraud=op&0x10;
+        const unsigned corners=quad?4:3;
+        if(n!=1+corners*(1+(textured?1:0))+(gouraud?corners-1:0)) continue;
+        uint32_t addr[4];int index[4];bool ok=true;
+        for(unsigned k=0,w=2;k<corners && ok;++k) {
+            if(gouraud && k) ++w;
+            addr[k]=packet+4*w;
+            const uint32_t word=psx_mod_read_word(addr[k]);
+            auto it=std::lower_bound(keys.begin(),keys.end(),std::make_pair(word,(uint16_t)0));
+            if(it==keys.end() || it->first!=word) {ok=false;++scene_depth_unmatched;break;}
+            index[k]=it->second;
+            for(auto j=it+1;j!=keys.end() && j->first==word;++j)
+                if(std::abs(verts[j->second].view[2]-verts[index[k]].view[2])>verts[index[k]].view[2]*0.01) {ok=false;++scene_depth_ambiguous;break;}
+            w+=1+(textured?1:0);
+        }
+        if(!ok) continue;
+        // Moving the plane by a fixed distance along its normal scales every
+        // point's depth along its eye ray by the same factor. The plane uses
+        // the host piece's corner order (0,1,3 for quads); warped quads, like
+        // host pieces, get no allowance. Perspective weights stay exact.
+        double scale=1;
+        if(scene_pending.prop) {
+            const NearDepthPlane plane=near_depth_plane(verts[index[0]].view,verts[index[1]].view,verts[index[quad?3:2]].view);
+            bool warped=false;
+            if(quad) {const double* q=verts[index[2]].view;warped=std::abs(plane.n[0]*q[0]+plane.n[1]*q[1]+plane.n[2]*q[2]-plane.d)>1e-5;}
+            const bool phone_back=scene_pending.phone && quad && textured && !gouraud &&
+                index[0]==0 && index[1]==4 && index[2]==2 && index[3]==6;
+            if(!warped && std::abs(plane.d)>1e-9) scale=1-prop_contact_shift(plane.d,phone_back)/plane.d;
+        }
+        for(unsigned k=0;k<corners;++k) {
+            const NearProjected& v=verts[index[k]];
+            const uint32_t word=psx_mod_read_word(addr[k]);
+            const int32_t x16=geometry?v.x16:(int32_t)(int16_t)word*65536,y16=geometry?v.y16:(int32_t)(int16_t)(word>>16)*65536;
+            psx_mod_gpu_host_vertex_coverage(addr[k],word,x16,y16,textures?(float)v.view[2]:1.0f,-1.0f,-1.0f,(float)(v.view[2]*scale),1.0f);
+        }
+        ++scene_depth_packets;
+    }
+}
+// prop: a non-actor object mesh (host pieces of it take the contact
+// allowance); phone: the verified payphone shape at the static-prop caller.
+void scene_depth_begin(const Frame& f,bool prop=false,bool phone=false) {
+    scene_depth_flush();
+    if(!scene_depth() || !input_modernized()) return;
+    auto& m=scene_pending;
+    static const bool prop_contact=env_int("DNTTK_SCENE_PROP_CONTACT",1,0,1)!=0;
+    m.verts=f.verts;m.keys.clear();m.prop=prop && prop_contact;m.phone=phone;
+    for(size_t i=0;i<f.verts.size();++i)
+        if(f.verts[i].safe && f.verts[i].view[2]>16) m.keys.push_back({f.verts[i].sxy,(uint16_t)i});
+    std::sort(m.keys.begin(),m.keys.end());
+    m.cursor=psx_mod_read_word(context);m.live=!m.keys.empty();
+    scene_depth_meshes+=m.live;
+}
+bool begin(Frame& f,CPUState* cpu,bool object) {
+    f.g=read_gte(cpu);f.object=object;f.stats=object?&object_stats:&world_stats;
+    f.far_limit=psx_mod_read_word(context+0x78);f.zsf3=(uint32_t)(int32_t)(int16_t)cpu->gte_ctrl[29];last_zsf3=(int32_t)f.zsf3;
+    f.zsf4=(uint32_t)(int32_t)(int16_t)cpu->gte_ctrl[30];
+    return f.g.h>=64;
+}
+uint32_t guest_copy() {
+    if(!copy_base) copy_base=psx_mod_alloc_guest_memory(copy_size,16);
+    return copy_base;
+}
+// Group writer for the filtered polygon list in the copy.
+struct Group { uint32_t header,record_size; std::vector<uint32_t> kept; };
+uint32_t list_bytes(const std::vector<Group>& groups) {
+    uint32_t n=4;for(const auto& g:groups) n+=4+g.record_size*(uint32_t)g.kept.size();return n;
+}
+void write_list(uint32_t out,const std::vector<Group>& groups) {
+    for(const auto& g:groups) {
+        psx_mod_write_word(out,(g.header&0xffff)|(uint32_t)g.kept.size()<<16);out+=4;
+        for(uint32_t r:g.kept) for(uint32_t i=0;i<g.record_size;i+=4){psx_mod_write_word(out,psx_mod_read_word(r+i));out+=4;}
+    }
+    psx_mod_write_word(out,0xff);
+}
+// Texture animation for textured polygons (world 0x80011c60, object 0x800105d0).
+bool animate(uint32_t& t1,uint32_t& t2,uint32_t& t3,bool object) {
+    const uint32_t anim=psx_mod_read_word(context+0x60);
+    if(!anim) return false;
+    const uint32_t frame=object?psx_mod_read_word(anim+(t1>>16)*16+8):psx_mod_read_word(anim+(t1>>16)*4);
+    const uint32_t s1=psx_mod_read_word(frame),s2=psx_mod_read_word(frame+4),s4=s1&0xffff;
+    const uint32_t bits=object?((t2>>21)&3)<<21:0;
+    t2=(t2&0xffff)+((s2&0xffff0000u)|s4);t1=(t1&0xffff)+s1;t3=t3+((s4<<16)|s4);
+    t2|=bits;
+    return true;
+}
+
+void rank_coplanar(const Frame& f,std::vector<Poly>& polys);
+void rank_coplanar_world(const Frame& f,std::vector<Poly>& polys,uint32_t mesh,uint64_t sig,const std::vector<uint32_t>& taken);
+extern uint64_t coplanar_hits,coplanar_builds;
+inline uint64_t coplanar_mix(uint64_t h,uint32_t w);
+uint64_t unified_downgrades,fallback_kind[3],near_fallbacks;
+uint32_t last_object_animation; // D41D1
+std::vector<uint32_t> glow_meshes; // D41D1, sorted (near_clip_set_glow_meshes)
+// Bytes a mesh's taken faces are expected to need before it is taken over.
+// Unified scene geometry: about one packet per face (most are unclipped quads).
+// D17AR2: a distant host piece (every vertex 4096+ away) is never cut by the
+// near plane, so it needs about its packets: a quad each, with half again for
+// faces the screen edges split.
+uint32_t mesh_need(const Frame& f,size_t faces) {
+    if(host_piece && f.far && unified_scene(f)) return 512+(uint32_t)faces*0x34*3/2;
+    return takeover_reserve+(uint32_t)faces*(unified_scene(f)?0x34:0x28*3);
+}
+// D17AR2 host visibility: a piece drawn from the host world pass
+// (near_clip_host_world_piece) is either drawn here whole or left untouched,
+// never downgraded part way, since the game's walk that would draw the rest
+// is emptied. host_walk_kept: the pieces the game's own walk still draws.
+bool host_walk_filter=false;
+std::vector<uint32_t> host_walk_kept;
+uint64_t host_world_pieces=0,host_world_left=0,host_walk_nulled=0,host_left_far=0,host_left_near=0;
+// D17AV: a quad record that repeats a corner draws one triangle: of the
+// GPU's two halves (0 1 2) and (1 2 3), the one with three corners. The
+// world cull (front_facing) accepts a quad seen from either side when its
+// second half faces the eye, so such a triangle showed from behind too:
+// slot 8's left panel showed a back-side triangle, with the back's texture
+// tile and palette, over half of its front. Polymorph draws it as that
+// triangle, culled by its own winding.
+bool repeated_corner_triangle(Poly& p) {
+    if(p.count!=4) return false;
+    static const int halves[2][3]={{0,1,2},{1,2,3}};
+    for(const auto& h:halves) {
+        const int a=p.idx[h[0]],b=p.idx[h[1]],c=p.idx[h[2]];
+        if(a==b || b==c || a==c) continue;
+        int repeats=0;for(int j=0;j<4;++j) for(int k=0;k<j;++k) repeats+=p.idx[j]==p.idx[k];
+        if(!repeats) return false;
+        Poly t=p;t.count=3;
+        for(int j=0;j<3;++j) {t.idx[j]=p.idx[h[j]];t.colors[j]=p.colors[h[j]];t.uv[j]=p.uv[h[j]];}
+        p=t;return true;
+    }
+    return false;
+}
+// 0x80011020 entry: a0 mesh, a1 ordering table, a2 render context, a3 bitmap.
+void world(CPUState* cpu) {
+    const uint32_t mesh=cpu->gpr[4],ra=cpu->gpr[31];
+    if(ra!=0x80037344 && ra!=0x80037c54 && ra!=0x80062db8) return;
+    ++world_stats.seen;
+    const unsigned count=psx_mod_read_half(mesh+0x14);
+    if(!count || count>256) return;
+    Frame f{};if(!begin(f,cpu,false)) return;
+    f.scene=true;
+    trace_begin(f,cpu);
+    const uint32_t flags=psx_mod_read_word(context+0x50);
+    const int32_t fog=(int32_t)psx_mod_read_word(context+0x6c);
+    std::vector<uint32_t> colors(count);
+    f.verts.resize(count);
+    bool any=false;
+    // Vertex positions and the polygon list, hashed as they are read
+    // (rank_coplanar_world). The colour-index nibble is not geometry.
+    uint64_t sig=coplanar_mix(0xcbf29ce484222325ull,count);
+    for(unsigned i=0;i<count;++i) {
+        const uint32_t record=mesh+0x1c+8*i,w0=psx_mod_read_word(record),w1=psx_mod_read_word(record+4);
+        sig=coplanar_mix(sig,w0&0xf0ffffffu);
+        const uint32_t xy=((w0&0xff)<<10)|((w0&0xff00)<<15);
+        f.verts[i]=near_project(f.g,(int16_t)xy,(int16_t)(xy>>16),(int16_t)((((w0>>16)&0xff)<<10)&0xffff));
+        any|=!f.verts[i].safe || f.verts[i].sz<std::max<uint32_t>(perspective_z,2048);
+        uint32_t c=w1;
+        if(flags&2) c=(w1&0xff000000u)|(psx_mod_read_word(context+0x54)&0xffffff);
+        else if(const uint32_t nibble=(w0>>24)&0xf) c=(w1&0xff000000u)|(psx_mod_read_word(color_table+nibble*4)&0xffffff);
+        const int32_t d=(int32_t)f.verts[i].sz-fog;
+        colors[i]=d>0?near_dpcs(f.g,c,(int16_t)d):c;
+    }
+    f.far=true;for(const auto& v:f.verts) f.far&=v.sz>=far_z;
+    trace_vertices(f);
+    // Unified geometry draws every face here, leaving the original no
+    // packets to give depth; only a downgraded mesh needs scene depth.
+    bool forced=unified();
+    if(forced) scene_depth_flush(); else scene_depth_begin(f);
+    if(!any && !forced) {trace_record(f,"native_mesh",0);if(!f.trace) return;}
+    const uint32_t list=mesh+psx_mod_read_word(mesh+0x18);
+    std::vector<Group> groups;std::vector<uint32_t> taken;
+    // D17AM2: a mesh the frame cannot afford whole is downgraded: drawn as
+    // the earlier renderer would (its near polygons here, the rest native
+    // with scene depth), never left wholly to the original near the eye.
+    uint64_t list_sig=sig;
+    for(;;) {
+    groups.clear();taken.clear();list_sig=sig;
+    uint32_t cursor=list;
+    for(unsigned guard=0;;++guard) {
+        if(guard>256) return;
+        const uint32_t header=psx_mod_read_word(cursor);cursor+=4;
+        list_sig=coplanar_mix(list_sig,header);
+        const uint32_t type=header&0xffff,n=header>>16;
+        if(type==0xff) break;
+        if((type!=0x60 && type!=0x61) || !n || n>4096) return;
+        Group group{type,8,{}};
+        const unsigned corners=type==0x60?3:4;
+        for(uint32_t k=0;k<n;++k,cursor+=8) {
+            const uint32_t word=psx_mod_read_word(cursor);
+            list_sig=coplanar_mix(list_sig,word);
+            bool unsafe=forced;uint32_t zmin=0xffff;int idx[4];
+            for(unsigned j=0;j<corners;++j) {
+                const unsigned i=(word>>(8*j))&0xff;if(i>=count) return;idx[j]=(int)i;
+                unsafe|=!f.verts[i].safe;zmin=std::min<uint32_t>(zmin,f.verts[i].sz);
+            }
+            unsafe|=oversize(f,idx,corners) || zmin<perspective_z;
+            trace_face(f,cursor,corners,(any || forced) && unsafe?"host_candidate":"native_kept");
+            if(unsafe && (any || forced)) taken.push_back(cursor|(type==0x61)); else group.kept.push_back(cursor);
+        }
+        if(!group.kept.empty()) groups.push_back(std::move(group));
+    }
+    if(forced && budget(f)<mesh_need(f,taken.size())) {
+        if(host_piece) {++(f.far?host_left_far:host_left_near);trace_record(f,"host_piece_left",0);return;}
+        forced=false;f.scene=false;++unified_downgrades;trace_record(f,"unified_downgrade",0);
+        scene_depth_begin(f);
+        if(!any) return;
+        continue;
+    }
+    break;
+    }
+    if(taken.empty()) return;
+    if(budget(f)<mesh_need(f,taken.size())) {++mesh_fallbacks;++fallback_kind[0];near_fallbacks+=!f.far;trace_record(f,"mesh_budget_fallback",0);return;}
+    const uint32_t copy=guest_copy();
+    const unsigned read_verts=(count+2)/3*3;
+    const uint32_t head_size=0x1c+8*read_verts,list_offset=(head_size+15)&~15u;
+    if(!copy || list_offset+list_bytes(groups)>copy_size) {++copy_overflows;return;}
+    // D17AR3: with every face drawn here the original gets a null mesh
+    // (below) and never reads the copy, so it is written only when faces
+    // are left to it.
+    if(!groups.empty()) {
+        for(uint32_t i=0;i<head_size;i+=4) psx_mod_write_word(copy+i,psx_mod_read_word(mesh+i));
+        psx_mod_write_word(copy+0x18,list_offset);
+        write_list(copy+list_offset,groups);
+    }
+    // The original clears the color-index nibble of every vertex it reads
+    // (0x80011170); it now reads the copy, so apply that to the real mesh.
+    if(!(flags&2)) clear_color_index(mesh,count);
+    // D17AQ: with every face drawn here the copy has no polygons left, but
+    // the original would still transform all its vertices (RTPT) for nothing.
+    // A null mesh returns at once (0x80011020); the nibble clear above is the
+    // only effect the vertex pass would have had.
+    cpu->gpr[4]=groups.empty()?0:copy;
+    world_stats.skipped+=groups.empty();
+    ++world_stats.taken;
+    const uint32_t textures=psx_mod_read_word(context+0x58);
+    std::vector<Poly> polys;polys.reserve(taken.size());
+    for(uint32_t tagged:taken) {
+        const uint32_t record=tagged&~1u;
+        Poly p{};p.source=record;p.count=(tagged&1)?4:3;p.textured=true;p.command=0x34000000u;
+        const uint32_t word=psx_mod_read_word(record);
+        for(unsigned j=0;j<p.count;++j) p.idx[j]=(word>>(8*j))&0xff;
+        Poly drawn=p;const bool repeated=unified_scene(f) && repeated_corner_triangle(drawn);
+        if(!(psx_mod_read_half(record+6)&0x200) && !front_facing(f,repeated?drawn:p,flags,!repeated)) {++world_stats.culled;trace_record(f,"backface",record);continue;}
+        // D17AM2: the original's own per-polygon rules (0x80011634..0x800116f0,
+        // 0x80011894..0x800118a8) for faces it would have drawn itself. With
+        // context flag 0x80, a polygon whose corners all lie past one edge of
+        // the clip rectangle (ctx+0x18..0x1e) is dropped; one whose corners
+        // are all beyond ctx+0x70 is drawn as an untextured black silhouette.
+        // Only exactly projected corners are tested, so near-eye faces keep
+        // the host clipping that replaces the original's rejection.
+        bool silhouette=false;
+        if(unified_scene(f)) {
+            bool safe=true;unsigned outside=0xf,beyond=1;
+            const uint32_t limit=psx_mod_read_word(context+0x70);
+            const int x0=(int16_t)psx_mod_read_half(context+0x18),x1=(int16_t)psx_mod_read_half(context+0x1a);
+            const int y0=(int16_t)psx_mod_read_half(context+0x1c),y1=(int16_t)psx_mod_read_half(context+0x1e);
+            for(unsigned j=0;j<p.count;++j) {
+                const auto& v=f.verts[p.idx[j]];const int x=(int16_t)v.sxy,y=(int16_t)(v.sxy>>16);
+                safe&=v.safe;beyond&=limit<v.sz;
+                outside&=(x<x0)|(x1<x)<<1|(y<y0)<<2|(y1<y)<<3;
+            }
+            if(safe && (flags&0x80) && outside) {++world_stats.culled;trace_record(f,"rect_cull",record);continue;}
+            silhouette=safe && beyond;
+        }
+        if(unified_scene(f)) {
+            p.native_order=true;
+            uint32_t zmax=0;for(unsigned j=0;j<p.count;++j) zmax=std::max<uint32_t>(zmax,f.verts[p.idx[j]].sz);
+            p.native_slot=(zmax>>2)>=f.far_limit?-1:(int)std::min<uint32_t>(zmax>>5,0x7ff);
+        }
+        if(silhouette) {
+            p.textured=false;p.command=0x30000000u;
+            for(unsigned j=0;j<p.count;++j) p.colors[j]=0;
+            if(repeated) repeated_corner_triangle(p);
+            polys.push_back(p);continue;
+        }
+        const int16_t tex=(int16_t)psx_mod_read_half(record+4);
+        const uint32_t entry=textures+(uint32_t)(tex*12);
+        uint32_t t1=psx_mod_read_word(entry),t2=psx_mod_read_word(entry+4),t3=psx_mod_read_word(entry+8);
+        if(((t2>>16)&0x200) && !animate(t1,t2,t3,false)) continue;
+        p.clut=t1>>16;p.tpage=t2>>16;
+        p.uv[0]=t1&0xffff;p.uv[1]=t2&0xffff;p.uv[2]=t3&0xffff;p.uv[3]=t3>>16;
+        // D17AO1: a painted sky opens onto the borrowed sky drawn behind it.
+        if(sky_borrow_skip(p.clut,p.tpage,p.uv,p.count)) {trace_record(f,"sky_borrow",record);continue;}
+        // Light table when every corner's color-index byte has bit 4 (0x80011908).
+        uint32_t all=~0u;for(unsigned j=0;j<p.count;++j) all&=psx_mod_read_word(mesh+0x1c+8*p.idx[j])>>24;
+        for(unsigned j=0;j<p.count;++j) {
+            uint32_t c=colors[p.idx[j]];
+            if(all&0x10) c=near_dpcs(f.g,c,(int16_t)psx_mod_read_word(psx_mod_read_word(context+0x68)+(c>>24)*4));
+            p.colors[j]=c&0xffffff;
+        }
+        if(repeated) repeated_corner_triangle(p);
+        polys.push_back(p);
+    }
+    // D17AM2: overlapping coplanar faces of one world mesh (a panel defined
+    // for both sides, a decal on its wall) keep the original's painter
+    // winner under the depth test, as D17W does for props.
+    if(unified_scene(f)) rank_coplanar_world(f,polys,mesh,list_sig,taken);
+    if(unified_scene(f) && smooth_quads()) join_smooth_pairs(f,polys);
+    for(const auto& p:polys) draw(f,p);
+}
+unsigned object_record_size(uint32_t type) {
+    switch(type) {
+        case 0x20: case 0x28: return 8;
+        case 0x30: case 0x38: return 12;
+        case 0x24: case 0x2c: return 16;
+        case 0x34: case 0x3c: return 20;
+        default: return 0;
+    }
+}
+// D17Y: the retail texture resolver returns this zero descriptor when a
+// texture bank is absent (e.g. 0x8003cd6c). Treat animated faces referencing
+// that sentinel as absent. Otherwise their zero TPAGE/CLUT samples the live
+// framebuffer, producing opaque patches that depend on camera/draw order.
+// Filter a private mesh copy before both native and host rendering; never
+// alter the level mesh or suppress valid black/transparent texture frames.
+uint32_t missing_texture_copy;
+uint64_t missing_texture_faces;
+void filter_missing_animation(CPUState* cpu) {
+    static const bool on=env_int("DNTTK_MISSING_ANIMATION",1,0,1)!=0;
+    if(!on || !input_modernized()) return;
+    constexpr uint32_t missing=0x800c5784;
+    if(psx_mod_read_word(missing) || psx_mod_read_word(missing+4) || psx_mod_read_word(missing+8)) return;
+    const uint32_t anim=psx_mod_read_word(context+0x60),mesh=cpu->gpr[4];
+    if(anim<0x80010000u || anim>0x801ffff0u || (anim&3)) return;
+    uint32_t cursor=psx_mod_read_word(mesh+0x14);
+    std::vector<Group> groups;
+    unsigned removed=0,bytes=0;
+    for(unsigned guard=0;;++guard) {
+        if(guard>256 || cursor<0x80010000u || cursor>0x801ffffcu || (cursor&3)) return;
+        const uint32_t header=psx_mod_read_word(cursor);cursor+=4;
+        const uint32_t type=header&0xffff,n=header>>16;
+        if(type==0xff) break;
+        const unsigned size=object_record_size(type);
+        if(!size || !n || n>4096 || cursor>0x80200000u-n*size) return;
+        bytes+=4+n*size;
+        if(bytes>copy_size-0x24) return;
+        Group group{type,size,{}};
+        for(uint32_t k=0;k<n;++k,cursor+=size) {
+            bool absent=false;
+            if((type&4) && (psx_mod_read_word(cursor+8)&0x40000000u)) {
+                const uint32_t index=psx_mod_read_word(cursor+4)>>16;
+                const uint32_t entry=anim+index*16;
+                absent=entry<=0x801ffff4u && psx_mod_read_word(entry+8)==missing;
+            }
+            if(absent) ++removed; else group.kept.push_back(cursor);
+        }
+        if(!group.kept.empty()) groups.push_back(std::move(group));
+    }
+    if(!removed) return;
+    if(!missing_texture_copy) missing_texture_copy=psx_mod_alloc_guest_memory(copy_size,16);
+    if(!missing_texture_copy) return;
+    for(uint32_t i=0;i<0x18;i+=4) psx_mod_write_word(missing_texture_copy+i,psx_mod_read_word(mesh+i));
+    psx_mod_write_word(missing_texture_copy+0x14,missing_texture_copy+0x20);
+    write_list(missing_texture_copy+0x20,groups);
+    cpu->gpr[4]=missing_texture_copy;
+    missing_texture_faces+=removed;
+}
+// D17W: a model can lay two faces on the same corners (the overturned
+// minecart, level 3: a textured panel and a flat F4 on its four corners). The
+// original gives them one AVSZ slot and paints the earlier record last, so
+// the texture covers the flat face. Host pieces each sort by their own depth,
+// and flat and gouraud pieces are never depth-tested (painter order only), so
+// flat pieces in nearer slots painted large white triangles over the panel.
+// For each pair of coplanar faces that overlap, the one the original paints
+// first (farther slot, or the later record in one slot) is ranked behind the
+// other. Every face of such a group sorts by the group's average depth and
+// object() emits them in rank order, so the OT paints them as the original
+// did; draw() also pushes a ranked face back for the depth test.
+// DNTTK_NEAR_COPLANAR=0 (developer) turns it off for comparisons.
+// A face's plane and corners (quads in outline order 0 1 3 2); planar when
+// the plane exists and a quad's fourth corner lies within half a unit of it.
+struct CoplanarFace {double n[3],d,c[4][3];unsigned count;};
+bool coplanar_face(CoplanarFace& a,unsigned count) {
+    // D17AV: a triangle stored as a quad repeats one corner (indices
+    // a,b,c,a: the GPU draws a,b,c twice). In edge order the repeat can land
+    // in the first three corners and give no plane, so the face was never
+    // ranked against the faces it overlaps. Keep each distinct corner once.
+    if(count==4)
+        for(unsigned j=1;j<count;++j)
+            for(unsigned k=0;k<j;++k)
+                if(a.c[j][0]==a.c[k][0] && a.c[j][1]==a.c[k][1] && a.c[j][2]==a.c[k][2]) {
+                    for(unsigned m=j;m+1<count;++m) for(int q=0;q<3;++q) a.c[m][q]=a.c[m+1][q];
+                    --count;j=count;break;
+                }
+    a.count=count;
+    const NearDepthPlane plane=near_depth_plane(a.c[0],a.c[1],a.c[2]);
+    if(!plane.n[0] && !plane.n[1] && !plane.n[2]) return false;
+    for(int k=0;k<3;++k) a.n[k]=plane.n[k];a.d=plane.d;
+    bool flat=true;
+    for(unsigned j=3;j<count;++j) flat&=std::abs(a.n[0]*a.c[j][0]+a.n[1]*a.c[j][1]+a.n[2]*a.c[j][2]-a.d)<0.5;
+    return flat;
+}
+// Pairs of planar faces (i<j) on one plane that overlap by more than half a
+// unit. bucketed: compare only faces whose planes fall in the same or a
+// neighbouring bucket (world meshes have hundreds of faces).
+std::vector<std::pair<size_t,size_t>> coplanar_pairs(const std::vector<CoplanarFace>& faces,const std::vector<bool>& planar,bool bucketed) {
+    // Separating axes in the plane of a: overlap of more than half a unit.
+    auto overlap=[](const CoplanarFace& a,const CoplanarFace& b) {
+        double u[3]={a.c[1][0]-a.c[0][0],a.c[1][1]-a.c[0][1],a.c[1][2]-a.c[0][2]};
+        const double length=std::sqrt(u[0]*u[0]+u[1]*u[1]+u[2]*u[2]);
+        if(length<1e-9) return false;
+        for(double& x:u) x/=length;
+        const double w[3]={a.n[1]*u[2]-a.n[2]*u[1],a.n[2]*u[0]-a.n[0]*u[2],a.n[0]*u[1]-a.n[1]*u[0]};
+        double pa[4][2],pb[4][2];
+        auto flatten=[&](const CoplanarFace& s,double out[4][2]) {
+            for(unsigned j=0;j<s.count;++j) {
+                out[j][0]=u[0]*s.c[j][0]+u[1]*s.c[j][1]+u[2]*s.c[j][2];
+                out[j][1]=w[0]*s.c[j][0]+w[1]*s.c[j][1]+w[2]*s.c[j][2];
+            }
+        };
+        flatten(a,pa);flatten(b,pb);
+        for(int pass=0;pass<2;++pass) {
+            const double (*s)[2]=pass?pb:pa;const unsigned n=pass?b.count:a.count;
+            for(unsigned j=0;j<n;++j) {
+                const double ax=-(s[(j+1)%n][1]-s[j][1]),ay=s[(j+1)%n][0]-s[j][0];
+                const double len=std::sqrt(ax*ax+ay*ay);if(len<1e-9) continue;
+                double lo[2]={1e300,1e300},hi[2]={-1e300,-1e300};
+                for(int q=0;q<2;++q) {
+                    const double (*t)[2]=q?pb:pa;const unsigned m=q?b.count:a.count;
+                    for(unsigned k=0;k<m;++k) {
+                        const double d=(t[k][0]*ax+t[k][1]*ay)/len;
+                        lo[q]=std::min(lo[q],d);hi[q]=std::max(hi[q],d);
+                    }
+                }
+                if(std::min(hi[0],hi[1])-std::max(lo[0],lo[1])<0.5) return false;
+            }
+        }
+        return true;
+    };
+    // D17AM2: world meshes have hundreds of faces; compare only faces whose
+    // planes fall in the same or a neighbouring bucket (normal to 1/64,
+    // distance to 4 units, sign-canonical). Props keep the full comparison.
+    std::vector<std::pair<size_t,size_t>> pairs,found;
+    if(bucketed) {
+        std::vector<std::pair<std::array<int64_t,4>,size_t>> keys;
+        for(size_t i=0;i<faces.size();++i) {
+            if(!planar[i]) continue;
+            const CoplanarFace& a=faces[i];int big=0;
+            for(int k=1;k<3;++k) if(std::abs(a.n[k])>std::abs(a.n[big])) big=k;
+            const double s=a.n[big]<0?-1:1;
+            keys.push_back({{std::llround(s*a.n[0]*64),std::llround(s*a.n[1]*64),std::llround(s*a.n[2]*64),(int64_t)std::floor(s*a.d/4)},i});
+        }
+        std::sort(keys.begin(),keys.end());
+        for(size_t x=0;x<keys.size();++x)
+            for(size_t y=x+1;y<keys.size();++y) {
+                const auto& ka=keys[x].first;const auto& kb=keys[y].first;
+                if(ka[0]!=kb[0] || ka[1]!=kb[1] || ka[2]!=kb[2] || kb[3]>ka[3]+1) break;
+                pairs.push_back(std::minmax(keys[x].second,keys[y].second));
+            }
+        std::sort(pairs.begin(),pairs.end());
+    } else {
+        for(size_t i=0;i<faces.size();++i) if(planar[i])
+            for(size_t j=i+1;j<faces.size();++j) if(planar[j]) pairs.push_back({i,j});
+    }
+    for(const auto& [i,j]:pairs) {
+        const CoplanarFace& a=faces[i];const CoplanarFace& b=faces[j];
+        const double dot=a.n[0]*b.n[0]+a.n[1]*b.n[1]+a.n[2]*b.n[2];
+        if(std::abs(dot)<0.9999) continue;
+        bool on=true;
+        for(unsigned k=0;k<b.count && on;++k) on=std::abs(a.n[0]*b.c[k][0]+a.n[1]*b.c[k][1]+a.n[2]*b.c[k][2]-a.d)<0.5;
+        if(on && overlap(a,b)) found.push_back({i,j});
+    }
+    return found;
+}
+// Ranks the faces of each coplanar pair (i the earlier record: it is painted
+// last unless j sorts nearer), gives each overlapping group one shared sort
+// depth, and orders the faces by rank.
+void apply_coplanar(const Frame& f,std::vector<Poly>& polys,const std::vector<std::pair<size_t,size_t>>& pairs) {
+    if(pairs.empty()) return;
+    std::vector<size_t> group(polys.size());
+    for(size_t i=0;i<group.size();++i) group[i]=i;
+    auto root=[&](size_t i) {while(group[i]!=i) i=group[i]=group[group[i]];return i;};
+    auto slot=[&](const Poly& p) {
+        if(unified_scene(f) && p.native_order) return p.native_slot;
+        uint32_t sum=0;for(unsigned j=0;j<p.count;++j) sum+=f.verts[p.idx[j]].sz;
+        const int64_t zsf=(int32_t)(p.count==4?f.zsf4:f.zsf3);
+        return (int)(((zsf*sum)>>12)>>3)+p.bias;
+    };
+    // D17AV: a face ranks behind every face painted over it (one more than
+    // the highest of them), not by how many there are: with A over B and B
+    // over C, counting gave B and C the same rank and they fought.
+    // A face made of some of another's corners (a triangle over half of a
+    // quad) can never sort farther than it, so the original paints it on top
+    // except when both share the farthest corner and tie, where record order
+    // decides: turning the view swapped them back and forth (slot 8's wall).
+    // On a tie the subset face wins, so it stays on top in every view.
+    auto subset=[](const Poly& a,const Poly& b) {
+        unsigned distinct=0,shared=0;
+        for(unsigned x=0;x<a.count;++x) {
+            bool repeat=false,found=false;
+            for(unsigned y=0;y<x;++y) repeat|=a.idx[y]==a.idx[x];
+            if(repeat) continue;
+            ++distinct;
+            for(unsigned y=0;y<b.count;++y) found|=b.idx[y]==a.idx[x];
+            shared+=found;
+        }
+        unsigned other=0;
+        for(unsigned x=0;x<b.count;++x) {bool repeat=false;for(unsigned y=0;y<x;++y) repeat|=b.idx[y]==b.idx[x];other+=!repeat;}
+        return shared==distinct && distinct<other;
+    };
+    auto duplicate=[&](const Poly& a,const Poly& b) {
+        if(!subset(a,b) || a.textured!=b.textured || (a.textured && (a.clut!=b.clut || a.tpage!=b.tpage))) return false;
+        for(unsigned x=0;x<a.count;++x)
+            for(unsigned y=0;y<b.count;++y)
+                if(a.idx[x]==b.idx[y] && (a.colors[x]!=b.colors[y] || (a.textured && a.uv[x]!=b.uv[y]))) return false;
+        return true;
+    };
+    std::vector<std::pair<size_t,size_t>> order; // {winner, loser}
+    for(const auto& [i,j]:pairs) {
+        const int si=slot(polys[i]),sj=slot(polys[j]);
+        bool j_wins=sj<si || (sj==si && subset(polys[j],polys[i]) && !subset(polys[i],polys[j]));
+        // A face that only repeats part of a bigger one (same texture,
+        // palette and texture coordinates at every shared corner: slot 8's
+        // wall panels) adds nothing but its own shading break, so the bigger
+        // face stays on top and is shaded as a whole (smooth_quad_shading).
+        if(duplicate(polys[j],polys[i])) j_wins=false;
+        else if(duplicate(polys[i],polys[j])) j_wins=true;
+        order.push_back(j_wins?std::make_pair(j,i):std::make_pair(i,j));
+        group[root(i)]=root(j);
+    }
+    // Ties broken by the subset rule could in principle close a cycle;
+    // a longest path is at most one step per pair, so stop there.
+    for(size_t pass=0,changed=1;changed && pass<=order.size();++pass) {
+        changed=0;
+        for(const auto& [w,l]:order)
+            if(polys[l].coplanar_rank<polys[w].coplanar_rank+1) {polys[l].coplanar_rank=polys[w].coplanar_rank+1;changed=1;}
+    }
+    std::vector<double> sum(polys.size(),0);std::vector<unsigned> corners(polys.size(),0);
+    for(size_t i=0;i<polys.size();++i) {
+        for(unsigned j=0;j<polys[i].count;++j) sum[root(i)]+=f.verts[polys[i].idx[j]].sz;
+        corners[root(i)]+=polys[i].count;
+    }
+    for(size_t i=0;i<polys.size();++i) {
+        const size_t r=root(i);
+        if(corners[r]>polys[i].count && polys[i].key_z<=0) polys[i].key_z=sum[r]/corners[r];
+    }
+    std::stable_sort(polys.begin(),polys.end(),[](const Poly& a,const Poly& b) {return a.coplanar_rank<b.coplanar_rank;});
+}
+bool coplanar_on() {static const bool on=env_int("DNTTK_NEAR_COPLANAR",1,0,1)==1;return on;}
+void rank_coplanar(const Frame& f,std::vector<Poly>& polys) {
+    if(!coplanar_on()) return;
+    static const int order4[4]={0,1,3,2};
+    std::vector<CoplanarFace> faces(polys.size());std::vector<bool> planar(polys.size(),false);
+    for(size_t i=0;i<polys.size();++i) {
+        const Poly& p=polys[i];
+        for(unsigned j=0;j<p.count;++j) {
+            const auto& v=f.verts[p.idx[p.count==4?order4[j]:j]];
+            for(int k=0;k<3;++k) faces[i].c[j][k]=v.view[k];
+        }
+        planar[i]=coplanar_face(faces[i],p.count);
+    }
+    apply_coplanar(f,polys,coplanar_pairs(faces,planar,!f.object));
+}
+// D17AR3: world pieces do not move (D17AR2 proof 2), so which of a mesh's
+// faces are coplanar and overlap does not depend on the view. The pairs are
+// found once per mesh in its own (exact integer) coordinates and kept, keyed
+// by the mesh address and checked against a hash of its vertex positions and
+// polygon list that world() folds in as it reads them. Only the ranking,
+// which depends on the view, runs every frame. Before, every host piece
+// repeated the search in view space: about 13 us of its 48. The search
+// itself is unchanged; DNTTK_COPLANAR_CACHE=0 (developer) repeats it in view
+// space every frame, as before, and DNTTK_COPLANAR_CHECK=1 (developer) runs
+// both and counts meshes whose ranks or sort depths differ.
+struct CoplanarMesh {uint64_t sig=0;std::vector<std::pair<uint32_t,uint32_t>> pairs;};
+std::vector<std::pair<uint32_t,CoplanarMesh>> coplanar_meshes; // sorted by mesh address
+uint64_t coplanar_hits=0,coplanar_builds=0,coplanar_checked=0,coplanar_mismatch=0;
+bool coplanar_cache() {static const bool on=env_int("DNTTK_COPLANAR_CACHE",1,0,1)==1;return on;}
+inline uint64_t coplanar_mix(uint64_t h,uint32_t w) {return (h^w)*0x100000001b3ull;}
+// taken: every face of the mesh (unified geometry takes them all), tagged
+// records in list order; polys: those drawn this frame, in the same order.
+void rank_coplanar_world(const Frame& f,std::vector<Poly>& polys,uint32_t mesh,uint64_t sig,const std::vector<uint32_t>& taken) {
+    if(!coplanar_on()) return;
+    if(!coplanar_cache()) {rank_coplanar(f,polys);return;}
+    auto it=std::lower_bound(coplanar_meshes.begin(),coplanar_meshes.end(),mesh,[](const auto& e,uint32_t m){return e.first<m;});
+    if(it==coplanar_meshes.end() || it->first!=mesh) it=coplanar_meshes.insert(it,{mesh,{}});
+    CoplanarMesh& c=it->second;
+    if(c.sig!=sig || !sig) {
+        static const int order4[4]={0,1,3,2};
+        std::vector<CoplanarFace> faces(taken.size());std::vector<bool> planar(taken.size(),false);
+        for(size_t i=0;i<taken.size();++i) {
+            const uint32_t record=taken[i]&~1u,word=psx_mod_read_word(record);
+            const unsigned count=(taken[i]&1)?4:3;
+            for(unsigned j=0;j<count;++j) {
+                const uint32_t w0=psx_mod_read_word(mesh+0x1c+8*((word>>(8*(count==4?order4[j]:j)))&0xff));
+                const uint32_t xy=((w0&0xff)<<10)|((w0&0xff00)<<15);
+                faces[i].c[j][0]=(int16_t)xy;faces[i].c[j][1]=(int16_t)(xy>>16);faces[i].c[j][2]=(int16_t)((((w0>>16)&0xff)<<10)&0xffff);
+            }
+            planar[i]=coplanar_face(faces[i],count);
+        }
+        c.pairs.clear();
+        for(const auto& [i,j]:coplanar_pairs(faces,planar,true)) c.pairs.push_back({taken[i]&~1u,taken[j]&~1u});
+        c.sig=sig;++coplanar_builds;
+    } else ++coplanar_hits;
+    static const bool check=env_int("DNTTK_COPLANAR_CHECK",0,0,1)==1;
+    std::vector<Poly> reference;
+    if(check) {reference=polys;rank_coplanar(f,reference);}
+    struct Check {const std::vector<Poly>& got;const std::vector<Poly>& want;bool on;
+        ~Check() {
+            if(!on) return;
+            ++coplanar_checked;bool same=got.size()==want.size();
+            for(size_t i=0;same && i<got.size();++i) same=got[i].source==want[i].source && got[i].coplanar_rank==want[i].coplanar_rank && got[i].key_z==want[i].key_z;
+            coplanar_mismatch+=!same;
+        }} verify{polys,reference,check};
+    if(c.pairs.empty()) return;
+    // Faces culled this frame drop out of their pairs.
+    auto find=[&](uint32_t record) {
+        auto p=std::lower_bound(polys.begin(),polys.end(),record,[](const Poly& q,uint32_t r){return q.source<r;});
+        return p!=polys.end() && p->source==record ? (size_t)(p-polys.begin()) : polys.size();
+    };
+    std::vector<std::pair<size_t,size_t>> pairs;
+    for(const auto& [a,b]:c.pairs) {
+        const size_t i=find(a),j=find(b);
+        if(i<polys.size() && j<polys.size()) pairs.push_back({i,j});
+    }
+    apply_coplanar(f,polys,pairs);
+}
+// D17AC: authenticate the retail payphone shape, not a scene address, slot,
+// texture page or a type-table index that another level can reuse. Modified
+// models fail closed. Only its opaque FT4 rear panel gets the allowance.
+bool phone_mesh(uint32_t vertices,unsigned count) {
+    if(count!=10) return false;
+    static constexpr int16_t xyz[10][3]={
+        {-105,0,-136},{105,0,-136},{-105,0,136},{105,0,136},
+        {-105,-395,-136},{105,-395,-136},{-105,-395,136},{105,-395,136},
+        {105,-321,-136},{105,-321,136}};
+    for(unsigned i=0;i<10;++i) for(unsigned k=0;k<3;++k)
+        if((int16_t)psx_mod_read_half(vertices+8*i+2*k)!=xyz[i][k]) return false;
+    return true;
+}
+// D17BA: open models. A static model whose one-sided faces do not close
+// (the slot-12 burning barrel: six outer walls, no lid, no inside) shows the
+// background through its opening where the far walls' inner sides should be,
+// because the original culls back faces (NCLIP) and its low, distant camera
+// rarely looked in. Polymorph draws both sides of such a model's one-sided
+// faces that form its inside. A model is open when an edge of a one-sided
+// face (by corner position, quads in the GPU's 0-1-3-2 order) has no reversed
+// twin in another one-sided face, other than at its base (the model's lowest
+// corners, standing on the floor); double-sided faces (flames, cards) do not
+// close it. Of an open model, a one-sided face gets its back side when that
+// side faces the model's centre (an inner wall: a flat panel or sign does
+// not), it is opaque, and no opposite-facing face lies within 8 units of its
+// plane (a back-to-back panel, which would fight it). The inside shows the
+// face's own texture and colour. Static scene props only: actors, Duke, the
+// first-person layer and the sky keep the original rule.
+// DNTTK_OPEN_MODELS=0 (developer) keeps the original cull everywhere.
+uint64_t open_model_builds=0,open_model_meshes=0,open_model_faces=0,open_model_drawn=0;
+struct OpenModel {uint32_t vertices=0,list=0,count=0,sum=0;std::vector<uint32_t> faces;};
+const std::vector<uint32_t>& open_model_faces_of(uint32_t mesh,uint32_t vertices,uint32_t list,unsigned count) {
+    static std::unordered_map<uint32_t,OpenModel> cache;
+    // The model's data may be replaced by a level load: the cache entry holds
+    // a checksum of its corner positions and face corner lists.
+    uint32_t sum=2166136261u,cursor=list;
+    for(unsigned i=0;i<count;++i) sum=((sum^psx_mod_read_word(vertices+8*i))*16777619u^psx_mod_read_half(vertices+8*i+4))*16777619u;
+    for(unsigned guard=0;guard<=256;++guard) {
+        const uint32_t header=psx_mod_read_word(cursor);cursor+=4;sum=(sum^header)*16777619u;
+        const uint32_t type=header&0xffff,n=header>>16,size=object_record_size(type);
+        if(type==0xff || !size || !n || n>4096) break;
+        for(uint32_t k=0;k<n;++k) sum=(sum^psx_mod_read_word(cursor+k*size))*16777619u;
+        cursor+=n*size;
+    }
+    if(const auto it=cache.find(mesh);it!=cache.end()) {
+        const OpenModel& m=it->second;
+        if(m.vertices==vertices && m.list==list && m.count==count && m.sum==sum) return m.faces;
+    }
+    ++open_model_builds;
+    OpenModel m{vertices,list,count,sum,{}};
+    struct Face {uint32_t record;int idx[4];unsigned n;double normal[3],d;bool translucent;};
+    std::vector<Face> faces;
+    auto position=[&](int i,double* out){for(int k=0;k<3;++k) out[k]=(int16_t)psx_mod_read_half(vertices+8*i+2*k);};
+    auto key=[&](int i){return (uint64_t)psx_mod_read_word(vertices+8*i)<<16|psx_mod_read_half(vertices+8*i+4);};
+    std::vector<std::pair<uint64_t,uint64_t>> edges;
+    cursor=list;
+    for(unsigned guard=0;guard<=256;++guard) {
+        const uint32_t header=psx_mod_read_word(cursor);cursor+=4;
+        const uint32_t type=header&0xffff,n=header>>16,size=object_record_size(type);
+        if(type==0xff || !size || !n || n>4096) break;
+        for(uint32_t k=0;k<n;++k,cursor+=size) {
+            const uint32_t bits=psx_mod_read_word(cursor+(type==0x20 || type==0x28 || type==0x30 || type==0x38 ? 4 : 8))>>25;
+            if(bits&1) continue;
+            Face face{cursor,{},(type&8)?4u:3u,{},0,(bits&0x10)!=0};
+            const uint32_t word=psx_mod_read_word(cursor);bool bad=false;
+            for(unsigned j=0;j<face.n;++j) {face.idx[j]=(word>>(8*j))&0xff;bad|=face.idx[j]>=(int)count;}
+            if(bad) continue;
+            double a[3],b[3],c[3];position(face.idx[0],a);position(face.idx[1],b);position(face.idx[2],c);
+            const double u[3]={b[0]-a[0],b[1]-a[1],b[2]-a[2]},v[3]={c[0]-a[0],c[1]-a[1],c[2]-a[2]};
+            double nn[3]={u[1]*v[2]-u[2]*v[1],u[2]*v[0]-u[0]*v[2],u[0]*v[1]-u[1]*v[0]};
+            const double len=std::sqrt(nn[0]*nn[0]+nn[1]*nn[1]+nn[2]*nn[2]);
+            if(len<1e-6) continue;
+            for(int i=0;i<3;++i) face.normal[i]=nn[i]/len;
+            face.d=face.normal[0]*a[0]+face.normal[1]*a[1]+face.normal[2]*a[2];
+            static constexpr int quad[4]={0,1,3,2};
+            for(unsigned j=0;j<face.n;++j) {
+                const int from=face.idx[face.n==4?quad[j]:j],to=face.idx[face.n==4?quad[(j+1)%4]:(j+1)%3];
+                if(key(from)!=key(to)) edges.push_back({key(from),key(to)});
+            }
+            faces.push_back(face);
+        }
+    }
+    std::vector<std::pair<uint64_t,uint64_t>> sorted=edges;std::sort(sorted.begin(),sorted.end());
+    double base=-32768,centre[3]={0,0,0};
+    for(unsigned i=0;i<count;++i) {
+        double p[3];position(i,p);base=std::max(base,p[1]);
+        for(int k=0;k<3;++k) centre[k]+=p[k]/count;
+    }
+    // Key layout: z in bits 0-15, x in 16-31, y in 32-47.
+    auto y_of=[](uint64_t k){return (double)(int16_t)(k>>32);};
+    bool open=false;
+    for(const auto& [a,b]:edges)
+        open|=!std::binary_search(sorted.begin(),sorted.end(),std::make_pair(b,a)) && std::min(y_of(a),y_of(b))<base-4;
+    if(open) {
+        ++open_model_meshes;
+        for(const auto& face:faces) {
+            // With y down, (v1-v0) x (v2-v0) of a front face points into the
+            // model: the centre lies on the side its back faces.
+            const double inside=face.normal[0]*centre[0]+face.normal[1]*centre[1]+face.normal[2]*centre[2]-face.d;
+            bool twin=false;
+            for(const auto& other:faces) {
+                const double dot=face.normal[0]*other.normal[0]+face.normal[1]*other.normal[1]+face.normal[2]*other.normal[2];
+                twin|=&other!=&face && dot<-0.99 && std::abs(face.d+other.d)<8.0;
+            }
+            if(inside>1.0 && !face.translucent && !twin) m.faces.push_back(face.record);
+        }
+        std::sort(m.faces.begin(),m.faces.end());
+        open_model_faces+=m.faces.size();
+    }
+    if(cache.size()>=4096) cache.clear();
+    OpenModel& slot=cache[mesh];slot=std::move(m);
+    return slot.faces;
+}
+bool open_models_on() {static const bool v=env_int("DNTTK_OPEN_MODELS",1,0,1)!=0;return v;}
+// D17BE: the original culls an object quad by its first half (0 1 2) alone.
+// A quad folded along its diagonal (the crushed car on TIME TO KILL's street)
+// can face away there while its other half (1 3 2) faces the eye, so that
+// half vanished as the view turned (a sliver under the cabin). Unified scene
+// meshes draw such a quad as its front half, as the world's repeated-corner
+// triangle (D17AV). DNTTK_FOLDED_QUADS=0 (developer) keeps the original cull.
+uint64_t folded_quads=0;
+bool folded_quads_on() {static const bool v=env_int("DNTTK_FOLDED_QUADS",1,0,1)!=0;return v;}
+// 0x80010000 entry, same register contract as the world renderer.
+// D41H: smooth light on models. TTK's meshes carry no normals (note 184) and
+// D41A shades each face by its own plane, so a body shows its facets under a
+// light. Each corner of a drawn face takes the area-weighted mean of the
+// mesh's face normals at that corner (every face of the list, drawn or
+// culled, with corners at the same position welded), limited to faces within
+// the crease angle of its own, so rounded parts shade round and hard edges
+// (crates, a gun's slide) stay hard. World space, the space of the lights;
+// recomputed per draw so animated meshes keep correct normals. Outward
+// normals: front faces face the eye (front_facing's sign), so a light
+// behind a closed body leaves its far side unlit. A face seen from both
+// sides (double-sided, open-model backs) keeps two-sided light
+// (shorter normal, gpu_gl_renderer.c). DNTTK_SMOOTH_CREASE=<degrees>
+// (developer, default 65).
+double smooth_crease_cos() {
+    static const double v=std::cos(env_int("DNTTK_SMOOTH_CREASE",65,0,180)*3.14159265358979323846/180.0);return v;
+}
+void smooth_model_normals(const Frame& f,std::vector<Poly>& polys,uint32_t list,unsigned count,uint32_t flags) {
+    if(polys.empty() || !count) return;
+    // DNTTK_SMOOTH_TRACE=1 (developer): every 4000 meshes, the mean cost and
+    // how many drawn faces' outward normals face the eye (should be all but
+    // double-sided faces).
+    static const bool smooth_trace=std::getenv("DNTTK_SMOOTH_TRACE")!=nullptr;
+    const auto t0=smooth_trace?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
+    struct V3 {double x,y,z;};
+    thread_local std::vector<V3> w;thread_local std::vector<int> rep,order;
+    thread_local std::vector<V3> fn;thread_local std::vector<int> fstart,fadj,fill;
+    w.resize(count);rep.resize(count);order.resize(count);
+    const double* m=light_inv;
+    for(unsigned i=0;i<count;++i) {
+        const double* p=f.verts[i].view;
+        w[i]={m[0]*p[0]+m[1]*p[1]+m[2]*p[2],m[3]*p[0]+m[4]*p[1]+m[5]*p[2],m[6]*p[0]+m[7]*p[1]+m[8]*p[2]};
+        order[i]=(int)i;
+    }
+    // Weld corners at one model position (texture seams): same view position.
+    std::sort(order.begin(),order.end(),[&](int a,int b) {
+        const double* p=f.verts[a].view;const double* q=f.verts[b].view;
+        for(int k=0;k<3;++k) if(p[k]!=q[k]) return p[k]<q[k];
+        return a<b;});
+    for(unsigned i=0;i<count;++i) {
+        const int a=order[i];
+        rep[a]=i && !std::memcmp(f.verts[a].view,f.verts[order[i-1]].view,sizeof(double)*3)?rep[order[i-1]]:a;
+    }
+    const double a0=light_inv[0],a1=light_inv[1],a2=light_inv[2],a3=light_inv[3],a4=light_inv[4],a5=light_inv[5],a6=light_inv[6],a7=light_inv[7],a8=light_inv[8];
+    const double det_m=a0*(a4*a8-a5*a7)-a1*(a3*a8-a5*a6)+a2*(a3*a7-a4*a6);
+    // det(v0,v1,v2) = n_view . v0 and front faces have sign*det > 0, so the
+    // outward view normal is -sign * n_view; in world space det(M) flips it.
+    const double orient=((flags&0x400)?1.0:-1.0)*(det_m<0?-1.0:1.0);
+    auto face_normal=[&](const int* idx,unsigned corners) {
+        const V3& p0=w[idx[0]];const V3& p1=w[idx[1]];const V3& p2=w[idx[2]];
+        V3 e1,e2;
+        if(corners==4) {const V3& p3=w[idx[3]];e1={p3.x-p0.x,p3.y-p0.y,p3.z-p0.z};e2={p2.x-p1.x,p2.y-p1.y,p2.z-p1.z};}
+        else {e1={p1.x-p0.x,p1.y-p0.y,p1.z-p0.z};e2={p2.x-p0.x,p2.y-p0.y,p2.z-p0.z};}
+        return V3{orient*(e1.y*e2.z-e1.z*e2.y),orient*(e1.z*e2.x-e1.x*e2.z),orient*(e1.x*e2.y-e1.y*e2.x)};
+    };
+    // Every face of the list, by welded corner (two passes: count, fill).
+    fn.clear();fadj.clear();fstart.assign(count+1,0);
+    thread_local std::vector<int> fidx;fidx.clear();
+    uint32_t cursor=list;
+    for(unsigned guard=0;guard<=256;++guard) {
+        const uint32_t header=psx_mod_read_word(cursor);cursor+=4;
+        const uint32_t type=header&0xffff,n=header>>16;
+        if(type==0xff) break;
+        const unsigned size=object_record_size(type);
+        if(!size || !n || n>4096) return;
+        const unsigned corners=(type&8)?4:3;
+        for(uint32_t k=0;k<n;++k,cursor+=size) {
+            const uint32_t word=psx_mod_read_word(cursor);int idx[4];
+            for(unsigned j=0;j<corners;++j) {idx[j]=(int)((word>>(8*j))&0xff);if(idx[j]>=(int)count) return;}
+            const V3 v=face_normal(idx,corners);
+            if(v.x*v.x+v.y*v.y+v.z*v.z<=1e-12) continue;
+            fn.push_back(v);
+            for(unsigned j=0;j<corners;++j) {fidx.push_back(rep[idx[j]]);++fstart[rep[idx[j]]+1];}
+            fidx.push_back(-1);
+        }
+    }
+    for(unsigned i=0;i<count;++i) fstart[i+1]+=fstart[i];
+    fadj.resize(fstart[count]);fill.assign(fstart.begin(),fstart.end()-1);
+    for(size_t i=0,face=0;i<fidx.size();++i) {
+        if(fidx[i]<0) {++face;continue;}
+        // A degenerate quad may name a corner twice: count the face once.
+        bool seen=false;for(int j=fstart[fidx[i]];j<fill[fidx[i]];++j) seen|=fadj[j]==(int)face;
+        if(!seen) fadj[fill[fidx[i]]++]=(int)face;
+    }
+    const double crease=smooth_crease_cos();
+    for(auto& p:polys) {
+        const V3 own=face_normal(p.idx,p.count);
+        const double ol=std::sqrt(own.x*own.x+own.y*own.y+own.z*own.z);
+        if(ol<=1e-6) continue;
+        const double scale=p.two_sided?0.4:1.0;
+        for(unsigned j=0;j<p.count;++j) {
+            const int r=rep[p.idx[j]];V3 sum{0,0,0};
+            for(int a=fstart[r];a<fill[r];++a) {
+                const V3& q=fn[fadj[a]];
+                const double ql=std::sqrt(q.x*q.x+q.y*q.y+q.z*q.z);
+                if((q.x*own.x+q.y*own.y+q.z*own.z)<crease*ql*ol) continue;
+                sum.x+=q.x;sum.y+=q.y;sum.z+=q.z;
+            }
+            double sl=std::sqrt(sum.x*sum.x+sum.y*sum.y+sum.z*sum.z);
+            if(sl<=1e-9) {sum=own;sl=ol;}
+            p.n[j][0]=(float)(scale*sum.x/sl);p.n[j][1]=(float)(scale*sum.y/sl);p.n[j][2]=(float)(scale*sum.z/sl);
+        }
+    }
+    if(smooth_trace) {
+        thread_local uint64_t calls=0,faces=0,ns=0,eye=0,drawn=0;
+        for(const auto& p:polys) if(!p.two_sided) {const V3 n=face_normal(p.idx,p.count);const V3& q=w[p.idx[0]];eye+=(n.x*q.x+n.y*q.y+n.z*q.z)<0;++drawn;}
+        ++calls;faces+=fn.size();ns+=(uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-t0).count();
+        if(calls%4000==0) std::fprintf(stderr,"[TTK smooth] %llu meshes, %.1f faces and %.2f us each, outward toward eye %llu of %llu drawn\n",
+            (unsigned long long)calls,(double)faces/calls,ns/1000.0/calls,(unsigned long long)eye,(unsigned long long)drawn);
+    }
+}
+void object(CPUState* cpu) {
+    const uint32_t mesh=cpu->gpr[4];
+    const LimbPresentation limb=first_person_limb_presentation();
+    const bool viewmodel=limb.viewmodel();
+    // D36H9: first-person hang legs share the third-person body's
+    // screen-door coverage, every face host-drawn with it.
+    const bool fp_legs=!third_person_camera_live() && first_person_duke_drawing() && limb.owner==LimbOwner::Legs;
+    const double coverage=fp_legs?first_person_legs_coverage():third_person_duke_drawing()?third_person_body_coverage():1.0;
+    const bool lit_body=light_frame && duke_light_on() && unified() && limb.owner==LimbOwner::Native &&
+        third_person_body_lightable();
+    const bool body=(third_person_duke_drawing() && third_person_camera_live() && coverage<1.0) || (fp_legs && coverage<1.0) || lit_body;
+    if(!viewmodel && !limb.world_clip() && (first_person_duke_drawing() || third_person_duke_drawing()) && !body) {++duke_skips;return;}
+    const bool actor=first_person_actor_drawing() || third_person_duke_drawing();
+    ++object_stats.seen;
+    // D41D1: the object animation table (ctx+0x60 is only set while objects
+    // draw), for the sign scan's animated faces (near_clip_object_animation).
+    if(const uint32_t a=psx_mod_read_word(context+0x60);a>=0x80010000u && a<=0x801ffff0u && !(a&3)) last_object_animation=a;
+    const unsigned count=psx_mod_read_byte(mesh+6);
+    const uint32_t vertices=psx_mod_read_word(mesh+0x10),list=psx_mod_read_word(mesh+0x14);
+    // D08A35: the hat head copy keeps its vertices and list beside it.
+    const bool hat=cowboy_hat_mesh(mesh) && cowboy_hat_mesh(vertices) && cowboy_hat_mesh(list);
+    const bool borrowed=sky_borrow_owns(mesh) && sky_borrow_owns(vertices) && sky_borrow_owns(list);
+    if(!count || ((vertices<0x80010000 || vertices>0x801ffff0 || list<0x80010000 || (list>0x801ffff0 && list!=missing_texture_copy+0x20)) && !hat && !borrowed)) return;
+    Frame f{};if(!begin(f,cpu,true)) return;
+    const bool game_view=game_camera_view();   // D52
+    f.glow=!glow_meshes.empty() && std::binary_search(glow_meshes.begin(),glow_meshes.end(),mesh);
+    // D17AH: native sky layers are composed in painter order, not world depth.
+    // Retain perspective texture coordinates and all clipping/ordering rules.
+    static SkyRenderIdentity sky_identity;
+    const uint32_t sky_ra=cpu->gpr[31];
+    static const bool sky_painter=env_int("DNTTK_SKY_PAINTER",1,0,1)!=0;
+    f.sky=sky_painter &&
+        (sky_ra==0x80038c94u || sky_ra==0x80038cf0u ||
+         sky_ra==0x80038da8u || sky_ra==0x80038e44u) &&
+        sky_identity.valid(input_host_frame(),g_dirty_ram_code_gen,g_psx_ram);
+    // Keep the accepted display geometry, pose, UVs and depth. Changing only
+    // this mesh's projection restores its original apparent size and position
+    // at every world FOV. The shared GTE and gameplay matrices are untouched;
+    // attached weapons/items/flashes inherit the verified hand owner, while
+    // native contact arms and body keep the projection read above. Each replay
+    // draw reconstructs ownership, so no additional snapshot state is needed.
+    if(limb.fixed_projection()) f.g.h=256;
+    trace_begin(f,cpu);
+    f.viewmodel=viewmodel;f.coverage=coverage;
+    f.duke_lit=duke_light_on() && (first_person_duke_drawing() || third_person_duke_drawing()) &&
+        (viewmodel || limb.owner!=LimbOwner::Native);
+    f.scene=!viewmodel && !f.sky && !limb.fixed_projection();
+    // D17AO1: the borrowed sky's textures exist only in the second bank, so
+    // every one of its polygons is host-drawn with the bank mark.
+    f.borrowed=f.sky && borrowed;
+    if(viewmodel && held_frame!=frame_first_cursor) {held_packets.clear();held_frame=frame_first_cursor;}
+    f.verts.resize(count);
+    // D17AC: the payphone shape at the verified static-prop loop.
+    const bool phone=!actor && !viewmodel && cpu->gpr[31]==0x80032288 && phone_mesh(vertices,count);
+    bool any=viewmodel || body;
+    for(unsigned i=0;i<count;++i) {
+        const uint32_t xy=psx_mod_read_word(vertices+8*i);
+        f.verts[i]=near_project(f.g,(int16_t)xy,(int16_t)(xy>>16),(int16_t)psx_mod_read_half(vertices+8*i+4));
+        any|=!f.verts[i].safe || f.verts[i].sz<std::max<uint32_t>(object_perspective_z,2048);
+    }
+    bool forced=(unified() && f.scene) || f.borrowed;
+    f.far=f.scene;for(const auto& v:f.verts) f.far&=v.sz>=far_z;
+    trace_vertices(f);
+    // As in world(): only a downgraded scene mesh leaves native packets.
+    if(f.scene && !body && !forced) scene_depth_begin(f,!actor,phone); else scene_depth_flush();
+    if(!any && !forced) {trace_record(f,"native_mesh",0);if(!f.trace) return;}
+    struct Taken {uint32_t record,type;};
+    std::vector<Group> groups;std::vector<Taken> taken;
+    // D17AM2: see world(); an unaffordable mesh keeps the earlier rules.
+    for(;;) {
+    groups.clear();taken.clear();
+    uint32_t cursor=list;
+    for(unsigned guard=0;;++guard) {
+        if(guard>256) return;
+        const uint32_t header=psx_mod_read_word(cursor);cursor+=4;
+        const uint32_t type=header&0xffff,n=header>>16;
+        if(type==0xff) break;
+        const unsigned size=object_record_size(type);
+        if(!size || !n || n>4096) return;
+        Group group{type,size,{}};
+        const unsigned corners=(type&8)?4:3;
+        for(uint32_t k=0;k<n;++k,cursor+=size) {
+            const uint32_t word=psx_mod_read_word(cursor);
+            bool unsafe=false,all_near=true;int idx[4];
+            for(unsigned j=0;j<corners;++j) {
+                const unsigned i=(word>>(8*j))&0xff;if(i>=count) return;idx[j]=(int)i;
+                unsafe|=!f.verts[i].safe || f.verts[i].sz<object_perspective_z;all_near&=f.verts[i].sz<f.g.h;
+            }
+            // The original drops a polygon whose corners are all nearer than
+            // H; in the eye view that made props see-through up close, so such
+            // polygons are drawn here too. D52: not in a game-owned view
+            // (security monitors, scripted cameras): their camera sits inside
+            // its own housing model, whose faces the original drops; drawn
+            // here they lay a dark slab across the picture. They stay with the
+            // original routine, which drops them.
+            if(all_near && game_view) {++game_view_drops;trace_face(f,cursor,corners,"native_kept");group.kept.push_back(cursor);continue;}
+            unsafe|=all_near || oversize(f,idx,corners) || viewmodel || body || forced;
+            trace_face(f,cursor,corners,(any || forced) && unsafe?"host_candidate":"native_kept");
+            if(unsafe) taken.push_back({cursor,type}); else group.kept.push_back(cursor);
+        }
+        if(!group.kept.empty()) groups.push_back(std::move(group));
+    }
+    if(forced && budget(f)<mesh_need(f,taken.size())) {
+        if(!f.sky && !viewmodel) frame_after_missed+=(uint32_t)taken.size()*0x34;
+        forced=false;f.scene=false;++unified_downgrades;trace_record(f,"unified_downgrade",0);
+        if(!body) scene_depth_begin(f,!actor,phone);
+        if(!any) return;
+        continue;
+    }
+    break;
+    }
+    if(taken.empty()) return;
+    if(budget(f)<mesh_need(f,taken.size())) {
+        if(!f.sky && !viewmodel) frame_after_missed+=(uint32_t)taken.size()*0x34;
+        ++mesh_fallbacks;++fallback_kind[f.sky?2:1];near_fallbacks+=!f.far;trace_record(f,"mesh_budget_fallback",0);return;}
+    const uint32_t copy=guest_copy();
+    if(!copy || 0x20+list_bytes(groups)>copy_size) {++copy_overflows;return;}
+    for(uint32_t i=0;i<0x18;i+=4) psx_mod_write_word(copy+i,psx_mod_read_word(mesh+i));
+    psx_mod_write_word(copy+0x14,copy+0x20);
+    write_list(copy+0x20,groups);
+    cpu->gpr[4]=copy;
+    ++object_stats.taken;viewmodel_meshes+=viewmodel;
+    const uint32_t flags=psx_mod_read_word(context+0x50),palette=vertices+count*8;
+    const uint32_t command_bits=psx_mod_read_word(context+0x48),tpage_bits=psx_mod_read_word(context+0x4c);
+    std::vector<Poly> polys;polys.reserve(taken.size());
+    // D17BA: both sides of an open static model's one-sided faces.
+    const std::vector<uint32_t>* open_faces=open_models_on() && unified_scene(f) && !actor && !body && !viewmodel && !f.sky ?
+        &open_model_faces_of(mesh,vertices,list,count) : nullptr;
+    for(const auto& [record,type]:taken) {
+        Poly p{};p.source=record;p.count=(type&8)?4:3;p.actor=actor;
+        const uint32_t word=psx_mod_read_word(record);
+        for(unsigned j=0;j<p.count;++j) p.idx[j]=(word>>(8*j))&0xff;
+        const bool textured=type==0x24 || type==0x2c || type==0x34 || type==0x3c;
+        const bool gouraud=type==0x30 || type==0x38 || type==0x34 || type==0x3c;
+        const uint32_t bits=psx_mod_read_word(record+(type==0x20 || type==0x28 || type==0x30 || type==0x38 ? 4 : 8))>>25;
+        bool folded=false;
+        if(!(bits&1) && !front_facing(f,p,flags,false)) {
+            Poly half=p;half.idx[0]=p.idx[1];half.idx[1]=p.idx[3];half.idx[2]=p.idx[2];
+            if(p.count==4 && folded_quads_on() && unified_scene(f) && !actor && !body && !viewmodel && !f.sky &&
+               front_facing(f,half,flags,false)) {folded=true;++folded_quads;trace_record(f,"folded_half",record);}
+            else if(!open_faces || !std::binary_search(open_faces->begin(),open_faces->end(),record)) {++object_stats.culled;trace_record(f,"backface",record);continue;}
+            else {++open_model_drawn;trace_record(f,"open_back",record);p.two_sided=true;}
+        }
+        p.two_sided|=(bits&1)!=0;
+        p.textured=textured;p.bias=((bits&8)?1:0)-((bits&4)?1:0);
+        p.command=(textured?0x34000000u:0x30000000u)|((bits&0x10)<<21)|command_bits;
+        p.phone_back=phone && type==0x2c && word==0x06020400u &&
+            !(p.command&0x02000000u);
+        // D17AH diagnostic: keep each sky face's native AVSZ ordering key.
+        static const bool sky_source_order=env_int("DNTTK_SKY_SOURCE_ORDER",0,0,1)!=0;
+        if(f.sky && sky_source_order) p.native_order=true;
+        if(unified_scene(f)) p.native_order=true;
+        if(p.native_order) {
+            uint32_t sum=0;for(unsigned j=0;j<p.count;++j) sum+=f.verts[p.idx[j]].sz;
+            const int32_t zsf=(int32_t)(p.count==4?f.zsf4:f.zsf3);
+            const int32_t otz=clamp(((int64_t)zsf*sum)>>12,0,0xffff);
+            p.native_slot=otz>=(int32_t)f.far_limit?-1:clamp((otz>>3)+p.bias,0,0x7ff);
+        }
+        if(textured) {
+            uint32_t t1=psx_mod_read_word(record+4),t2=psx_mod_read_word(record+8),t3=psx_mod_read_word(record+12);
+            if((bits&0x20) && !animate(t1,t2,t3,true)) continue;
+            t2|=tpage_bits;
+            p.clut=t1>>16;p.tpage=t2>>16;
+            p.uv[0]=t1&0xffff;p.uv[1]=t2&0xffff;p.uv[2]=t3&0xffff;p.uv[3]=t3>>16;
+        }
+        const uint32_t color_bytes=type==0x34 || type==0x3c ? 16 : 8;
+        for(unsigned j=0;j<p.count;++j) {
+            uint32_t c;
+            if(gouraud) c=psx_mod_read_word(palette+4*psx_mod_read_byte(record+color_bytes+j));
+            else if(textured) c=psx_mod_read_word(context+((bits&2)?0x5c:0x54));
+            else c=psx_mod_read_word(palette+4*psx_mod_read_byte(record+4));
+            p.colors[j]=c&0xffffff;
+        }
+        if(folded) {
+            static const int half[3]={1,3,2};Poly t=p;t.count=3;
+            for(int j=0;j<3;++j) {t.idx[j]=p.idx[half[j]];t.colors[j]=p.colors[half[j]];t.uv[j]=p.uv[half[j]];}
+            p=t;
+        }
+        polys.push_back(p);
+    }
+    if(!viewmodel) rank_coplanar(f,polys);
+    if(light_frame && light_smooth && !f.sky && !f.biomask && (unified_scene(f) || f.duke_lit))
+        smooth_model_normals(f,polys,list,count,flags);
+    for(const auto& p:polys) draw(f,p);
+}
+#include "water_clip.inc"
+#include "model_depth.inc"
+
+// Occluder fade. The prop loop (0x80031fa0..0x80032078) makes a prop
+// semi-transparent and dims it by distance when it is nearer than the fade
+// distance (camera+0xa0) and its screen rectangle overlaps Duke's
+// (camera+0xa8), tested by 0x8002ee50(a0 Duke's rect, a1 prop rect; halves
+// x,y,w,h). That keeps Duke visible in third person, but in the eye view
+// Duke's rectangle covers most of the screen, so a door walked up to turns
+// nearly invisible. In the eye view the test is given an empty rectangle far
+// off screen (only this call's argument changes). DNTTK_FP_OCCLUDER_FADE=1
+// keeps the original fade (a future menu toggle, D19).
+bool keep_fade() {static const bool v=env_int("DNTTK_FP_OCCLUDER_FADE",0,0,1)==1;return v;}
+void occluder_test(CPUState* cpu) {
+    ++fade_tests;
+    if(keep_fade() || cpu->gpr[31]!=0x80032010) return;
+    if(!empty_rect) {
+        empty_rect=psx_mod_alloc_guest_memory(16,16);
+        if(!empty_rect) return;
+        psx_mod_write_word(empty_rect,0x8300u<<16|0x8300u); // x=y=-32000
+        psx_mod_write_word(empty_rect+4,0);                   // w=h=0
+    }
+    cpu->gpr[4]=empty_rect;++fades_skipped;
+}
+// D17N: whole world polygons when textures are perspective-correct.
+// The world renderer projects every vertex into the buffer at ctx+0x10 (8-byte
+// records: SXY, then SZ | flags) before its polygon loop. Bit 21 marks SZ under
+// 0x2000. The per-polygon fetch helpers (0x800114ec triangles, ra 0x80011894;
+// 0x8001160c quads, ra 0x80011ab4) AND the corners' flags; when bit 21 stays
+// set the polygon goes to the screen-space subdivision (0x80012960 triangles,
+// 0x8001205c quads: the whole polygon underneath, then 2x2 or 4x4 pieces).
+// Its midpoints are integer averages of the corners' screen positions, with
+// UVs averaged after dropping their low bits, and carry no projection data, so
+// every piece falls back to affine mapping: border lines bend along the piece
+// diagonals and the integer midpoints jitter as the eye moves. With Corrected
+// textures the GPU already maps the whole polygon with correct perspective, so
+// a polygon whose corners all have exact projections, and which fits the GPU
+// primitive limit, is drawn whole: bit 21 is cleared on one corner for that
+// polygon only and restored before the next one. DNTTK_WORLD_SUBDIVISION=1
+// (developer) keeps the original subdivision for comparisons.
+constexpr uint32_t near_flag=1u<<21;
+uint32_t subdivision_restore_addr,subdivision_restore_value;
+uint64_t subdivision_whole,subdivision_kept;
+bool subdivision_bypass() {
+    static const bool v=env_int("DNTTK_WORLD_SUBDIVISION",0,0,1)==0;
+    return v && pgxp_mesh_textures();
+}
+void subdivision_restore() {
+    if(subdivision_restore_addr) psx_mod_write_word(subdivision_restore_addr,subdivision_restore_value);
+    subdivision_restore_addr=0;
+}
+void world_polygon_fetch(CPUState* cpu,uint32_t address) {
+    subdivision_restore();
+    const bool quad=address==0x8001160c;
+    if(cpu->gpr[31]!=(quad?0x80011ab4u:0x80011894u) || cpu->gpr[6]!=context || !identity()) return;
+    const uint32_t word=psx_mod_read_word(cpu->gpr[16]),base=cpu->gpr[14];
+    const unsigned corners=quad?4:3;
+    uint32_t records[4];int32_t lo_x=INT32_MAX,hi_x=INT32_MIN,lo_y=INT32_MAX,hi_y=INT32_MIN;
+    for(unsigned i=0;i<corners;++i) {
+        records[i]=base+8*((word>>(8*i))&0xff);
+        if(!(psx_mod_read_word(records[i]+4)&near_flag)) return;
+    }
+    for(unsigned i=0;i<corners;++i) {
+        const uint32_t sxy=psx_mod_read_word(records[i]);int32_t x,y;uint16_t z;
+        if(!pgxp_mesh_vertex(records[i],sxy,&x,&y,&z)) {++subdivision_kept;return;}
+        const int32_t sx=(int16_t)sxy,sy=(int16_t)(sxy>>16);
+        lo_x=std::min(lo_x,sx);hi_x=std::max(hi_x,sx);lo_y=std::min(lo_y,sy);hi_y=std::max(hi_y,sy);
+    }
+    if(hi_x-lo_x>1000 || hi_y-lo_y>500) {++subdivision_kept;return;}
+    subdivision_restore_addr=records[0]+4;
+    subdivision_restore_value=psx_mod_read_word(subdivision_restore_addr);
+    psx_mod_write_word(subdivision_restore_addr,subdivision_restore_value&~near_flag);
+    ++subdivision_whole;
+}
+void near_hook_body(CPUState* cpu,uint32_t address) {
+    region_after_load();
+    // D17AT: a small model's temporary changes to game data (face flags,
+    // room bit) end with it. Any other hook ends the model, before anything
+    // else runs, so no frame boundary (where redraw workers copy the
+    // machine) ever sees them; near_clip_flip() is the backstop.
+    if(address!=0x8002d848u && address!=0x8002bd48u && address!=0x800a2690u) model_end();
+    // The drawing chain closes after the last mesh: give it its depth.
+    if(address==0x8001fba0u) {scene_depth_flush();return;}
+    if(address==0x8002bc18u) {water_clip(cpu);return;}
+    if(address==0x800b4d2cu) {water_near_flags(cpu);return;}
+    if(address==0x8002d848u) {model_begin(cpu);return;}
+    if(address==0x800a2690u) {object_room_lift(cpu);return;}
+    if(address==0x8002bd48u) {model_link(cpu);return;}
+    if(address==0x800114ec || address==0x8001160c) {
+        if(subdivision_bypass()) world_polygon_fetch(cpu,address);
+        return;
+    }
+    // D17AR2: while the host world pass owns the frame, the room walk's own
+    // calls (ra 0x80062db8) draw only the pieces it left to the game.
+    if(address==0x80011020 && host_walk_filter && cpu->gpr[31]==0x80062db8u &&
+       !std::binary_search(host_walk_kept.begin(),host_walk_kept.end(),cpu->gpr[4])) {
+        cpu->gpr[4]=0;++host_walk_nulled;return;
+    }
+    // A new mesh rewrites the vertex buffer; a pending restore is stale.
+    if(address==0x80011020) subdivision_restore_addr=0;
+    if(g_pgxp_mesh_active && (address==0x80010000 || address==0x80011020)) {
+        // Packet buffers may still be queued when the next mesh frame starts.
+        // Writes invalidate individual shadows; only state loads/new worker RAM
+        // images invalidate the whole timeline.
+        pgxp_mesh_register_boundary();
+    }
+    const bool eye=first_person_view_live();
+    const bool third=third_person_camera_live();
+    const bool clip_live=eye || third || widescreen_near_clip_live();
+    const bool object_filter=address==0x80010000 && input_modernized();
+    if(!clip_live && !object_filter) return;
+    if(address==0x80026164) {
+        // Start accounting at scene composition, before any world/prop draw.
+        // An empty OT at the first mesh is not a frame boundary: earlier
+        // non-mesh primitives can already have populated it, indefinitely
+        // retaining a stale (or initially zero) budget cursor in some views.
+        // Redraw workers enter this same boundary with their restored RAM.
+        if(cpu->gpr[31]==0x800268f4 && identity()) {
+            host_walk_filter=false;host_frame=false;
+            object_room_word=0; // the camera render clears the bitset
+            model_flags_restore();
+            scene_pending.live=false;
+            region_after_load();
+            frame_first_cursor=psx_mod_read_word(context);
+            host_frame_reset();
+            held_packets.clear();
+        }
+        return;
+    }
+    if(address==0x8002ee50) {if((eye || third) && identity()) occluder_test(cpu); return;}
+    {
+        const uint32_t cursor=psx_mod_read_word(context),start=psx_mod_read_word(context+4),end=psx_mod_read_word(context+8);
+        bool empty=true;
+        for(uint32_t i=0;i<0x100 && empty;i+=4) empty=!psx_mod_read_word(bitmap+i);
+        // An empty guest OT can coexist with queued first-person packets.
+        // Rotating here overwrites their arena before the later flush links them.
+        if(empty && held_packets.empty()) {region_after_load();frame_first_cursor=cursor;host_frame_reset();}
+        if(end>start && cursor>=start && cursor<end && frame_first_cursor>=start && frame_first_cursor<end) {
+            arena_size=end-start;
+            const uint32_t used=cursor>=frame_first_cursor?cursor-frame_first_cursor:arena_size-(frame_first_cursor-cursor);
+            frame_used_peak=std::max(frame_used_peak,used);
+        }
+    }
+    if(!enabled() && !object_filter) return;
+    const uint32_t mesh=cpu->gpr[4];
+    if(!mesh || cpu->gpr[5]!=ordering || cpu->gpr[6]!=context || cpu->gpr[7]!=bitmap) return;
+    if((mesh<0x80010000 || mesh>0x801f0000 || (mesh&3)) && !sky_borrow_owns(mesh)) return;   // D17AO1 copy in mod memory
+    if(!identity()) {++refused;return;}
+    if(object_filter) {third_person_mesh_begin(cpu);first_person_mesh_begin(cpu);filter_missing_animation(cpu);cowboy_hat_mesh_begin(cpu);}
+    if(!clip_live || !enabled()) return;
+    if(address==0x80011020 && (renderers()&1)) world(cpu);
+    else if(address==0x80010000 && (renderers()&2)) object(cpu);
+}
+void hook(CPUState* cpu,uint32_t address) {
+    // DNTTK_NEAR_MEASURE=1 times the current renderer the same way.
+    static const bool timed=env_int("DNTTK_NEAR_MEASURE",0,0,1)==1;
+    if(timed && !frame_trace_on()) {
+        const auto t0=std::chrono::steady_clock::now();near_hook_body(cpu,address);
+        frame_hook_us+=(uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now()-t0).count();
+        return;
+    }
+    if(!frame_trace_on()) {near_hook_body(cpu,address);return;}
+    const auto t0=std::chrono::steady_clock::now();near_hook_body(cpu,address);
+    frame_trace_account(address|0x1u,(long)std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now()-t0).count());
+}
+}
+
+void near_clip_host_world_unlit(uint32_t mesh) {
+    const unsigned count=psx_mod_read_half(mesh+0x14);
+    if(count && count<=1024 && mesh>=0x80010000u && mesh+0x1c+8*((count+2)/3*3)<=0x80200000u) clear_color_index(mesh,count);
+}
+uint32_t near_clip_object_animation() {return last_object_animation;}
+void near_clip_set_glow_meshes(std::vector<uint32_t> meshes) {
+    std::sort(meshes.begin(),meshes.end());glow_meshes.swap(meshes);
+}
+bool near_clip_host_world_live() {
+    const bool clip_live=first_person_view_live() || third_person_camera_live() || widescreen_near_clip_live();
+    return clip_live && (renderers()&1) && unified() && identity();
+}
+bool near_clip_host_world_piece(CPUState* cpu) {
+    const uint32_t mesh=cpu->gpr[4];
+    host_piece=true;hook(cpu,0x80011020);host_piece=false;
+    const bool drawn=mesh && cpu->gpr[4]==0;
+    ++(drawn?host_world_pieces:host_world_left);
+    return drawn;
+}
+void near_clip_host_walk(bool filter,const std::vector<uint32_t>& kept) {
+    if(filter) host_frame=true;
+    host_walk_filter=filter;host_walk_kept=kept;std::sort(host_walk_kept.begin(),host_walk_kept.end());
+}
+void near_clip_host_counters(uint64_t out[5]) {out[0]=host_world_pieces;out[1]=host_world_left;out[2]=host_walk_nulled;out[3]=host_left_far;out[4]=host_left_near;}
+void near_clip_counters(uint64_t out[8]) {
+    out[0]=world_stats.taken;out[1]=world_stats.triangles;out[2]=object_stats.taken;out[3]=object_stats.triangles;
+    out[4]=mesh_fallbacks;out[5]=world_stats.budget_hits+object_stats.budget_hits;out[6]=copy_overflows;out[7]=refused;
+}
+void near_clip_water_counters(uint64_t out[4]) {
+    out[0]=water_seen;out[1]=water_taken;out[2]=water_guard_reject;out[3]=water_grid_reject;
+}
+void near_clip_prepare() {
+    (void)guest_copy();(void)host_arena();
+    if(!mask_arena)mask_arena=psx_mod_alloc_gpu_dma_memory(mask_frame_bytes*mask_blocks,16);
+    if(!empty_rect) {
+        empty_rect=psx_mod_alloc_guest_memory(16,16);
+        if(empty_rect) {
+            psx_mod_write_word(empty_rect,0x8300u<<16|0x8300u);
+            psx_mod_write_word(empty_rect+4,0);
+        }
+    }
+}
+void near_clip_flip() {region_chosen=false;model_end();light_frame=false;}
+void near_clip_light_frame(bool valid,const double m[9],bool smooth) {
+    light_frame=false;light_smooth=smooth;
+    if(!valid) return;
+    const double a=m[0],b=m[1],c=m[2],d=m[3],e=m[4],f=m[5],g=m[6],h=m[7],i=m[8];
+    const double det=a*(e*i-f*h)-b*(d*i-f*g)+c*(d*h-e*g);
+    if(std::fabs(det)<1) return;
+    const double k=4096.0/det;
+    light_inv[0]=(e*i-f*h)*k;light_inv[1]=(c*h-b*i)*k;light_inv[2]=(b*f-c*e)*k;
+    light_inv[3]=(f*g-d*i)*k;light_inv[4]=(a*i-c*g)*k;light_inv[5]=(c*d-a*f)*k;
+    light_inv[6]=(d*h-e*g)*k;light_inv[7]=(b*g-a*h)*k;light_inv[8]=(a*e-b*d)*k;
+    light_frame=true;
+}
+NearClipFrameState near_clip_frame_state() {return {frame_first_cursor,frame_host_bytes,held_frame,host_region,region_chosen};}
+void near_clip_load_frame_state(const NearClipFrameState& s) {
+    frame_first_cursor=s.first_cursor;frame_host_bytes=s.host_bytes;held_frame=s.held_frame;host_region=s.host_region%host_regions;
+    region_chosen=s.region_chosen;held_packets.clear();
+}
+
+void near_clip_viewmodel_flush() {
+    region_after_load();
+    if(held_packets.empty()) return;
+    // Packets from an earlier frame may already be overwritten in the ring.
+    bool empty=true;
+    for(uint32_t i=0;i<0x100 && empty;i+=4) empty=!psx_mod_read_word(bitmap+i);
+    if(empty || held_frame!=frame_first_cursor) {++viewmodel_discards;held_packets.clear();return;}
+    // Farthest first, appended after the slot's current tail: the slot is
+    // drawn head to tail, so the weapon follows anything else near the eye
+    // (Duke's chest when looking down). The frame's OT link-up still patches
+    // the tail's link, now the weapon's last packet.
+    std::stable_sort(held_packets.begin(),held_packets.end(),[](const HeldPacket& a,const HeldPacket& b){return a.z>b.z;});
+    for(size_t i=0;i+1<held_packets.size();++i)
+        psx_mod_write_word(held_packets[i].prim,held_packets[i].tag|(held_packets[i+1].prim&0xffffff));
+    const HeldPacket& last=held_packets.back();
+    psx_mod_write_word(last.prim,last.tag);
+    const uint32_t slot=ordering+viewmodel_slot*8;
+    const uint32_t head=psx_mod_read_word(slot),tail=psx_mod_read_word(slot+4);
+    if(!head) {
+        psx_mod_write_word(slot,held_packets.front().prim);
+        psx_mod_write_word(bitmap,psx_mod_read_word(bitmap)|(0x80000000u>>viewmodel_slot));
+    } else {
+        psx_mod_write_word(tail,(psx_mod_read_word(tail)&0xff000000u)|(held_packets.front().prim&0xffffff));
+    }
+    psx_mod_write_word(slot+4,last.prim);
+    viewmodel_packets+=held_packets.size();held_packets.clear();
+}
+// Original Blender geometry, emitted into the same ordered/replayed GPU stream as
+// the weapon. Separate arena keeps the mesh out of the world's packet budget.
+void near_clip_biomask(double dip,uint32_t light) {
+    if(!mask_arena)mask_arena=psx_mod_alloc_gpu_dma_memory(mask_frame_bytes*mask_blocks,16);
+    static Stats stats{};
+    if(!psx_mod_replay_active() && std::getenv("DNTTK_MASK_TRACE"))std::fprintf(stderr,"mask-arena=%08x region=%u bytes=%u frame=%u\n",mask_arena,host_region,frame_host_bytes,frame_first_cursor);
+    if(!mask_arena)return;
+    Frame f{};f.biomask=f.object=f.viewmodel=true;f.stats=&stats;f.g.h=256;
+    if(held_frame!=frame_first_cursor){held_packets.clear();held_frame=frame_first_cursor;}
+    const double scale=std::min(1.0,(512.0+2*psx_mod_widescreen_x_margin())/(512.0*4/3));
+    Poly poly{};poly.textured=true;poly.command=0x34000000u;poly.clut=0x7fff;poly.tpage=0x7e00;
+    for(const auto& tri:bio_mask_mesh) {
+        const auto& a=tri[0];const auto& b=tri[1];const auto& c=tri[2];
+        const double ux=b.x-a.x,uy=b.y-a.y,uz=b.z-a.z,vx=c.x-a.x,vy=c.y-a.y,vz=c.z-a.z;
+        if((uy*vz-uz*vy)*(-a.x)+(uz*vx-ux*vz)*(-8-a.y)+(ux*vy-uy*vx)*(1.59-a.z)<=0)continue;
+        Vertex v[3]{};
+        for(int i=0;i<3;++i){
+            const auto& q=tri[i];const double z=(8+q.y)*100;
+            // Preserve the reviewed framing across pixel aspect and 4:3/16:9.
+            v[i].p[0]=q.x*333.333333*scale;
+            v[i].p[1]=((1.59-q.z)*208.333333*scale+(1-scale)*120*z/256)+dip*.15*z/256;
+            v[i].p[2]=z;v[i].uv[0]=q.u;v[i].uv[1]=q.v;
+            // PS1 modulation: 128 is neutral, with integer truncation/saturation.
+            const unsigned base[3]={q.r,q.g,q.b};
+            for(int k=0;k<3;++k)v[i].rgb[k]=std::min(255u,(base[k]*((light>>(8*k))&255u))>>7);
+            v[i].original=-1;
+        }
+        emit(f,poly,v);
+    }
+    if(!psx_mod_replay_active() && std::getenv("DNTTK_MASK_TRACE"))std::fprintf(stderr,"mask-emitted=%u held=%zu light=%06x\n",f.emitted,held_packets.size(),light);
+    ++mask_draws;mask_triangles+=f.emitted;
+    near_clip_viewmodel_flush();
+}
+// Recover the texture-page state immediately before slot 1's new tail.
+// Native packets and our clipped packets each carry one GP0 primitive. Search
+// nearest slots first, retaining the last page writer in each linked list.
+static bool frozen_previous_tpage(uint16_t& page,unsigned first=viewmodel_slot) {
+    unsigned budget=16384;
+    for(unsigned index=first;index<2048 && budget;++index) {
+        uint32_t q=psx_mod_read_word(ordering+index*8);
+        const uint32_t tail=psx_mod_read_word(ordering+index*8+4);
+        bool found=false;
+        while(q && budget) {
+            --budget;
+            const unsigned words=psx_mod_read_word(q)>>24;
+            const unsigned op=psx_mod_read_word(q+4)>>24;
+            if(op==0xe1 && words==1) {page=psx_mod_read_word(q+4)&0x1ff;found=true;}
+            else if(op>=0x20 && op<0x40 && (op&4)) {
+                const unsigned vertices=(op&8)?4:3;
+                const unsigned expected=1+2*vertices+((op&16)?vertices-1:0);
+                if(words!=expected)return false;
+                const auto tpage=psx_mod_read_word(q+((op&16)?24:20))>>16;
+                // External Bio Mask atlas deliberately does not latch GPU state.
+                if(!(op==0x34 && tpage==0x7e00 && (psx_mod_read_word(q+12)>>16)==0x7fff)) {
+                    page=tpage&0x1ff;found=true;
+                }
+            }
+            if(q==tail)break;
+            const auto next=psx_mod_read_word(q)&0xffffff;
+            if(!next || next==0xffffff)return false;
+            q=0x80000000u|next;
+        }
+        if(!budget)return false;
+        if(found)return true;
+    }
+    return false;
+}
+// D35J5: half-blend blue after weapons/mask, before HUD. Degenerate textured
+// triangles scope only GPUSTAT's page/blend bits; E1 would also overwrite
+// dither/texture-disable state. Restore the exact prior page for HUD sprites.
+void near_clip_frozen_tint() {
+    constexpr unsigned size=100;
+    uint16_t page=0;
+    Frame tint{};tint.biomask=true;
+    if(!mask_arena || !frozen_previous_tpage(page))return;
+    const int m=std::clamp(psx_mod_widescreen_x_margin(),0,512);
+    const uint32_t p=packet_alloc(tint,size);
+    if(!p)return;
+    const auto xy=[](int x,int y){return uint32_t(uint16_t(x))|(uint32_t(uint16_t(y))<<16);};
+    psx_mod_write_word(p,24u<<24);
+    unsigned cursor=4;
+    auto page_only=[&](uint16_t tpage) {
+        const uint32_t words[]={0x25000000u,xy(-512,-256),0,xy(-512,-256),uint32_t(tpage)<<16,xy(-512,-256),0};
+        for(auto word:words){psx_mod_write_word(p+cursor,word);cursor+=4;}
+    };
+    page_only(page&~0x60u);
+    // Two halves remain below the PS1 primitive width limit even at 32:9.
+    for(int half=0;half<2;++half) {
+        const int left=half?0:-256-m,right=half?256+m:0;
+        const uint32_t words[]={0x2a400808u,xy(left,-128),xy(right,-128),xy(left,128),xy(right,128)};
+        for(auto word:words){psx_mod_write_word(p+cursor,word);cursor+=4;}
+    }
+    page_only(page);
+    const uint32_t slot=ordering+viewmodel_slot*8;
+    const auto head=psx_mod_read_word(slot),tail=psx_mod_read_word(slot+4);
+    if(head)psx_mod_write_word(tail,(psx_mod_read_word(tail)&0xff000000u)|(p&0xffffffu));
+    else {
+        psx_mod_write_word(slot,p);
+        psx_mod_write_word(bitmap,psx_mod_read_word(bitmap)|(0x80000000u>>viewmodel_slot));
+    }
+    psx_mod_write_word(slot+4,p);
+}
+// D08G7's hit-flash word (mirror + 4) was retired by D39G (Classic quads
+// removed; Polymorph draws flashes as its present tint, screen_flash.h); D20I
+// keeps its reinforcement count there, under its own tag. The D39B flash
+// record follows it.
+uint32_t near_clip_enemy_extras_word() {return region_mirror?region_mirror+4:0;}
+uint32_t near_clip_flash_record() {return region_mirror?region_mirror+8:0;}
+NearDepthPlane near_depth_plane(const double a[3],const double b[3],const double c[3]) {
+    NearDepthPlane p{};
+    double u[3],v[3];
+    for(int i=0;i<3;++i) {u[i]=b[i]-a[i];v[i]=c[i]-a[i];}
+    for(int i=0;i<3;++i) p.n[i]=u[(i+1)%3]*v[(i+2)%3]-u[(i+2)%3]*v[(i+1)%3];
+    const double length=std::sqrt(p.n[0]*p.n[0]+p.n[1]*p.n[1]+p.n[2]*p.n[2]);
+    if(length<1e-9) return {};
+    for(int i=0;i<3;++i) {p.n[i]/=length;p.d+=p.n[i]*a[i];}
+    return p;
+}
+double near_raster_depth(const NearDepthPlane& p,const NearGte& g,double x,double y,double fallback) {
+    if(!g.h || std::abs(p.d)<1e-9) return fallback;
+    const double den=p.n[0]*(x-g.ofx/65536.0)/g.h+p.n[1]*(y-g.ofy/65536.0)/g.h+p.n[2];
+    if(std::abs(den)<1e-9) return fallback;
+    const double z=p.d/den;
+    // A snapped edge can cross the horizon of an almost edge-on plane. Do
+    // not turn it into an unbounded occluder or a negative depth.
+    return std::isfinite(z) && z>=near_z && z>=fallback*0.5 && z<=fallback*2 ? z : fallback;
+}
+NearProjected near_project(const NearGte& g,int16_t vx,int16_t vy,int16_t vz) {
+    NearProjected out{};
+    int64_t mac[3];
+    for(int k=0;k<3;++k) {
+        mac[k]=(int64_t)g.tr[k]*4096+(int64_t)g.r[k][0]*vx+(int64_t)g.r[k][1]*vy+(int64_t)g.r[k][2]*vz;
+        out.view[k]=mac[k]/4096.0;
+    }
+    const int32_t m1=(int32_t)(mac[0]>>12),m2=(int32_t)(mac[1]>>12);
+    const int32_t ir1=clamp(m1,-0x8000,0x7fff),ir2=clamp(m2,-0x8000,0x7fff);
+    out.sz=(uint16_t)clamp(mac[2]>>12,0,0xffff);
+    const int32_t q=gte_divide(g.h,out.sz);
+    const int64_t x16=(int64_t)g.ofx+(int64_t)ir1*q,y16=(int64_t)g.ofy+(int64_t)ir2*q;
+    const int32_t sx=clamp(x16>>16,-0x400,0x3ff),sy=clamp(y16>>16,-0x400,0x3ff);
+    out.x16=(int32_t)x16;out.y16=(int32_t)y16;
+    out.sxy=(uint32_t)(uint16_t)sx | (uint32_t)(uint16_t)sy<<16;
+    bool safe=(uint32_t)out.sz*2>g.h && ir1==m1 && ir2==m2;
+    if(safe) {
+        const double tx=g.ofx/65536.0+g.h*out.view[0]/out.view[2];
+        const double ty=g.ofy/65536.0+g.h*out.view[1]/out.view[2];
+        safe=std::abs(tx)<=1000 && std::abs(ty)<=1000;
+    }
+    out.safe=safe;
+    return out;
+}
+uint32_t near_dpcs(const NearGte& g,uint32_t rgbc,int16_t ir0) {
+    uint32_t out=rgbc&0xff000000u;
+    for(int i=0;i<3;++i) {
+        const int64_t base=(int64_t)((rgbc>>(8*i))&0xff)<<16;
+        const int32_t step=clamp(((int64_t)g.fc[i]*4096-base)>>12,-0x8000,0x7fff);
+        const int32_t mac=(int32_t)((base+(int64_t)ir0*step)>>12);
+        out|=(uint32_t)clamp(mac>>4,0,255)<<(8*i);
+    }
+    return out;
+}
+// D52 (near_clip.h): the composition's camera, as 0x80026164..0x8002626c
+// chooses it (player stride 0x8a4, camera stride 0xb0).
+uint32_t composition_camera() {
+    if(psx_mod_read_half(0x800c3c4cu)) return 0x800da488u;
+    const uint32_t index=psx_mod_read_word(0x800d2654u);
+    if(index>1) return 0x800d6eb0u;
+    const uint32_t player=0x800d7198u+index*0x8a4u;
+    return ((psx_mod_read_word(player+0x224)&0x20000000u) ? 0x800d7010u : 0x800d6eb0u)+index*0xb0u;
+}
+bool game_camera_view() {
+    const uint32_t index=psx_mod_read_word(0x800d2654u);
+    return composition_camera()!=0x800d6eb0u+(index>1?0u:index)*0xb0u;
+}
+const char* near_clip_debug_json() {
+    static char buffer[4096];
+    auto part=[](const Stats& s,char* out,size_t n){
+        std::snprintf(out,n,"{\"seen\":%llu,\"taken\":%llu,\"polys\":%llu,\"culled\":%llu,\"triangles\":%llu,\"budget_hits\":%llu}",
+            (unsigned long long)s.seen,(unsigned long long)s.taken,(unsigned long long)s.polys,(unsigned long long)s.culled,
+            (unsigned long long)s.triangles,(unsigned long long)s.budget_hits);
+    };
+    char w[192],o[192];part(world_stats,w,sizeof w);part(object_stats,o,sizeof o);
+    std::snprintf(buffer,sizeof buffer,"{\"biomask_draws\":%llu,\"biomask_triangles\":%llu,\"enabled\":%s,\"world\":%s,\"object\":%s,\"refused\":%llu,\"copy_overflows\":%llu,\"duke_skips\":%llu,\"fades_skipped\":%llu,\"fade_tests\":%llu,\"zsf3\":%d,\"arena_size\":%u,\"frame_used_peak\":%u,\"host_bytes_peak\":%u,\"packet_skips\":%llu,\"mesh_fallbacks\":%llu,\"whole_polygons\":%llu,\"subdivided_kept\":%llu,\"viewmodel\":{\"meshes\":%llu,\"packets\":%llu,\"discards\":%llu},\"scene_depth\":{\"meshes\":%llu,\"packets\":%llu,\"ambiguous\":%llu,\"wraps\":%llu,\"polygons\":%llu,\"unmatched\":%llu,\"breaks\":%llu},\"measure\":{\"frames\":%llu,\"demand_peak\":%u,\"demand_avg\":%llu,\"frames_over_budget\":%llu,\"emits_peak\":%llu,\"hook_us_peak\":%llu,\"hook_us_avg\":%llu,\"kind_peak\":[%u,%u,%u,%u,%u],\"kind_avg\":[%llu,%llu,%llu,%llu,%llu],\"unified\":%s,\"unified_downgrades\":%llu,\"fallbacks\":[%llu,%llu,%llu],\"near_fallbacks\":%llu},\"water\":{\"seen\":%llu,\"taken\":%llu,\"guard\":%llu,\"grid\":%llu,\"near_cleared\":%llu,\"near_dropped\":%llu,\"budget_native\":%llu},\"coplanar\":{\"hits\":%llu,\"builds\":%llu,\"checked\":%llu,\"mismatch\":%llu},\"models\":{\"seen\":%llu,\"taken\":%llu,\"mismatch\":%llu,\"near_cleared\":%llu,\"faces\":%llu,\"faces_taken\":%llu,\"faces_native\":%llu,\"faces_dropped\":%llu,\"faces_budget\":%llu,\"flat\":%llu,\"faces_decal\":%llu,\"room_lifts\":%llu,\"sides_cleared\":%llu,\"flags_lifted\":%llu,\"backface\":%llu,\"refined\":%llu,\"refine_skipped\":%llu,\"refine_max\":%.3f,\"refine_last\":[%.2f,%.2f,%.2f,%.0f,%.0f,%.0f]},\"open_models\":{\"builds\":%llu,\"open\":%llu,\"faces\":%llu,\"drawn\":%llu},\"folded_quads\":%llu,\"game_view_drops\":%llu}",
+        (unsigned long long)mask_draws,(unsigned long long)mask_triangles,enabled()?"true":"false",w,o,(unsigned long long)refused,(unsigned long long)copy_overflows,(unsigned long long)duke_skips,(unsigned long long)fades_skipped,(unsigned long long)fade_tests,(int)last_zsf3,arena_size,frame_used_peak,host_bytes_peak,(unsigned long long)packet_skips,(unsigned long long)mesh_fallbacks,(unsigned long long)subdivision_whole,(unsigned long long)subdivision_kept,(unsigned long long)viewmodel_meshes,(unsigned long long)viewmodel_packets,(unsigned long long)viewmodel_discards,(unsigned long long)scene_depth_meshes,(unsigned long long)scene_depth_packets,(unsigned long long)scene_depth_ambiguous,(unsigned long long)scene_depth_wraps,(unsigned long long)scene_depth_polygons,(unsigned long long)scene_depth_unmatched,(unsigned long long)scene_depth_breaks,
+        (unsigned long long)demand_frames,demand_peak,(unsigned long long)(demand_frames?demand_total/demand_frames:0),(unsigned long long)demand_over,(unsigned long long)emits_peak,(unsigned long long)hook_us_peak,(unsigned long long)(hook_frames?hook_us_total/hook_frames:0),
+        kind_peak[0],kind_peak[1],kind_peak[2],kind_peak[3],kind_peak[4],
+        (unsigned long long)(demand_frames?kind_total[0]/demand_frames:0),(unsigned long long)(demand_frames?kind_total[1]/demand_frames:0),
+        (unsigned long long)(demand_frames?kind_total[2]/demand_frames:0),(unsigned long long)(demand_frames?kind_total[3]/demand_frames:0),
+        (unsigned long long)(demand_frames?kind_total[4]/demand_frames:0),unified()?"true":"false",(unsigned long long)unified_downgrades,
+        (unsigned long long)fallback_kind[0],(unsigned long long)fallback_kind[1],(unsigned long long)fallback_kind[2],(unsigned long long)near_fallbacks,
+        (unsigned long long)water_seen,(unsigned long long)water_taken,(unsigned long long)water_guard_reject,(unsigned long long)water_grid_reject,
+        (unsigned long long)water_near_cleared,(unsigned long long)water_near_dropped,(unsigned long long)water_budget_native,
+        (unsigned long long)coplanar_hits,(unsigned long long)coplanar_builds,(unsigned long long)coplanar_checked,(unsigned long long)coplanar_mismatch,
+        (unsigned long long)model_seen,(unsigned long long)model_taken,(unsigned long long)model_mismatch,(unsigned long long)model_near_cleared,(unsigned long long)model_faces,
+        (unsigned long long)model_faces_taken,(unsigned long long)model_faces_native,(unsigned long long)model_faces_dropped,(unsigned long long)model_faces_budget,(unsigned long long)model_flat,(unsigned long long)model_faces_decal,(unsigned long long)object_room_lifts,(unsigned long long)model_sides_cleared,(unsigned long long)model_flags_lifted,(unsigned long long)model_backface,(unsigned long long)model_refined,(unsigned long long)model_refine_skipped,model_refine_max,model_refine_last[0],model_refine_last[1],model_refine_last[2],model_refine_last[3],model_refine_last[4],model_refine_last[5],
+        (unsigned long long)open_model_builds,(unsigned long long)open_model_meshes,(unsigned long long)open_model_faces,(unsigned long long)open_model_drawn,(unsigned long long)folded_quads,(unsigned long long)game_view_drops);
+    return buffer;
+}
+}
+PSX_MOD_CONSTRUCTOR(register_ttk_near_clip) {
+    (void)ttk::host_arena();
+    ttk::mask_arena=psx_mod_alloc_gpu_dma_memory(ttk::mask_frame_bytes*ttk::mask_blocks,16);
+    for(uint32_t address:{0x8001fba0u,0x8002bc18u,0x800b4d2cu,0x80010000u,0x80011020u,0x8002ee50u,0x80026164u,0x800114ecu,0x8001160cu,0x8002d848u,0x8002bd48u,0x800a2690u})
+        psx_mod_register_function_entry_plugin("ttk.near.clip",address,ttk::hook);
+}
+
+extern "C" const uint16_t* ttk_biomask_texture(void) {return bio_mask_atlas;}
+namespace ttk {
+bool smoothquads_console_command(const char* line,void (*say)(const char*),bool& close) {
+    if(std::strcmp(line,"smoothquads") && std::strncmp(line,"smoothquads ",12)) return false;
+    close=false;
+    if(line[11]) {
+        const char* v=line+12;
+        if(!std::strcmp(v,"on")) smooth_quads_override=1;
+        else if(!std::strcmp(v,"off")) smooth_quads_override=0;
+        else if(!std::strcmp(v,"default")) smooth_quads_override=-1;
+        else {say("Usage: smoothquads [on|off|default] (developer, session only)");return true;}
+    }
+    say(smooth_quads()?"Smooth quad shading on.":"Smooth quad shading off (developer).");
+    return true;
+}
+}

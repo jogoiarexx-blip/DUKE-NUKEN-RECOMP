@@ -1,0 +1,107 @@
+# Documentation index
+
+This is the working engineering notebook for the local **SLUS-00583** recompilation project. It describes this workspace and the owned USA disc. Drop that dump in `game/` (created on first run). Europe/PAL is out of scope.
+
+For custom mesh and texture work: [accepted native mesh art style](265-native-mesh-art-style.md).
+
+## Read first
+
+1. [Current status and acceptance boundaries](00-status.md)
+2. [Scope, architecture, and milestones](01-architecture-and-roadmap.md)
+3. [Disc identity and integrity](02-disc-and-integrity.md)
+4. [Executable, assets, and overlays](03-reverse-engineering.md)
+5. [Build and run instructions](04-build-and-run.md)
+6. [Validation matrix](05-validation.md)
+7. [First-person research design](06-first-person.md)
+8. [Decisions, risks, and open questions](07-decisions-and-risks.md)
+9. [Reproducibility and dependency provenance](08-provenance.md)
+10. [Next-session handoff](09-handoff.md)
+11. [Tool contracts and maintenance](10-tooling.md)
+12. [Complete overlay inventory](11-overlay-inventory.md)
+13. [Development log](12-development-log.md)
+14. [Movie playback diagnosis and native overlay](13-fmv-fidelity-pass.md)
+15. [Gameplay voice-to-music seek correction](14-gameplay-voice-seek.md)
+16. [Security-key freeze investigation and window-close fix](15-security-key-and-window-close.md)
+
+17. [Vanilla regression route and recorded baseline](16-vanilla-regression-route.md)
+
+18. [Persistent launch profiles](17-player-profiles.md)
+
+19. [Player and camera research](18-player-camera-research.md)
+
+For players: [game manual and controls](../GAME_MANUAL.md).
+
+For the next development job: [modernization backlog and acceptance criteria](../MODERNIZATION_JOBS.md). Invoke `$continue-duke-recomp` (Codex) or `/continue-duke-recomp` (Claude Code) to review the current list and choose work.
+
+## Machine-readable evidence
+
+- [Disc manifest](reports/disc-manifest.json): every ISO file, logical and raw-extent hashes, submodes, overlay duplicates, and candidate extent-table references.
+- [Full sector validation](reports/sector-integrity.json): EDC/ECC and structural totals.
+- [Executable analysis](reports/executable-analysis.json): candidate diagnostic-string references, seed audit, startup disassembly.
+- [Dependency pins](reports/provenance.json): exact Git identities and local tool versions.
+- Build and diagnostic logs are in `logs/`. They are local evidence, excluded from source tracking because they can contain private paths and generated-code details.
+
+- [PC action input](19-pc-action-input.md): D04 bindings, capture, contexts and native test contracts.
+
+## Evidence language
+
+**Observed** means reproduced from this disc or this build. **Candidate** means a plausible static interpretation that still needs loader/control-flow/runtime proof. **Upstream-reported** is a statement in the source project, not reproduced here. **Untested** means no claim of success.
+
+A generated function count does not measure correct gameplay. A native link does not demonstrate boot. A headless boot does not verify graphics or audio. A first level does not verify all overlays or campaign progression.
+
+Update `00-status.md` after meaningful tests. Keep raw evidence and exact commands; do not replace a failure with an unqualified success when only a narrower check passed.
+
+- [D07 weapon aiming, crosshair and coverage](21-modern-weapon-aiming.md)
+
+- [D07A view-facing and weapon presentation](22-view-facing.md)
+
+- [External research register](23-external-research.md): EDuke32 controls and later HRP/menu investigations.
+
+- [D08A shortcuts, held crouch and bounded D10 distance](33-controls-shortcuts.md): verified original paths, current limitations and automated evidence.
+
+- [Accepted standing directional jumps, both input orders (D08C Done)](34-standing-directional-jumps.md)
+
+- [D08G1/D07C/D08H/D19A feedback implementation and verification](40-feedback-implementation.md)
+
+- [Latest playtest acceptance and next-job plan](41-playtest-follow-up-plan.md): silent/centered cheat results, run/edge jumps, armed ladders, crouch walking, inventory feedback and deferred menu responsiveness.
+
+- [D08P crystal-2 turret / scripted-camera WASD recovery](56-scripted-camera-controls.md)
+
+- [D08T pushable objects: modern grab, push/pull and climb](64-d08t-pushable-objects.md)
+- [D12A first-person quick kick](65-d12a-first-person-kick.md)
+- [D08L inertial platform edge run-off](66-d08l-edge-run-off.md)
+- [D17 high refresh rate brief](68-d17-high-refresh-brief.md)
+- [D08T1 grab / manipulate brief](69-d08t1-grab-manipulate-brief.md)
+- [D08Y gap jump dead band research](77-d08y-gap-jump-research.md)
+
+
+Latest high-refresh closeout: [D17A/B acceptance, source publication and regression baseline](86-d17-acceptance-and-regression-baseline.md).
+D17A/B are Accepted. 120 FPS is the primary quality target; focused residual
+bugs are on the board. The implementation under `recomp/` is now versioned.
+
+Latest accepted renderer work: [D15 precision, floor/idle and close-up clipping](96-d15-accepted-precision.md). D17P is the immediate follow-up for the replacement subway slot 8 distant bands.
+D17P distant bands: [note 97](97-d17p-distant-bands.md) (accepted). D17N world subdivision: [note 98](98-d17n-world-subdivision.md) (accepted). D17Q residual surface flicker (UV seams): [note 99](99-d17q-uv-seams.md) (accepted; current regression baseline).
+
+D24A open assets (TTK disc fonts, Microfont digits, original frame and crosshair; no Duke Nukem 3D art): [note 112](112-d24a-open-assets.md) (Needs playtest). D26E debug spawn console command: [note 111](111-d26e-debug-spawn.md) (accepted). D26F spawnable crystals and the custom pickup recipe: [note 117](117-d26f-crystals.md) (accepted).
+ D24B savestate menu: [note 113](113-d24b-savestate-menu.md) (accepted).
+D33 Modernized by default, `--vanilla` for one launch: [note 158](158-d33-default-profile.md) (accepted).
+D19G in-game KEY BINDINGS and live display, camera and mouse settings: [note 159](159-d19g-options-stage-2.md) (accepted).
+D07F airborne shots follow the crosshair: [note 160](160-d07f-airborne-shots.md) (accepted).
+D10C Duke 3D look keys (Page Up / Page Down, Home / End): [note 161](161-d10c-look-keys.md) (accepted).
+D10D keyboard turning (Left / Right arrows): [note 162](162-d10d-keyboard-turning.md) (accepted).
+D08T4 fixed pushable objects (slot 10 dumpster, original floor gate): [note 163](163-d08t4-fixed-pushables.md) (accepted).
+
+Multiplayer research (D34): [split-screen, online play and self-hosting feasibility](167-d34-multiplayer-research.md).
+First-person falls (D08Z4): [falls keep the eye, slot 6 cop car](168-d08z4-falls-keep-eye.md).
+Quick save and quick load (D20, F6 / F9, F2 / F3, console): [note 177](177-d20-quick-save.md); D20A savestate-after-load bug in the same note.
+Wrong colours / scrambled textures after a load (D20C) and the D20A halt, one cause: savestates now carry mod memory: [note 178](178-d20c-savestate-mod-memory.md).
+Music silent after death and Continue (D18D): near CD seeks now take Beetle's seek time: [note 182](182-d18d-music-after-continue.md).
+Statistics research (D20E): kills, the enemy total for X OF Y, shots and hits: [note 183](183-d20e-statistics-research.md).
+
+- [Accepted crouch movement and MGS-based walk/run study](286-d08k13-d08k14-crouch-movement.md): D08K13 timeout/legacy-roll fix; D08K14 accepted revision 2, reference timing, hand posture, boot contact, exact gait parameters, HTML preview reproduction and test limits.
+
+- [D36J2 no-body default integration](304-d36j2-no-body-default.md).
+- [D36J1 quick-kick investigation](303-d36j1-quick-kick-research.md) - [standalone artifact](artifacts/quick-kick-realism.html).
+
+- [D38 accepted playable piano and distance falloff](315-d38-playable-piano.md).
+- [D44 earthquake research](396-d44-earthquake-research.md).

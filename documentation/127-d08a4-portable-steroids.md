@@ -1,0 +1,359 @@
+# D08A4 - Portable steroids (EDuke32 style)
+
+Status: **Done** (user-accepted 2026-10-07: "mechanically, the steroids work
+perfectly"). Follow-up D08A8 (Done, below): the running countdown is
+in the steroids box instead of the original armor element. Modernized
+only, optional (`steroids` = `portable`, the default, or `original`); Vanilla
+unchanged.
+
+User request (2026-10-06): "Eduke style steroids, where you actually pick up the
+roids as an item, and it appears in our items list. it is invoked with the R key."
+
+## Behaviour
+
+- A steroids pickup shows the original STEROIDS message and sound, and is kept
+  instead of starting the effect.
+- Held steroids appear in the `[ / ]` switcher right after the medkit (EDuke32's
+  order) and in the D08A6 HUD item box, with the user's own pill-bottle icon
+  at 100%.
+- **R**, or **Enter / U** with steroids selected, takes them: the original
+  effect starts (full time), the pickup sound plays and `USED STEROIDS` shows
+  (Duke 3D quote 12). While they run, the switcher shows them draining with the
+  active mark and their HUD box counts down (D08A8, below); the armor element
+  shows only armor.
+- One at a time, as in Duke 3D (`GAME.CON`: `ifpinventory GET_STEROIDS`): while
+  one is held, more steroids stay on the ground. ~~A pickup while steroids run is
+  left to the original, which refreshes them.~~ D08A15 correction (user,
+  2026-10-08): a pickup while steroids run stops them and is held at full,
+  ready for R; `dnhyper` mid-run refills and keeps running.
+- R with none held, while they run, or while Duke is dead does nothing.
+- `dnhyper` still starts the effect directly (EDuke32's `dnhyper` sets 399, an
+  active dose); the original inventory grant (`dnstuff`, `dninventory`,
+  `dnitems`) gives a held one, like EDuke32's inventory cheat.
+
+## The original's own portable steroids
+
+The original still has a held steroids item; only its pickup skips it.
+
+| Piece | Address | Meaning |
+| --- | --- | --- |
+| Item 4 | player `+0x364` flags, `+0x366` amount/timer, full amount `0x800c2722` (9000) | Typed 3 (timed toggle) in the item table `0x800c2710`, like the Bio Mask and goggles |
+| Pickup | dispatcher `0x80081a48` (only caller `0x8007fe64`), case `0x800827e8` for type 638 | Full amount, `+0x364 |= 2` (starts the effect), message 110 into `0x800dcd90[player 0x233]`; shared tail `0x800828d0` plays sound `0x100f` at Duke through `0x8006b73c` (ra `0x800828d8`) and returns 1 (caller removes the object) |
+| Drain | `0x800414a0` | While bit 1: amount -= frame step `0x800d21fc`; at 0 clears bits 0-1 |
+| Damage | `0x800a4154` | Takes 1500 from a running amount; can end it (bits 0-1 cleared) |
+| Readers of bit 1 | kick `0x80049058` (x4 damage), status bar `0x8008bd94`, `0x800881e4` | The effect |
+| Inventory grant | `0x8003d738` | Items 0-5: `|= 1`, amount = capacity. For steroids: owned, full, not running |
+| Original Select menu | list `0x80088134`, use `0x80089494` | Uses a timed toggle with `flags ^= 2`; the use routine `0x800402d0` only clears steroids' pending bit. The list has no name for item 4 (`0x80087da8`), so held steroids are not listed |
+| Level-end snapshot | `0x80083348` (from `0x80083404`), carry record `0x800dd030` | Items 0-6 as bit 0 plus the amount; the memory card save writes this record (items at save offset `0x158`) |
+| Card load restore | `0x800831cc` (from `0x800258f0`, pending load `0x800be560`) | Item words copied back verbatim |
+| Level-start reset | `0x8003fd98` loop `0x8003fe10` | Zeroes items 0-5 at level 0, while `0x800bdea8` is set, in two-player games, and when end code `0x800be55e` >= 5 outside levels 21-26 (the pause menu Restart, 0xFD) |
+
+So a held steroids item is bit 0 with an amount, bit 1 off. The first design kept
+a dose count in spare flag bits 8-11 (no original writer touches them), but the
+level-end snapshot keeps only bit 0 of each item, so a card save dropped it
+(verified: the card held `0000` for item 4 while RAM held the dose). The
+original representation goes through every original path like the jetpack.
+
+## Implementation
+
+`recomp/src/ttk/steroids.inc` (in `modern_controls.cpp`):
+
+- At the dispatcher entry (existing hook), a steroids touch by Duke from
+  `0x8007fe6c` is noted when nothing is held or running. Held: the dispatcher
+  gets a blank object (type 0xffff), so the pickup stays (the D08H concealed
+  apartment pickup technique). Running: left to the original.
+- New entry hook `0x8006b73c` (`game.local.toml`, regenerated: one generated
+  line in `SLUS_005.83_full_35.c`; the codegen hash is unchanged, so existing
+  savestates load). Only the pickup tail's call (ra `0x800828d8`, s1 Duke) goes
+  further: bit 1 off, bit 0 on, full amount. This is still inside the pickup, so
+  the effect never runs for a frame. A missed call would settle at the next
+  item poll (`late_settles`, never seen).
+- R and Enter/U on steroids (`shortcuts.inc`) are taken in every live gameplay
+  state, like `[ / ]`: they set bit 1 (the original menu's toggle) and play the
+  pickup sound through `0x8006b73c(0x100f, Duke+4, 0x800, -10)` on a private
+  stack.
+- Switcher (`inventory_hud.cpp`): order 5, 4, 1, 2, 3; item 4 reads the raw
+  flags and amount. HUD box (`gadget_hud.inc`): the D08A7 own-art path is now a
+  table; steroids use a 4bpp cell at VRAM (964,205) and palette (1008,207) in the
+  band D08A7 surveyed as empty, uploaded with the box through the HUD
+  ordering table.
+- Code guards: drain `0x800414a0` (96 bytes) and damage cut `0x800a4154` (68);
+  the dispatcher (incl. the tail) and the pickup case were already guarded.
+- Profile schema 29: `steroids` (`portable` | `original`), `run.py --steroids`,
+  `--settings` choice **S**, `DNTTK_STEROIDS` (Vanilla always `original`).
+- Art: `recomp/assets/ui/items/hud-steroids.png` (user's art, D24A) in the
+  switcher pack (`build_ttk_inv_icons.py --steroids`); its 15-colour reduction
+  `hud-steroids-15col.png` from the new `tools/local/reduce_icon_15col.py`
+  (k-means in PSX 15-bit colour, no dither, deterministic) for the HUD box.
+- Debug: `ttk_input` -> `controls.steroids` (`portable`, `doses`, `flags`,
+  `timer`, `stores`, `full_leaves`, `refreshes`, `uses`, `refusals`,
+  `late_settles`).
+
+## Evidence (executable `f91c4ec92e7494dd8854b98b0e2332fc17f9c1f8280e7b85798e1b4c9ea10bd5`)
+
+Private Xvfb runs, private profile and a private copy of the user's cards and
+savestates (`recomp/analysis/d08a4-steroids/`, local; the player's card was not
+written). UI slot 4 (level 0) unless noted; pickups are spawned type 638
+(`spawn steroids`) going through the original pickup code.
+
+| Check | Result |
+| --- | --- |
+| Pickup | STEROIDS message; flags 0 -> 1, amount 9000, effect not running |
+| Second pickup while held | stays on the ground (21-30 touch frames refused) |
+| `[ / ]` | steroids after the medkit, icon at 100%; HUD box shows the icon and a lit 100 |
+| R | flags 3, amount draining; `USED STEROIDS`; switcher shows 95% with the active mark; original armor element shows 95 |
+| R running / none / Enter on steroids | nothing / nothing / same as R |
+| Pickup while running | refreshed to 9000 (original) |
+| Savestate save/reload | held item back after it had been used |
+| Level completion (end code 4, stats, save offered) | carried into level 1 (`0x0001`, 9000) |
+| Card save | item 4 `0100 2823` in the save record, same as the jetpack |
+| Card load (pause, Load) after using it in level 1 | restored to held (`0x0001`, 9000) |
+| Death, Continue | still held |
+| Level 6 (via `level 6`) | pickup held, R runs it |
+| `level N` travel | every gadget cleared by the original Restart reset (`0x8003fe10`, write trace), steroids included |
+| `original` | pickup starts the effect (flags 2), R does nothing |
+| Vanilla | `portable` false, nothing held or used |
+| Original Select inventory | lists only the jetpack with steroids held |
+| Suites | `ttk-controls-test` (fixture, LEVEL01, all levels; two new D08A4 groups), `ttk-inventory-test`, `ttk-input-test`, Python 131 (2 skipped), `level_overlay_guards.py --check`, `check_repo.py` |
+
+## Limits
+
+- Natural level placements were not surveyed
+  (spawned pickups use the same type and code); enemy drops of steroids were not
+  seen.
+- Death while steroids run, the challenge and boss levels and two-player games
+  were not exercised (only player one's pickups are taken; R is player one's).
+- The original Select inventory cannot show or use held steroids (it has no name
+  for them).
+- Switching a profile to `original` with steroids held leaves them held; they can
+  be used from Modernized later, and Vanilla ignores them.
+
+## D08A8 - Countdown in the steroids box
+
+Status: **Done** (user-accepted 2026-10-07: "this is phenomenally good ... i
+accept this as complete"). User request: "why the armor icon is used when
+the coundtown for the steroids is displayed. I'd really love if that entire
+countdown could be delegated to the steroids thing".
+
+### How the original chooses
+
+Status bar element 2 (layout `0x800dd778 + 16`, state `0x800dd7b8 + 16`), code
+`0x8008bccc..0x8008befc`:
+
+- becomes visible when `+0x364` bit 1 is on or armour `+0x234` > 0 (and starts
+  its slide), and hides when both are off;
+- its number is `+0x366 * 100 / [0x800c2722]` while bit 1 is on, else
+  `armour / 100` (at least 1);
+- its icon is always the armour record `0x800c44f4`, box `0x800c44a4`.
+
+Bit 1 of `+0x364` is read nowhere else in the status bar. The status bar is
+called from the view composition at `0x80026588`; the next hooked call is
+`0x8001fc44` (`0x800265a4` or `0x800265bc`) or, on the path that skips both,
+`0x8002e850` (`0x800265cc`, ra `0x800265d4`). Nothing runs between the return
+and those calls except a load and a branch.
+
+### Implementation
+
+- `steroids.inc`: `steroids_owned()` (held or running), `steroids_running()`,
+  `steroids_hud_hide()` / `steroids_hud_restore()`.
+- `gadget_hud.inc` (status bar entry, Modernized single player): restore first;
+  if steroids run, turn bit 1 off for this draw (element 2 = armour only) and
+  draw the steroids box with the original's own calls (pill icon, lit,
+  `amount * 100 / 9000`, the original's number). Selected: in the slot.
+  Otherwise stacked a box row above the slot, above an unselected jetpack that
+  is on (that jetpack is row 1, steroids row 2).
+- Restore at `0x8001fc44` and `0x800b4d9c` (before the mode check in
+  `hook_body`), the next status bar entry, and new lightweight entry hook
+  `0x8002E850` (only ra `0x800265d4`). It sets bit 1 back only while bit 0 is
+  still on. Replay workers replay the whole composition, so they restore too.
+- `shortcuts.inc`: `usable_item(4)` is `steroids_owned()`, so running steroids
+  stay selected after R (like a jetpack that is on) and `[ / ]` can select them;
+  R and Enter/U still use only a held dose.
+- Debug: `controls.steroids.hud_hides`, `hud_hidden`.
+- `game.local.toml`: hook `0x8002E850` (regenerated: one line in
+  `SLUS_005.83_full_09.c`; codegen hash unchanged).
+
+### Evidence (executable `e9e0cfa7aeec88ace33f794b4a831ebc0b536b09bd4dce54df6e52e85865ffc8`)
+
+Private Xvfb runs, fresh copy of the player's cards and savestates
+(`recomp/analysis/d08a8-steroids-hud/`, local: `t1.py` to `t3.py`, screenshots).
+
+| Check | Result |
+| --- | --- |
+| Held, selected | pill box, lit 100 (D08A4) |
+| R | selection stays on steroids; the box counts down in place (80, 63 ...); no armour element with armour 0 (element 2 state 0) |
+| Effect | drain unchanged (timer falls at the normal rate, ends at 0, flags 0); the box goes |
+| `]` to jetpack (off) / jetpack on and selected | steroids box one row up |
+| Bio Mask selected, jetpack on | jetpack row 1, steroids row 2 |
+| Armour 50 while running | armour element shows 50 with the armour icon; steroids in their box |
+| Savestate save, reload while running | same boxes; bit 1 on in RAM between frames (`hud_hidden` false) |
+| R while running | nothing |
+| GL 16:9 at 120 fps (replay workers), Software 4:3 and 16:9 | same layout |
+| Vanilla, steroids forced on | original armour element with the steroids percent |
+| Suites | `ttk-controls-test` (40 groups), `ttk-input-test`, `ttk-inventory-test`, Python 131 OK (2 skipped), `level_overlay_guards.py --check` |
+
+### Limits
+
+- Death while steroids run, natural (non-spawned) pickups while running and
+  window resize were not exercised.
+- With `steroids` `original` in Modernized there is no steroids box, so the
+  original armour-element countdown stays.
+
+## D08A11 - `dnhyper` in the steroids box
+
+Done (user-accepted 2026-10-08).
+
+`dnhyper` (`cheats.inc`) sets `+0x364` bit 1 and the full amount but not
+bit 0. The D08A8 predicates required bit 0, so the status bar still drew the
+countdown in element 2 with the armour icon and the box did not show.
+
+Running steroids are now bit 1 with an amount, whatever bit 0 is:
+`steroids_owned()` accepts either bit (so `usable_item(4)` and the box keep a
+`dnhyper` run selected and drawn), and `steroids_running()` follows. The hide
+records the savestate load count; the restore puts bit 1 back unless a
+savestate loaded in between or the amount reached 0 (before, it required
+bit 0, which also guarded loads only by accident). `steroid_doses()` still
+requires exactly bit 0, so R / Enter never take a running effect. The original
+drain clears bits 0-1 at 0, so a `dnhyper` run never becomes a held dose. For
+D08A9, a steroids refill compares bits 0-1, so a pickup that refreshes a
+`dnhyper` run selects steroids.
+
+Evidence (executable `2ebef6a88598649b2fade42d6306a253d1b7228df7cc57763e5f041791fde892`): `recomp/analysis/d08a11-dnhyper/` `t1.py` at
+60 and 120 fps, `t2.py` with `DNTTK_STEROIDS=original`; see the D08A11 work
+log in `MODERNIZATION_JOBS.md`.
+
+Limits: `dnhyper` while a dose is held runs that dose (one amount per item);
+Vanilla by code path only.
+
+## D08A13 - Steroids independent of damage
+
+Done (user-accepted 2026-10-08). User rule: steroids and armour are independent
+systems; damage never consumes steroid time.
+
+### The original shield
+
+Duke's damage handler is `0x800a40a8` (the player entry of the class table
+`0x800c5ecc`, at `0x800c5ed4`; a0 victim player, a1 attacker, a2 damage, a3
+type, stack args source object and a sixth passed to the death call):
+
+| Step | Address | What |
+| --- | --- | --- |
+| Immune | `0x800a40e0` | victim word 0 bit `0x20000000`: return 0 |
+| Self damage | `0x800a40f4` | source = victim: types 5, 15 and 10 return 0 |
+| Attacker | `0x800a4114` | source type 32: its counter `+0x3b4` += 1, damage doubled when its `+0x89e` is set; else `[victim+0x40]+2` = 255 |
+| **Shield** | `0x800a4154` | `+0x364` bit 1: amount <= 1500 -> amount 0, bits 0-1 cleared; else amount -= 1500. Then **return 0: no damage** |
+| Damage | `0x800a41a0` on | difficulty scaling (`0x800c3d7c`), the type jump table, armour (`+0x234`, 75% absorbed), health `+0x32`, pain sounds, death (`0x800a373c`, the death call, return 1) |
+
+So the original's running steroids cancel every hit routed here, at 1500
+units each (5 seconds of the 300-a-second drain), whatever the damage or
+armour. Bit 1 is read nowhere else in the handler. The coupling is original
+(Vanilla shows it), not something D08A4/A8/A10/A11 added; the armour element
+merely displayed the steroid countdown (D08A8). Nothing else writes `+0x364`
+or `+0x366` by offset except the pickup (`0x8008280c`), the drain
+(`0x800414d8..0x800414f4`) and the use routine (`0x80040570`).
+
+### Implementation
+
+`steroids.inc`: new entry hook `0x800A40A8` (`game.local.toml`, regenerated:
+one generated line in `SLUS_005.83_full_55.c`; codegen hash unchanged).
+With portable steroids running and Duke as the victim, `steroids_damage_entry`
+turns bit 1 off for that call only; the handler then takes its normal path,
+including its own return value (1 on death, which callers read). The timer is
+not touched. `steroids_damage_restore` puts bit 1 back at the first TTK hook
+afterwards: the top of `hook_body` (all shared hooks) and the dedicated
+`0x800412a4` (Duke's update, which holds the drain), `0x8006b73c`,
+`0x800a979c` and `0x8002e850` entries, and the next damage entry. Not after a
+savestate load or once the amount reached 0. Every in-game reader of bit 1
+runs from a hooked function (drain, kick `0x80048410`, status bar
+`0x8008ba30`, heartbeat); the original Select menu `0x80088134` runs only in
+the pause menu. `steroid_flags()` (the flags with the hidden bit on) feeds
+`steroids_owned`, `steroids_running` and `steroid_doses`. The D08A8 status-bar
+hide is separate: it must survive the status bar's own hooked calls.
+
+- Guard: the whole handler, `0x800a40a8`, 1812 bytes.
+- `DNTTK_STEROID_SHIELD=original` keeps the original shield (diagnostics).
+- Debug: `controls.steroids.shield` (`independent` / `original`),
+  `damage_passes`, `damage_hidden`.
+- Native test: `ttk-controls-test` D08A13 group.
+
+### Evidence (executable `5f7052656083349168451c0e217fb24fcd9b0a3372d188a38d0319b459c01f05`)
+
+`recomp/analysis/d08a13-steroid-damage/` (local): `t0.py` (savestate survey),
+`t1.py` (CASE hyper / armour / dose; RATE, STEROIDS, TTK_MODE,
+DNTTK_STEROID_SHIELD), `t2.py` (death and Continue). See the D08A13 work log
+in `MODERNIZATION_JOBS.md` for the table. In short: hits damage health (and
+armour 75/25 with armour) and the timer falls by the drain alone (5 per
+frame, worst per-frame drop 9 against 1500 jumps in the original); Vanilla,
+`original` and the shield switch keep the original absorption.
+
+### Limits
+
+- Steroids no longer protect Duke in Modernized portable. Duke can die while
+  they run; the timer pauses while he is dead and TTK's Continue keeps them
+  running with the time left.
+- Explosions, falls and drowning were not isolated; only damage routed through
+  `0x800a40a8` was ever shielded.
+- Player one only.
+
+## D08A14 - Death ends steroids
+
+Done (user-accepted 2026-10-08). User request: "if you are using steroids and you
+die, and use a continue, you should not still be using steroids and it should
+be gone from the inventory." User decision when selected: a held, unused dose
+is lost at death too (Duke 3D).
+
+### The original
+
+TTK keeps every item through death. While Duke is dead, player word 0 bit 1
+(`0x2`) is set, health `+0x32` is 0 and the gameplay state `0x800bcbb0` stays
+1; his update no longer drains `+0x366`, so the timer stands still. Continue
+(Cross) clears bit 1 and sets health 10000; a running effect then resumes
+with the time left and a held dose stays held.
+
+### Implementation
+
+`steroids.inc` `steroids_death_clear()`, called from `hook_body` right after
+the D08A13 restore, in Modernized `portable` only: while Duke is dead (word 0
+bit 1, health <= 0, state 1, player one, camera links and code identity) and
+item 4 has bit 0 or 1 or an amount, it clears bits 0-1 and the amount (as the
+drain leaves them at expiry) and drops the D08A8/D08A13 hide marks and a
+pending pickup. Other flag bits are kept. Checked at every hook while dead,
+so a dead state that still has steroids (for example a savestate made before
+this change) clears as soon as it loads. Debug: `controls.steroids.death_clears`.
+No new hook, guard or generated code.
+
+### Evidence (executable `da4a09b04ca07466d001839c0b812d071b94fa79e4829979eeb734e1c27fc687`)
+
+`recomp/analysis/d08a14-steroid-death/` (local): `t0.py` (survey), `t1.py`
+(CASE hyper / dose / held; STATE=1 for the savestate), `t2.py` (steroids
+written while dead). UI savestate slot 3, a pig cop shooting Duke.
+
+| Check | Result |
+| --- | --- |
+| `dnhyper`, die, Continue | at death flags 0, timer 0; after Continue health 10000, no box, no new beats, selection off steroids (0), R and `]` do nothing |
+| R dose, die, Continue | the same |
+| Held dose, die, Continue | the dose is gone (flags 0, doses 0) |
+| Steroids written into RAM while dead, savestate save and reload while dead, Continue | cleared at the next hook; reload and Continue: nothing |
+| `steroids` `original` / Vanilla, held dose written while dead | kept through death and Continue (flags 1, 9000), no clears |
+| Native | `ttk-controls-test` new D08A14 group (dose, `dnhyper`, held lost, other bits kept, alive and Vanilla untouched); 43 groups |
+| Suites | `ttk-input-test`, `ttk-inventory-test`, Python 131 OK (2 skipped), `level_overlay_guards.py --check` |
+
+### Limits
+
+- Death by falls, drowning and explosions was not exercised; the clear keys
+  on the dead state, not on the damage routine, so any death that sets it is
+  covered.
+- Card save/load and level completion paths were not changed and not re-run.
+- Player one only.
+
+## D08G4 - Inventory cheats and running steroids
+
+Done (user-accepted 2026-10-08). `dnstuff`, `dnitems` and `dninventory` also give
+full armor (see [note 38](38-debug-cheats.md)). The original inventory grant
+`0x8003d738` sets item 4 bit 0 and the full amount, so running steroids came
+out refilled and still running (flags 3). User rule when selected: "steroid
+usage stops, full steroids are in inventory". `steroids_cheat_grant()` clears
+bit 1 after the grant (portable only): flags 1, amount 9000, no box countdown,
+no heartbeat; R starts a fresh dose. Without running steroids the grant is
+unchanged (a held dose). Evidence: `recomp/analysis/d08g4-cheat-armor/`
+(local), see the D08G4 work log.

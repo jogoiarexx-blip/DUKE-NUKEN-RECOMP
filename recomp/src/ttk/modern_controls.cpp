@@ -1,0 +1,2683 @@
+#include "tight_camera.h"
+#include <cstdarg>
+#include <deque>
+#include <filesystem>
+#include <fstream>
+#include <map>
+#include <mutex>
+#include "action_perspective.h"
+// Bounded SLUS-00583 adapter for the authenticated level overlays in
+// control_guards.inc (LEVEL00, LEVEL01). Original routines retain all integration,
+// collision responses and camera constraints. No final position writes.
+#include "modern_controls.h"
+#include "night_vision_audio.h"
+#include "piano_audio.h"
+#include "anim_override.h"
+#include "weapon_aim.h"
+#include "aim_weapons.h"
+#include "pc_input.h"
+#include "inventory_hud.h"
+#include "control_math.h"
+#include "first_person_fov.h"
+#include "contact_arm_ik.h"
+#include "cpu_state.h"
+#include "mod_plugins.h"
+#include "live_env.h"
+#include "code_identity.h"
+#include "near_clip.h"
+#include "screen_flash.h"
+#include "pgxp.h"
+#include "gpu.h"
+#include <algorithm>
+#include <array>
+#include <set>
+#include <atomic>
+#include <cctype>
+#include <cmath>
+#include <cstdio>
+#include <cstring>
+#include <cstdlib>
+#include <chrono>
+#include <map>
+#include <string>
+
+extern "C" {extern int g_precise_mode,g_ls_mode,g_psx_call_bail;}
+namespace ttk {
+static constexpr uint32_t player=0x800d7198, camera=0x800d6eb0;
+// D08AA: the one Modernized walk/run pace. These are the land baselines
+// (walk 72/74 ~10.6, run 76/78 ~49.7 units per vblank, measured on three
+// saves), in the original's velocity units: position += v*dt/1024 per player
+// update. Every water state scales its own motion to them
+// (mid-depth wade root, surface strokes, underwater thrust); land itself is
+// still the original gait. A global walk/run retune changes these two.
+static constexpr double modern_walk_pace=2030.0, modern_run_pace=9520.0;
+// Effective dt of a 30 Hz player update: swimming at the pace measures
+// v*10.5/1024 per update (the sampled +0xba reads 9..12).
+static constexpr double pace_nominal_dt=10.5;
+static double modern_pace(bool run) {return run?modern_run_pace:modern_walk_pace;}
+// Distance per player update for root-driven states (walk ~21, run ~98).
+static double modern_pace_step(bool run) {return modern_pace(run)*pace_nominal_dt/1024.0;}
+// Mid-depth wade root per player tick (30 Hz): the 80/81 clip carries ~25
+// units (uneven 6..44; 28 measured against land) and is not time-scaled. The gain keeps the clip rhythm
+// around the pace step; floor/ceiling keep it within 0.8..1.2 of it.
+static constexpr double mid_wade_clip_average=28.0;
+// D08AB SWIMMING original: the pre-D08AA band (walk twice the land walk).
+static constexpr double mid_wade_run_gain=4.0, mid_wade_run_floor=80.0, mid_wade_run_ceiling=120.0;
+static constexpr double mid_wade_walk_gain=2.0, mid_wade_walk_floor=40.0, mid_wade_walk_ceiling=60.0;
+struct Guard { uint32_t address, size; const char* digest; };
+#include "control_guards.inc"
+static uint64_t camera_frame, camera_epoch, ground_frame, ground_epoch;
+// D07E: a lease stays fresh for one game frame, measured in host input frames
+// (one per vblank). The game updates the camera every 3 at its usual 20 fps,
+// so the window is the original 4 there; a busy scene (an upgraded energy
+// stream runs about 12 fps, 5 vblanks) widens it to the slowest of the last
+// camera intervals plus one, up to frame_window_cap. A pause or a scene that
+// stops the camera still lapses within the cap.
+static constexpr unsigned frame_window_min=4, frame_window_cap=10;
+static unsigned camera_intervals[4], camera_interval_next, frame_window=frame_window_min;
+static void frame_window_reset() {
+    std::fill(std::begin(camera_intervals),std::end(camera_intervals),0u);frame_window=frame_window_min;
+}
+static void frame_window_note(uint64_t interval) {
+    if(!interval || interval>frame_window_cap) {frame_window_reset();return;}
+    camera_intervals[camera_interval_next++%4]=unsigned(interval);
+    const unsigned slowest=*std::max_element(std::begin(camera_intervals),std::end(camera_intervals));
+    frame_window=std::clamp(slowest+1,frame_window_min,frame_window_cap);
+}
+static bool within_frame(uint64_t now, uint64_t then) {return now>=then && now-then<=frame_window;}
+static uint64_t moves, probes, cameras, refusals;
+static Vec2 intent{};
+static double gait_length;
+static uint64_t gait_frame, gait_epoch;
+static bool gait_running;
+static double stride_speed,fall_speed;
+static uint64_t stride_epoch,landing_until,landing_epoch;
+static uint32_t walking_sp, probe_return, walking_size;
+static bool had_movement;
+static bool flight_valid;
+static bool takeoff_valid, takeoff_direction;
+static uint64_t takeoff_epoch, takeoff_frame;
+static Vec2 takeoff_intent{};
+static bool takeoff_obstacle;
+static int32_t takeoff_top;
+static unsigned standing_takeoffs, blocked_drifts;
+static bool vertical_steer;
+static uint64_t vertical_epoch;
+static double vertical_cap;
+static bool takeoff_owned() {
+    const auto& f=input_snapshot(Context::Gameplay);
+    return takeoff_valid && f.active && takeoff_epoch==f.epoch &&
+        f.sequence>=takeoff_frame && f.sequence-takeoff_frame<=60;
+}
+static uint64_t movement_frame, flight_epoch;
+static Vec2 flight_intent{};
+static uint64_t jumps, speed_changes, selections;
+static uint32_t weapon_update_sp;
+static bool weapon_transition_boost;
+static uint64_t intent_epoch;
+static bool walking;
+static bool step_dispatch, short_fall, large_fall, delayed_takeoff, fall_velocity_pending, fall_walking, small_landing;
+static uint64_t terrain_epoch;
+static int32_t delayed_vertical;
+static unsigned step_drops, run_offs, delayed_jumps, edge_jumps, edge_postpones;
+
+static bool orbit_valid;
+static uint32_t orbit_sp;
+static uint64_t looks, orbits, facings, arms, orientations;
+static uint32_t presentation_vector;
+static double yaw,pitch,radius,preferred_radius,distance_seen;
+static uint64_t distance_epoch,distance_frame;
+// D10: recenter swing, shoulder offset and persisted camera preferences.
+static bool recentering,rest_pitch_valid;
+static double rest_pitch,shoulder_offset;
+static double tight_distance=6144;
+static uint64_t tight_hold_until=0;
+static bool tight_compressed=false;
+static unsigned tight_return_rate=6;
+static bool tight_camera_enabled() {
+    // D10B1: native obstruction handling is the player default. D10B is
+    // retained only for explicit developer comparisons.
+    static const bool enabled=[] {const char* t=std::getenv("DNTTK_TIGHT_CAMERA");return t && !std::strcmp(t,"1");}();
+    return enabled;
+}
+static uint64_t recenter_seen,recenters;
+// D10F1: the camera update (cameras) whose constraint the orbit last requested.
+static uint64_t constraint_update;
+// D10E: yaw/pitch remain the gameplay heading; only the camera solver and
+// presenter receive these inspection offsets. No player/animation state writes.
+struct FreeLook {
+    bool active=false,held=false;
+    double x=0,y=0,ms=0,eye[3]{};
+};
+static FreeLook free_look;
+static bool free_look_cancelled;
+bool free_look_active() {return free_look.active;}
+static double inspection_yaw() {return wrap_yaw(yaw+free_look.x);}
+static double inspection_pitch() {return clamp_pitch(pitch+free_look.y);}
+bool free_look_aim(double* eye,double* forward) {
+    if(!free_look.active)return false;
+    for(int i=0;i<3;++i)eye[i]=(int32_t)psx_mod_read_word(player+4+4*i)+free_look.eye[i];
+    forward[0]=std::sin(yaw)*std::cos(pitch)*4096;
+    forward[1]=std::sin(pitch)*4096;
+    forward[2]=std::cos(yaw)*std::cos(pitch)*4096;
+    return true;
+}
+// D10C Duke 3D look keys. Look Up / Down turn the pitch while held and ease
+// it back to the rest pitch on release; Lock Look Up / Down turn it and leave
+// it. Timed on the presenter clock, so late_view draws the same pitch between
+// game frames (smooth at high refresh). Pitch grows downward (mouse down).
+static int key_hold;                 // pitch direction held: -1 up, 1 down
+static bool key_lock,key_return;
+static double key_ms=-1;             // when pitch last caught up with the keys
+static uint64_t key_looks,key_returns,key_taps,look_press_seen;
+static constexpr double key_look_rate=150*tau/360, key_lock_rate=80*tau/360;
+// The V swing's 0.75 per vblank, per second: home in about a third of a second.
+static constexpr double key_return_rate=17.26;
+static double key_pitch_at(double ms) {
+    if(key_ms<0 || (!key_hold && !key_return)) return pitch;
+    const double dt=std::clamp((ms-key_ms)/1000,-0.1,0.1);
+    if(key_hold) return clamp_pitch(pitch+key_hold*(key_lock?key_lock_rate:key_look_rate)*dt);
+    return clamp_pitch(rest_pitch+(pitch-rest_pitch)*std::exp(-key_return_rate*dt));
+}
+// Brings pitch up to now under the keys held so far, then takes the new keys.
+// A look key wins over a lock key; any key stops a V swing; mouse motion
+// stops the ease back (as it stops V).
+static void key_look(const InputFrame& f,bool mouse) {
+    const double now=input_clock_ms();
+    pitch=key_pitch_at(now);key_ms=now;
+    if(mouse) key_return=false;
+    if(key_return && std::abs(pitch-rest_pitch)<0.002) {pitch=clamp_pitch(rest_pitch);key_return=false;++key_returns;}
+    const int look=int(f.held[look_down])-int(f.held[look_up]);
+    // A Look press released before this update (a tap) still unlocks and
+    // eases back, as a held one does on release.
+    const bool tapped=f.look_press_total>look_press_seen && !look;
+    look_press_seen=f.look_press_total;
+    const int lock=int(f.held[lock_look_down])-int(f.held[lock_look_up]);
+    if(look || lock) {
+        if(!key_hold) ++key_looks;
+        key_hold=look?look:lock;key_lock=!look;key_return=false;recentering=false;
+    } else {
+        if(key_hold && !key_lock || tapped) key_return=true;
+        if(tapped) {++key_taps;recentering=false;}
+        key_hold=0;
+    }
+}
+// D10D Duke 3D keyboard turning (game.c getinput: PREAMBLETURN 5 build angle
+// units per 30 Hz tic until the key has been held TURBOTURNTIME, 1/8 s, then
+// NORMALTURN 15, doubled when running). Yaw grows to the right (mouse right).
+// Timed on the presenter clock like the look keys, so late_view turns
+// smoothly between game frames.
+static int turn_hold;                // -1 left, 1 right
+static bool turn_running;
+static double turn_ms=-1,turn_since; // last catch-up; when the key went down
+static uint64_t key_turns;
+static constexpr double build_tic_rate=30*tau/2048;  // one unit per tic, rad/s
+static constexpr double turn_preamble_rate=5*build_tic_rate,turn_normal_rate=15*build_tic_rate,turn_preamble_s=0.125;
+// Angle turned after holding a turn key for `held` seconds.
+static double turn_angle(double held,bool running) {
+    if(held<turn_preamble_s) return turn_preamble_rate*held;
+    return turn_preamble_rate*turn_preamble_s+turn_normal_rate*(running?2:1)*(held-turn_preamble_s);
+}
+static double turn_yaw_at(double ms) {
+    if(turn_ms<0 || !turn_hold) return yaw;
+    const double from=(turn_ms-turn_since)/1000,dt=std::clamp((ms-turn_ms)/1000,-0.1,0.1);
+    return wrap_yaw(yaw+turn_hold*(turn_angle(std::max(from+dt,0.0),turn_running)-turn_angle(from,turn_running)));
+}
+// Brings yaw up to now under the turn key held so far, then takes the new
+// keys. A turn key stops a V swing; the mouse adds on top.
+static void key_turn(const InputFrame& f) {
+    const double now=input_clock_ms();
+    yaw=turn_yaw_at(now);turn_ms=now;
+    const int turn=int(f.held[turn_right])-int(f.held[turn_left]);
+    if(turn!=turn_hold) {turn_since=now;if(turn)++key_turns;}
+    turn_hold=turn;turn_running=input_running();
+    if(turn) recentering=false;
+}
+static double saved_distance=-1,written_distance=-1;
+static int written_shoulder=2,seen_shoulder=2,written_view=2,seen_view=2;
+static uint64_t camera_pref_changed;
+static LookAccumulator look;
+// D11 first-person blend, 0 = third-person orbit, 1 = eye level (first_person.inc).
+static double fp_blend;
+static uint64_t fp_frame;
+// D11: a jump that starts while the eye view is live keeps the camera-only
+// lease through its original animations (Space-only jumps have no flight lease).
+// D22B: in third person too; the orbit used to drop to the original camera.
+static bool jump_camera;
+// D17: set in a render replay worker, which has no live lease of its own.
+static bool render_override=false, override_lease_cam=false, last_lease_cam=false;
+static bool override_body_coverage=false,override_third_camera=false;
+// Nested uses of the generic list iterator cannot release this actor draw.
+// Only the verified outer object-list successor or another actor can end it.
+static bool third_body_drawing=false;
+// Draw-local ownership: reflected Duke is a separate pass, never the primary
+// first-person body/viewmodel. Reset at its verified list successor or entry
+// to another actor, and when a replay/world snapshot is installed.
+static bool mirror_duke_drawing=false;
+static double override_kick_frame=0;
+// D12A first-person quick kick (kick.inc).
+static bool kick_request(bool queue=false);
+static bool tp_kick_request(bool queue);   // D12E1 tp_kick.inc
+static void tp_kick_camera_offset(double* out);
+// D11B: between Duke's actor draw entry and the next object-list step.
+static bool duke_drawing,actor_drawing;
+static uint32_t actor_draw_sp; // D36H9: the object loop's sp at the actor entry
+static bool jump_animation(unsigned animation) {
+    return animation==96 || animation==97 || animation==98 || animation==103 ||
+        animation==104 || animation==105 || animation==109;
+}
+static bool first_person_anchor(const double* forward,double* anchor);
+static ActionView swimming_view() {
+    ActionView choice=ActionView::First;
+    parse_action_view(ttk_live_env("DNTTK_SWIM_VIEW"),choice);
+    return choice;
+}
+static ActionView jetpack_view() {
+    ActionView choice=ActionView::First;
+    parse_action_view(ttk_live_env("DNTTK_JETPACK_VIEW"),choice);
+    return choice;
+}
+static ActionView push_view() {
+    ActionView choice=ActionView::First;
+    parse_action_view(ttk_live_env("DNTTK_PUSH_VIEW"),choice);
+    return choice;
+}
+static ActionView ladder_view() {
+    ActionView choice=ActionView::First;
+    parse_action_view(ttk_live_env("DNTTK_LADDER_VIEW"),choice);
+    return choice;
+}
+static ActionView wall_view() {
+    ActionView value=ActionView::First;
+    parse_action_view(ttk_live_env("DNTTK_WALL_VIEW"),value);return value;
+}
+static ActionView overhead_view() {
+    ActionView choice=ActionView::First;
+    parse_action_view(ttk_live_env("DNTTK_OVERHEAD_VIEW"),choice);
+    return choice;
+}
+static ActionView mantle_view() {
+    ActionView choice=ActionView::First;
+    parse_action_view(ttk_live_env("DNTTK_MANTLE_VIEW"),choice);
+    return choice;
+}
+static ActionView pole_view() {
+    ActionView choice=ActionView::First;
+    parse_action_view(ttk_live_env("DNTTK_POLE_VIEW"),choice);
+    return choice;
+}
+static bool independent_camera() {
+    if(!input_modern_controls())return false;
+    const char* mode=ttk_live_env("DNTTK_CAMERA_MODE");
+    return !mode || !std::strcmp(mode,"independent");
+}
+static double sensitivity() {
+    const char* text=ttk_live_env("DNTTK_MOUSE_SENSITIVITY");
+    char* end=nullptr; double value=text?std::strtod(text,&end):0.12;
+    if (!std::isfinite(value) || value<0.01 || value>2 || (text && (!end || *end))) value=0.12;
+    return value*tau/360;
+}
+static bool pivot(double* xyz) {
+    if (psx_mod_read_word(camera+0x50)!=player+0x7bc ||
+        psx_mod_read_word(camera+0x4c)!=player+0x7bc) return false;
+    for (int i=0;i<3;++i) xyz[i]=(int32_t)psx_mod_read_word(player+0x7bc+4*i);
+    // Original normal-camera target offset. The D10 shoulder offset is applied
+    // to the camera position in orbit_constraint, never to this look target.
+    xyz[1]+=(int32_t)psx_mod_read_word(camera+0x88);
+    return true;
+}
+// D10 persistence. The launcher owns the profile; the runtime only reports the
+// last Alt-wheel distance and shoulder side through a small side file it names.
+static double camera_saved_distance() {
+    const char* text=std::getenv("DNTTK_CAMERA_DISTANCE");
+    char* end=nullptr;double value=text?std::strtod(text,&end):0;
+    if(!text || !end || *end || !std::isfinite(value) || value<768 || value>6144)return 0;
+    return value;
+}
+static void camera_persist(uint64_t sequence,int shoulder,int view) {
+    const char* path=std::getenv("DNTTK_CAMERA_STATE_FILE");
+    if(!path || !*path)return;
+    if(written_distance<0)written_distance=camera_saved_distance();
+    if(written_shoulder==2) {
+        const char* side=std::getenv("DNTTK_CAMERA_SHOULDER");
+        written_shoulder=side && !std::strcmp(side,"right")?1:side && !std::strcmp(side,"left")?-1:0;
+    }
+    if(written_view==2) {
+        const char* text=std::getenv("DNTTK_CAMERA_VIEW");
+        written_view=text && !std::strcmp(text,"first");
+    }
+    const double distance=saved_distance>0?saved_distance:0;
+    if(distance==written_distance && shoulder==written_shoulder && view==written_view)return;
+    // Half a second after the last change: one write per adjustment, not per notch.
+    if(sequence<camera_pref_changed+30)return;
+    std::string temporary=std::string(path)+".tmp";
+    if(FILE* file=std::fopen(temporary.c_str(),"w")) {
+        const bool ok=std::fprintf(file,"{\"camera_distance\": %.0f, \"shoulder\": \"%s\", \"view\": \"%s\"}\n",distance,
+                                   shoulder>0?"right":shoulder<0?"left":"center",view?"first":"third")>0;
+        if(std::fclose(file)==0 && ok && std::rename(temporary.c_str(),path)==0) {
+            written_distance=distance;written_shoulder=shoulder;written_view=view;return;
+        }
+    }
+    std::remove(temporary.c_str());
+    // Do not retry every frame after a failure; the next change tries again.
+    written_distance=distance;written_shoulder=shoulder;written_view=view;
+    std::fprintf(stderr,"[TTK camera] could not save camera preferences to %s\n",path);
+}
+// D19G: CAMERA DISTANCE confirmed in the menu, as an Alt-wheel change would
+// set it (0: the original boom, read from the camera as orbit_begin does).
+double camera_distance_setting() {return saved_distance<0?camera_saved_distance():saved_distance;}
+void camera_set_distance(double distance) {
+    saved_distance=distance>0?std::clamp(distance,768.0,6144.0):0;
+    if(saved_distance>0) preferred_radius=saved_distance;
+    else {
+        double ox=(int32_t)psx_mod_read_word(camera+0x94);
+        double oy=(int32_t)psx_mod_read_word(camera+0x98)-(int32_t)psx_mod_read_word(camera+0x88);
+        double oz=(int32_t)psx_mod_read_word(camera+0x9c);
+        const double desired=std::sqrt(ox*ox+oy*oy+oz*oz);
+        preferred_radius=desired>=256 && desired<=8192 ? std::clamp(desired,768.0,6144.0) : 0;
+    }
+    camera_pref_changed=input_host_frame();
+}
+// Native damage 0x800a43c4 sets bit 0x20000 and +0x214=3000;
+// 0x8004157c drains that timer and clears freeze/ice shading on thaw.
+// Read-only presentation predicate, never an input or gameplay lease.
+static bool frozen_eye_state() {
+    return (psx_mod_read_word(player)&0x20002u)==0x20000u &&
+        (int32_t)psx_mod_read_word(player+0x214)>0 &&
+        (int16_t)psx_mod_read_half(player+0x32)>0;
+}
+// D42: Duke dying (player word 0 bit 1, no health) with the first-person view
+// selected, one player. Read-only presentation predicate: the eye follows the
+// body to the floor; it never authorizes movement, aim or fire.
+static bool death_eye_state() {
+    return input_modernized() && input_snapshot(Context::Gameplay).first_person &&
+        psx_mod_read_word(0x800c27bc)==1 && (psx_mod_read_word(player)&2) &&
+        (int16_t)psx_mod_read_half(player+0x32)<=0;
+}
+// D42: EDuke32's first-person death view, re-implemented from its behaviour
+// (clean room; documentation/373-d42-death-scene.md). Look input stops (late
+// redraws too), the view levels out, the eye rides the body (over its root)
+// and drops as Duke 3D's does: from 36 to 20 of the 38 units of standing eye
+// height, falling under sprite gravity (176 per tic squared over 4096 units,
+// 30 tics a second: about 0.23 s), and the screen rolls to a random angle
+// (Duke 3D's dead_flag plus a map-height term: any angle), turning another
+// 32 / 2048 of a turn as the body falls. Presentation only.
+// While dead the view also turns toward the killer, half the remaining angle
+// per tic (Duke 3D's wackedbyactor): the source object of the last hit
+// (Duke's damage handler, stack +0x10; damage_flash.inc), if it was not Duke
+// and is still the same object (its type id +0x2c).
+// D08G9: after a dnkroz revive the roll unwinds, half per tic (Duke 3D's
+// rotscrnang -= rotscrnang >> 1 once alive); CONTINUE and restarts reset it.
+struct DeathView {bool active=false,revived=false;double start_ms=0,roll0=0,turn_ms=0,unwind=0,unwind_ms=0;uint32_t killer=0;uint16_t killer_id=0;};
+static DeathView death_view;
+static uint32_t last_hit_source;
+static double last_hit_ms;
+static constexpr double death_standing_eye=294; // the upright eye above the root (swim, climb)
+static double death_fall_fraction() {
+    const double tics=std::max(0.0,(input_clock_ms()-death_view.start_ms)*30/1000);
+    return std::min(1.0,176*tics*(tics+1)/2/4096);
+}
+static double death_eye_height() {return death_standing_eye*(36-16*death_fall_fraction())/38;}
+static double death_roll() {
+    if(death_view.active) return death_view.roll0+death_fall_fraction()*32*tau/2048;
+    return death_view.unwind*std::pow(0.5,std::max(0.0,input_clock_ms()-death_view.unwind_ms)*30/1000);
+}
+void death_view_revive() {death_view.revived=true;}
+static void death_view_update() {
+    if(!death_eye_state()) {
+        if(death_view.active) {
+            death_view.unwind=death_view.revived ? wrap_yaw(death_roll()) : 0;death_view.unwind_ms=input_clock_ms();
+        } else if(death_view.unwind && std::abs(death_roll())<0.001) death_view.unwind=0;
+        death_view.active=death_view.revived=false;return;
+    }
+    if(death_view.active) return;
+    death_view.active=true;death_view.start_ms=death_view.turn_ms=input_clock_ms();
+    const uint32_t seed=(uint32_t)SDL_GetPerformanceCounter()*2654435761u;
+    death_view.roll0=(seed>>21)*tau/2048;
+    death_view.killer=0;
+    if(last_hit_source && last_hit_source!=player && death_view.start_ms-last_hit_ms<2000) {
+        death_view.killer=last_hit_source;death_view.killer_id=psx_mod_read_half(last_hit_source+0x2c);
+    }
+}
+static void death_view_turn() {
+    const double now=input_clock_ms(),dt=std::clamp(now-death_view.turn_ms,0.0,200.0);
+    death_view.turn_ms=now;
+    const uint32_t k=death_view.killer;
+    if(!k || psx_mod_read_half(k+0x2c)!=death_view.killer_id) return;
+    const double dx=(int32_t)psx_mod_read_word(k+4)-(int32_t)psx_mod_read_word(player+4);
+    const double dz=(int32_t)psx_mod_read_word(k+12)-(int32_t)psx_mod_read_word(player+12);
+    if(std::hypot(dx,dz)<1) return;
+    yaw=wrap_yaw(yaw+wrap_yaw(std::atan2(dx,dz)-yaw)*(1-std::pow(0.5,dt*30/1000)));
+}
+static bool climb_state_early();
+static void orbit_begin(uint32_t sp) {
+    const auto& f=input_snapshot(Context::Gameplay);
+    death_view_update();
+    double target[3];
+    if (!independent_camera() || !pivot(target)) {free_look={};orbit_valid=false;look.reset();return;}
+    // A slow original game update is not a camera ownership transition.
+    // The dancers legitimately take five guest fields; the old four-field
+    // timeout reseeded from an older camera and discarded accumulated mouse
+    // motion. Loads and an explicit camera ownership release already
+    // invalidate orbit_valid. Preserve the look across variable game cadence.
+    if (!orbit_valid) {
+        free_look={};
+        if(std::getenv("DNTTK_CAMERA_RESEED_TRACE"))
+            std::fprintf(stderr,"[camera reseed] gap=%llu valid=%d epoch=%llu/%llu yaw=%.6f field=%llu\n",
+                (unsigned long long)(f.sequence-camera_frame),orbit_valid?1:0,
+                (unsigned long long)camera_epoch,(unsigned long long)f.epoch,yaw,
+                (unsigned long long)f.sequence);
+        double x=target[0]-(int32_t)psx_mod_read_word(camera+0x64);
+        double y=target[1]-(int32_t)psx_mod_read_word(camera+0x68);
+        double z=target[2]-(int32_t)psx_mod_read_word(camera+0x6c);
+        // The solved camera distance may be shortened by a wall, death or a
+        // transition. It is never a replacement for our established follow boom.
+        if(radius<256 || radius>8192) {
+            // 28e1c builds the original unconstrained boom from this local offset.
+            double ox=(int32_t)psx_mod_read_word(camera+0x94);
+            double oy=(int32_t)psx_mod_read_word(camera+0x98)-(int32_t)psx_mod_read_word(camera+0x88);
+            double oz=(int32_t)psx_mod_read_word(camera+0x9c);
+            double desired=std::sqrt(ox*ox+oy*oy+oz*oz);
+            radius=(psx_mod_read_word(camera+0x80)&1) && desired>=256 && desired<=8192
+                ? desired : std::sqrt(x*x+y*y+z*z);
+        }
+        if (radius<256 || radius>8192) {orbit_valid=false;look.reset();return;}
+        // Collision can put the boom to one side of the requested view. On
+        // capture/state recovery seed from the visible orientation, not the boom.
+        double fx=(int16_t)psx_mod_read_half(camera+12);
+        double fy=(int16_t)psx_mod_read_half(camera+14);
+        double fz=(int16_t)psx_mod_read_half(camera+16);
+        yaw=std::atan2(fx,fz);pitch=clamp_pitch(std::atan2(fy,std::hypot(fx,fz)));
+        look.reset();orbit_valid=true;recentering=false;
+        key_hold=0;key_return=false;key_ms=-1;
+        turn_hold=0;turn_ms=-1;
+    }
+    // Input epochs discard deltas, never the selected camera orientation.
+    // Loads and unauthenticated/scripted camera transitions invalidate the
+    // orbit separately. A console/menu/focus boundary only stops input.
+    if(camera_epoch!=f.epoch || !f.active) {
+        free_look={};
+        look.reset();recentering=false;key_hold=0;key_return=false;key_ms=-1;
+        turn_hold=0;turn_ms=-1;
+    }
+    // The first seed is the original follow view; recenter returns to its pitch.
+    if(!rest_pitch_valid){rest_pitch=pitch;rest_pitch_valid=true;}
+    if(preferred_radius==0) {
+        if(saved_distance<0)saved_distance=camera_saved_distance();
+        // A saved Alt-wheel preference starts in place, without a zoom on entry.
+        if(saved_distance>0)radius=preferred_radius=saved_distance;
+        else preferred_radius=std::clamp(radius,768.0,6144.0);
+    }
+    if(distance_epoch!=f.epoch) {distance_epoch=f.epoch;distance_seen=0;recenter_seen=0;look_press_seen=0;distance_frame=f.sequence;}
+    if(f.active && f.distance_total!=distance_seen) {
+        preferred_radius=std::clamp(preferred_radius-192.0*(f.distance_total-distance_seen),768.0,6144.0);
+        saved_distance=preferred_radius;camera_pref_changed=f.sequence;
+    }
+    distance_seen=f.distance_total;
+    const unsigned ticks=unsigned(std::min<uint64_t>(f.sequence-distance_frame,4));
+    const double blend=1-std::pow(0.75,ticks);
+    if(ticks) {
+        tight_return_rate=(unsigned)std::clamp(std::lround(1.0/(1.0-std::exp(-ticks/(60.0*0.18)))),2l,12l);
+        // Host vblank sequence, once per update; no collision feedback into preference.
+        radius+=(preferred_radius-radius)*blend;distance_frame=f.sequence;
+        // Shoulder side eases across; 0.22 of the boom, bounded for close/far.
+        // D08J3: climbs centre the view whatever the shoulder setting; the
+        // preference itself is untouched and returns when the climb ends.
+        const int shoulder=climb_state_early()?0:f.shoulder;
+        const double clearance=tight_camera_enabled() && fp_blend==0 ? camera_smoothstep(0.25,0.9,tight_distance/std::max(radius,1.0)) : 1.0;
+        const double side=shoulder*std::clamp(0.22*radius,192.0,640.0)*clearance;
+        shoulder_offset+=(side-shoulder_offset)*blend;
+    }
+    auto delta=look.consume(f.epoch,f.total_x,f.total_y);
+    const bool frozen=frozen_eye_state() || death_eye_state(); // D42: no look while dead
+    if(frozen) {
+        delta={};recentering=false;key_hold=0;key_return=false;key_ms=-1;
+        turn_hold=0;turn_ms=-1;
+    }
+    // D42: dead, the view levels out at once (Duke 3D's horizon 100, eased
+    // over a tic or two).
+    if(death_view.active && ticks) pitch*=std::pow(0.25,ticks);
+    if(death_view.active) death_view_turn();
+    // Bounded to ordinary grounded locomotion. Attached traversal, flight,
+    // swimming, first person and ownership boundaries discard inspection.
+    const bool inspect_ok=f.active && !f.first_person && fp_blend==0 && !frozen &&
+        locomotion_input_ready() && psx_mod_read_byte(player+0x22c)==0 &&
+        !f.held[original_aim] && camera_epoch==f.epoch;
+    if(!inspect_ok) free_look={};
+    if(!inspect_ok || !f.held[camera_free_look])free_look_cancelled=false;
+    if(free_look.active && f.recenter_total>recenter_seen)free_look_cancelled=true;
+    if(inspect_ok && !free_look_cancelled && f.held[camera_free_look] && !free_look.active) {
+        free_look.active=true;
+        for(int i=0;i<3;++i)free_look.eye[i]=(int32_t)psx_mod_read_word(camera+0x14+4*i)-(int32_t)psx_mod_read_word(player+4+4*i);
+    }
+    if(free_look.active) {
+        free_look.held=f.held[camera_free_look] && !free_look_cancelled;
+        recentering=false;
+        if(free_look.held) {
+            key_hold=0;key_return=false;key_ms=-1;turn_hold=0;turn_ms=-1;
+            const char* inv=ttk_live_env("DNTTK_MOUSE_INVERT_Y");
+            free_look.x=wrap_yaw(free_look.x+delta.x*sensitivity());
+            free_look.y=clamp_pitch(pitch+free_look.y+delta.z*sensitivity()*(inv && !std::strcmp(inv,"1")?-1:1))-pitch;
+            delta={};
+        } else {
+            // Release restores steering immediately. Only the residual visual
+            // offset decays; new mouse input must never replenish that offset
+            // or postpone the return while the player is trying to steer.
+            const double decay=std::exp(-12.0*ticks/60.0);
+            free_look.x*=decay;free_look.y*=decay;
+            if(std::abs(free_look.x)<0.001 && std::abs(free_look.y)<0.001)free_look={};
+        }
+        free_look.ms=input_clock_ms();
+    }
+    if(!free_look.active && f.active && !frozen && f.recenter_total>recenter_seen) recentering=true;
+    recenter_seen=f.recenter_total;
+    // Mouse movement always wins over a swing in progress.
+    if(delta.x || delta.z) recentering=false;
+    if(recentering && ticks) {
+        // Game yaw: +Z=0, +X=1024. Behind Duke means looking along his heading.
+        const double heading=(psx_mod_read_half(player+0x1c)&4095)*tau/4096;
+        const double dy=wrap_yaw(heading-yaw),dp=rest_pitch-pitch;
+        yaw=wrap_yaw(yaw+dy*blend);pitch=clamp_pitch(pitch+dp*blend);
+        if(std::abs(dy)<0.005 && std::abs(dp)<0.005) {yaw=wrap_yaw(heading);pitch=clamp_pitch(rest_pitch);recentering=false;}
+        if(!recentering)++recenters;
+    }
+    if(f.active && !frozen && !free_look.held) {key_look(f,delta.x || delta.z);key_turn(f);}
+    const char* inverted=ttk_live_env("DNTTK_MOUSE_INVERT_Y");
+    yaw=wrap_yaw(yaw+delta.x*sensitivity());
+    pitch=clamp_pitch(pitch+delta.z*sensitivity()*(inverted && !std::strcmp(inverted,"1")?-1:1));
+    if (delta.x || delta.z) ++looks;
+    if(f.shoulder!=seen_shoulder){seen_shoulder=f.shoulder;camera_pref_changed=f.sequence;}
+    if(int(f.first_person)!=seen_view){seen_view=f.first_person;camera_pref_changed=f.sequence;}
+    camera_persist(f.sequence,f.shoulder,f.first_person);
+    orbit_sp=sp;
+}
+static void view_matrix(uint32_t destination) {
+    double sy=std::sin(inspection_yaw()),cy=std::cos(inspection_yaw()),sp=std::sin(inspection_pitch()),cp=std::cos(inspection_pitch());
+    double matrix[]={cy,0,-sy,-sy*sp,cp,-cy*sp,sy*cp,sp,cy*cp};
+    // D42: the death view's screen roll turns the right and down rows about
+    // the forward row (the eye view only).
+    if((death_view.active || death_view.unwind) && fp_blend>0) {
+        const double r=death_roll()*fp_blend,cr=std::cos(r),sr=std::sin(r);
+        for(int i=0;i<3;++i) {
+            const double right=matrix[i],down=matrix[3+i];
+            matrix[i]=cr*right+sr*down;matrix[3+i]=-sr*right+cr*down;
+        }
+    }
+    for(int i=0;i<9;++i) psx_mod_write_half(destination+2*i,(int16_t)std::lround(matrix[i]*4096));
+}
+// D36H9: requested eye delta (world) of a fully blended first-person
+// mantle/hang eye, for first_person_unsolved_eye after the native solve.
+static bool hang_eye_request;
+static double hang_eye_delta[3];
+static bool hang_eye_owner();
+static void orbit_constraint(uint32_t delta) {
+    double target[3]; if (!pivot(target)) {orbit_valid=false;return;}
+    double sy=std::sin(inspection_yaw()),cy=std::cos(inspection_yaw()),sp=std::sin(inspection_pitch()),cp=std::cos(inspection_pitch());
+    double forward[]={sy*cp,sp,cy*cp};
+    // World-to-view rows: right, down, forward. Set before all original
+    // constraint queries, final camera position, room and height calculations.
+    view_matrix(camera);
+    double eye[3],punch[3];
+    const bool eye_view=fp_blend>0 && first_person_anchor(forward,eye);
+    tp_kick_camera_offset(punch);
+    for(int i=0;i<3;++i) {
+        int32_t current=psx_mod_read_word(camera+0x64+4*i);
+        // Shoulder moves the eye along the view's right row; the look target and
+        // the original constraint/collision solve are unchanged.
+        const double right[]={cy,0,-sy};
+        double orbit=target[i]-forward[i]*radius+right[i]*shoulder_offset;
+        // D11: blend the requested anchor toward the eye; collision still solves it.
+        if(eye_view) orbit+=(eye[i]-orbit)*fp_blend;
+        orbit+=punch[i];   // D12E1: the third-person kick's camera punch
+        int32_t desired=std::lround(orbit);
+        psx_mod_write_word(delta+4*i,desired-current);
+        hang_eye_delta[i]=desired-current;
+    }
+    hang_eye_request=eye_view && hang_eye_owner();
+    constraint_update=cameras;
+    ++orbits;
+}
+#include "apartment_secret.inc"
+// Runtime RAM image and RAM-code generation (memory.c). The plugin is linked
+// into the runtime; the native tests define both beside their RAM mock.
+extern "C" uint8_t* g_psx_ram;
+extern "C" uint32_t g_dirty_ram_code_gen;
+static uint64_t identity_calls, identity_checks, identity_ns;
+static constexpr uint32_t level_base=0x800ca968;
+static constexpr size_t level_count=sizeof level_overlays/sizeof level_overlays[0];
+// D22A: the authenticated level overlay of the last identity verdict (its
+// LEVELxx tag), or 0 when the verdict failed.
+static thread_local uint32_t identity_tag;
+static int level_index(uint32_t tag) {
+    for(size_t i=0;i<level_count;++i)if(level_overlays[i].tag==tag)return int(i);
+    return -1;
+}
+// Only LEVEL00 carries the Modernized apartment pair.
+static uint32_t (*level_reader(uint32_t tag))(uint32_t) {
+    return tag==3?apartment_identity_word:psx_mod_read_word;
+}
+static uint32_t grounded_water_identity_word(uint32_t address);
+static bool identity() {
+    static thread_local std::array<std::vector<uint32_t>,sizeof guards/sizeof guards[0]> expected;
+    static thread_local std::array<std::vector<uint32_t>,sizeof state_guards/sizeof state_guards[0]> state_expected;
+    static thread_local std::array<std::vector<uint32_t>,1> level_expected[level_count];
+    static thread_local IdentityMemo memo;
+    static thread_local uint32_t memo_tag;
+    ++identity_calls;
+    const uint64_t frame=input_host_frame();
+    if(!memo.valid(frame,g_dirty_ram_code_gen)) {
+        const auto t0=std::chrono::steady_clock::now();
+        const uint32_t tag=psx_mod_read_word(level_base);
+        const int level=level_index(tag);
+        const bool ok=level>=0 && code_identity(guards,expected,grounded_water_identity_word,g_psx_ram) &&
+            masked_identity(state_guards,state_expected) &&
+            code_identity(level_overlays[level].body,level_expected[level],level_reader(tag),g_psx_ram);
+        memo.set(frame,g_dirty_ram_code_gen,ok);memo_tag=ok?tag:0;
+        identity_ns+=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-t0).count();
+        ++identity_checks;
+    }
+    identity_tag=memo_tag;
+    if(!memo.ok)++refusals;
+    // Name the guard that broke, once per transition, so a lost lease in a
+    // playtest log says which original code changed.
+    static bool reported;
+    if(!memo.ok && !reported) {
+        uint32_t address=0,live=0,want=0;
+        const uint32_t tag=psx_mod_read_word(level_base);
+        const int level=level_index(tag);
+        const int index=code_identity_mismatch(guards,expected,address,live,want);
+        const int state=index<0?masked_identity_mismatch(state_guards,state_expected,address,live,want):-1;
+        if(index>=0)
+            std::fprintf(stderr,"[TTK identity] guard %d (0x%08x, %u bytes) changed at 0x%08x: 0x%08x, expected 0x%08x\n",
+                index,guards[index].address,guards[index].size,address,live,want);
+        else if(state>=0)
+            std::fprintf(stderr,"[TTK identity] state table 0x%08x (%u bytes, mask 0x%08x) changed at 0x%08x: 0x%08x, expected 0x%08x\n",
+                state_guards[state].address,state_guards[state].size,state_guards[state].mask,address,live,want);
+        else if(level<0)
+            std::fprintf(stderr,"[TTK identity] level overlay tag 0x%08x at 0x%08x is not an authenticated level\n",tag,level_base);
+        else {
+            code_identity_mismatch(level_overlays[level].body,level_expected[level],address,live,want,level_reader(tag));
+            std::fprintf(stderr,"[TTK identity] level %u overlay changed at 0x%08x: 0x%08x, expected 0x%08x\n",
+                tag,address,live,want);
+        }
+        reported=true;
+    }
+    if(memo.ok)reported=false;
+    return memo.ok;
+}
+// LEVEL00-only conveniences (the apartment) require that exact overlay.
+static bool first_map() { return identity() && identity_tag==3; }
+static bool gameplay_context() {
+    // 1bb84 dispatches mode 0 frontend/attract, mode 1 game. 268a0
+    // suspends player updates for inventory/pause. A demo player is not input ownership.
+    return psx_mod_read_half(0x800bcbb0)==1 && !psx_mod_read_half(0x800be568) &&
+        !psx_mod_read_half(0x800d2540);
+}
+static const char* last_refusal="";
+const char* lease_refusal_reason() { return last_refusal; }
+static void lease_refuse_trace(const char* why, bool ident) {
+    last_refusal=why;
+    char now[96];
+    unsigned animation=psx_mod_read_half(player+0x60);
+    unsigned mode=psx_mod_read_byte(player+0x22c), previous=psx_mod_read_byte(player+0x22d);
+    uint32_t flags=psx_mod_read_word(player+0x224);
+    uint32_t owner=psx_mod_read_word(camera+0xa4);
+    std::snprintf(now,sizeof now,"%s a=%u %u/%u f=%08x cam=%08x id=%d ctx=%d",
+        why,animation,mode,previous,flags,owner,ident?1:0,gameplay_context()?1:0);
+    static char last[96];
+    if(!std::strcmp(now,last))return;
+    std::snprintf(last,sizeof last,"%s",now);
+    std::fprintf(stderr,"[TTK lease] inactive (%s) anim=%u state=%u/%u flags=%08x cam=%08x ident=%d ctx=%d\n",
+        why,animation,mode,previous,flags,owner,ident?1:0,gameplay_context()?1:0);
+}
+static bool water_present_early() {
+    return psx_mod_read_word(player+0x834)!=0x40000000u;
+}
+static bool water_submerged_early() {
+    if(!water_present_early())return false;
+    return (int32_t)psx_mod_read_word(player+8)>(int32_t)psx_mod_read_word(player+0x834);
+}
+static bool in_water_early() {
+    return water_submerged_early() ||
+        (water_present_early() && psx_mod_read_word(player+0x20c)!=0);
+}
+// Waist-deep / mid water is original land gait (8005201c early-outs below 0x281
+// and swim states 4/5). Treat it as solid-ground locomotion, not a swim path.
+static bool shallow_land_water_early() {
+    if(!in_water_early())return false;
+    const unsigned mode=psx_mod_read_byte(player+0x22c);
+    if(mode==4 || mode==5)return false;
+    const int32_t depth=(int32_t)psx_mod_read_word(player+0x1c8)-
+        (int32_t)psx_mod_read_word(player+0x834);
+    return depth<0x281;
+}
+// D08AC: land mechanics in grounded water belong to SWIMMING MODERN.
+// ORIGINAL retains its accepted wade pace, jump boosts and ledge assistance.
+static bool grounded_water_modern() {
+    const char* option=ttk_live_env("DNTTK_SWIMMING");
+    return input_modernized() && (!option || std::strcmp(option,"original")) &&
+        shallow_land_water_early();
+}
+static bool land_gait_anim(unsigned animation) {
+    return animation==63 || (animation>=72 && animation<=79) ||
+        (animation>=178 && animation<=184);
+}
+// D22B: the original's own directional gait, selected by its idle dispatcher
+// (0x8004c1dc..0x8004c2d4) and strafe pads: 82/83 walk and 84/85 run
+// backward, 88-91 strafe (86/87 and 92/93 in mid water). Modernized never
+// asks for them, but a pad held as an original move ends (a fall, roll or
+// slide bridge) starts them; the lease then takes over at once instead of
+// leaving the original controls in charge.
+static bool original_step_anim(unsigned animation) {
+    return (animation>=82 && animation<=85) || (animation>=88 && animation<=91);
+}
+// Landing poses: 94/95 and the heavier 106 (BLOOD BATHS, after a fall).
+static bool landing_pose_anim(unsigned animation) { return animation==94 || animation==95 || animation==106; }
+static bool wade_land_anim(unsigned animation) {
+    return land_gait_anim(animation) || animation==70 || animation==71 ||
+        animation==94 || animation==95;
+}
+// D08Q: original jetpack flight. 8004aaf8 enters mode 10 / anim 163 on Square
+// with the jetpack on (+0x358 & 3) and fuel; 8004ade0 owns thrust, fuel and
+// the hover lock (+0x224 & 0x08000000). Anims 163..170 are its poses.
+static bool jetpack_anim(unsigned animation) { return animation>=163 && animation<=170; }
+static bool jetpack_flying_early() {
+    return psx_mod_read_byte(player+0x22c)==10 && jetpack_anim(psx_mod_read_half(player+0x60)) &&
+        (psx_mod_read_half(player+0x358)&3)==3;
+}
+// D08R: Modernized jetpack scheme, fixed at launch (DNTTK_JETPACK). Classic
+// keeps the modern flight controls but the original burst physics (jetpack.inc).
+static bool jetpack_classic() {
+    static const bool classic=[] {const char* v=std::getenv("DNTTK_JETPACK");return v && !std::strcmp(v,"classic");}();
+    return classic;
+}
+static bool jetpack_eduke32() {
+    static const bool enabled=[] {const char* v=std::getenv("DNTTK_JETPACK");return v && !std::strcmp(v,"eduke32");}();
+    return enabled;
+}
+static bool jet_instant_toggle(CPUState* cpu);
+// After the jetpack cuts out in the air (fuel, J) the original falls with 108
+// in mode 9; keep the mouse camera through that fall until the landing.
+static bool jet_fall_grace;
+static bool push_state_early();
+// D08V: original mantle / hang / pull-up (mode 8 anims 134..142, hang mode 6
+// 147..153, shimmy mode 7 149..153), including the entry frames whose previous
+// mode is still ground, fall or hang. The original dispatchers own motion and
+// facing; the host keeps only the mouse camera (and directional buttons).
+static bool mantle_state_early() {
+    const unsigned animation=psx_mod_read_half(player+0x60);
+    const unsigned mode=psx_mod_read_byte(player+0x22c), previous=psx_mod_read_byte(player+0x22d);
+    const bool from=previous==0 || previous==6 || previous==7 || previous==8 || previous==9;
+    // D08U: a ladder's top exit 190 and bottom step-off 185 (mode 8 after the
+    // climb, never the 185 mount from the ground) are the same kind of handoff.
+    // D08J5: so are a pole or chain's top exit 196 and step-off 191.
+    // D08J8: and a climbing wall's top exit 206 and bottom exit 197 (user,
+    // slot 8: the camera froze over the top, so Duke could not aim there).
+    return (mode==8 && animation>=134 && animation<=142 && from) ||
+        (mode==8 && (animation==185 || animation==190 || animation==191 || animation==196 || animation==197 || animation==206) &&
+         (previous==3 || previous==8)) ||
+        (mode==6 && animation>=147 && animation<=153 && from) ||
+        (mode==7 && animation>=149 && animation<=153 && (previous==6 || previous==7 || previous==9));
+}
+// D08V: an original fall that no owned jump started (107/108, mode 9: stepping
+// off an edge the run-off lease does not own, a failed grab, a drop into water).
+// Camera only; no air steering.
+static bool unowned_fall_early() {
+    const unsigned animation=psx_mod_read_half(player+0x60);
+    const unsigned mode=psx_mod_read_byte(player+0x22c), previous=psx_mod_read_byte(player+0x22d);
+    // An owned short fall (108) keeps its flight lease. Any other 107/108, even
+    // after an owned jump, is camera only; the camera hook then drops the stale
+    // jump ownership (flight_valid) as for any animation outside the flight set.
+    const bool owned=animation==108 && flight_valid && short_fall;
+    // D08K15: the fall initializer sets 108 one update before the dispatcher
+    // sets mode 9 (support gone under a still Duke: a crate kicked or shot apart
+    // beneath him, crouched or standing). That update (0/0) was unleased, so
+    // the eye view dropped and the orbit re-seeded from the native camera: the
+    // view pitch snapped level.
+    if(animation==108 && mode==0 && previous==0 && !owned)return true;
+    return (animation==107 || animation==108) && mode==9 && (previous==9 || previous==0) && !owned;
+}
+// D08U: the host-blended top-of-ladder mount (ladder_top.inc).
+static bool ladder_mount_early();
+// D22B: the original dodge rolls, seen armed in PIG FACTORY and THE REAPER:
+// 157 and 160 launch in the air (mode 9), 158/159 and 161/162 tumble and
+// recover on the ground. They were missing from the lease, so each roll
+// dropped the mouse camera and first person for about a second. The original
+// owns the roll's motion; the host keeps the mouse camera and the selected
+// view and sends no directions (committed_camera_ready).
+static bool roll_state_early() {
+    const unsigned animation=psx_mod_read_half(player+0x60);
+    const unsigned mode=psx_mod_read_byte(player+0x22c), previous=psx_mod_read_byte(player+0x22d);
+    return animation>=157 && animation<=162 && (mode==0 || mode==9) && (previous==0 || previous==9);
+}
+// D22B: the original steep-slope slide. The airborne/directional handler
+// 0x80055904 enters mode 2 (anim 143 or 145) when 0x800544e8 finds a slope too
+// steep to stand on; Duke then leaves the slope (99 or 108, mode 9) and lands
+// as 105. FAMILY JEWELS trace: jump 96, 145 (2/9), 99 (9/9), 105 (0/0), idle.
+// D08Z5: Jump on the slope starts 99 or 100 (a backflip, Original) and can
+// enter, slide and leave in one update (99 at 9/0); a standing jump's 99/100
+// comes from 97, mode 9. The latch carries the camera through that landing only.
+static bool slide_landing;
+static bool slide_state_early() {
+    const unsigned animation=psx_mod_read_half(player+0x60);
+    const unsigned mode=psx_mod_read_byte(player+0x22c), previous=psx_mod_read_byte(player+0x22d);
+    const bool sliding=mode==2 || (mode==9 && previous==2) || ((animation==99 || animation==100) && mode==9 && (previous==9 || previous==0));
+    if(sliding) slide_landing=true;
+    else if(!(animation==105 && mode==0 && (previous==0 || previous==9))) slide_landing=false;
+    return sliding || slide_landing;
+}
+// Original moves that run to their end on their own: the host keeps the mouse
+// camera and the selected view but sends no directions.
+static bool committed_move_early() { return roll_state_early() || slide_state_early(); }
+// D08J3: ladders, poles, chains and climbing walls (mode 3, the attached set
+// traversal_state_ready accepts), including their entry frames from a mount,
+// grab or hang. The original keeps the normal camera and Duke's pivot there and
+// only swaps in a high look-down boom; the mouse orbit replaces that boom. The
+// original climb handlers still own motion and facing.
+static bool climb_state_early() {
+    const unsigned animation=psx_mod_read_half(player+0x60);
+    const unsigned mode=psx_mod_read_byte(player+0x22c), previous=psx_mod_read_byte(player+0x22d);
+    return mode==3 && ((animation>=147 && animation<=156) || (animation>=185 && animation<=211)) &&
+        (previous==0 || previous==3 || previous==6 || previous==7 || previous==8 || previous==9);
+}
+static bool first_person_wall();
+// D35J: native idle selection and the reproduced ordinary-camera actions.
+// These predicates describe presentation, never locomotion/aim permission.
+static bool idle_fidget_eye() {
+    const unsigned a=psx_mod_read_half(player+0x60);
+    return a>=64 && a<=69 && psx_mod_read_byte(player+0x22c)==0 &&
+        psx_mod_read_byte(player+0x22d)==0;
+}
+static bool use_interaction_eye() {
+    const unsigned a=psx_mod_read_half(player+0x60);
+    // D35J4: slot-9 crystal take/return uses 268/267 in the same native
+    // selector (0x80051608). Keep its action lock and ordinary-camera gates.
+    // D35K: slot-5 hinged door selects 116 at 0x800515e0. It is a
+    // committed ordinary-camera use action, not a scripted camera override.
+    // D35K2: native toilet use selects 275 at 0x80051630. Presentation
+    // only; retain the committed action and its original one-time effect.
+    // D35K3: LEVEL09 statue (type 926) selects 279 at 0x800516d4.
+    // Preserve native alignment, callback/effects and weapon restoration.
+    // D35K4: class-7 wheel turn (type 206) uses native pose 270.
+    // Retain its committed action and normal-camera ownership requirements.
+    return (a==116 || a==118 || a==266 || a==267 || a==268 || a==270 || a==275 || a==277 || a==279) &&
+        psx_mod_read_byte(player+0x22c)==0 && psx_mod_read_byte(player+0x22d)==0 &&
+        (psx_mod_read_word(player+0x224)&0x40);
+}
+static bool mirror_interaction_eye() {
+    return psx_mod_read_half(player+0x60)==278 &&
+        psx_mod_read_byte(player+0x22c)==0 && psx_mod_read_byte(player+0x22d)==0 &&
+        (psx_mod_read_word(player+0x224)&0x40);
+}
+static bool first_person_ladder();
+static bool first_person_pole();
+static bool first_person_mantle();
+static bool traversal_camera_early() { return mantle_state_early() || unowned_fall_early() || ladder_mount_early() || committed_move_early() || climb_state_early(); }
+static bool state(bool camera_only=false,bool presentation=false) {
+    // Menus suspend gameplay, not the authenticated world behind the menu.
+    // Only the presentation lease may ignore the guest pause/inventory word.
+    if(presentation) {
+        if(psx_mod_read_half(0x800bcbb0)!=1 || psx_mod_read_half(0x800d2540))return false;
+        // D42: the first-person death eye keeps the normal camera while Duke dies.
+        if(camera_only && death_eye_state())
+            return psx_mod_read_word(camera+0xa4)==player && psx_mod_read_word(player+0x7d4)==camera &&
+                !(psx_mod_read_word(player+0x224)&0x20000000u);
+    } else if(!gameplay_context())return false;
+    unsigned animation=psx_mod_read_half(player+0x60);
+    // Guarded idle/locomotion dispatch; wall bumps and this jump lease permit camera only.
+    // Death can retain state bytes 0/0 and the normal camera pointer.
+    const bool preparing=camera_only && (animation==96 || animation==97) && takeoff_owned();
+    const bool flight=camera_only && flight_valid && (animation==98 || animation==103 || animation==104 || animation==105 || animation==109 || (animation==108 && short_fall)) &&
+        flight_epoch==input_snapshot(Context::Gameplay).epoch;
+    // D08M: keep independent mouselook while swimming. Full swim motion uses a
+    // parallel lease (swim.inc); this only widens the camera-only gate.
+    const bool swimming=camera_only && in_water_early();
+    // Crystal-2 wade: original plays tank turns 70/71 in this water. Those used
+    // to fail state() and kill mouse/Shift. Waist-deep water keeps the land lease.
+    const bool wade_land=!camera_only && shallow_land_water_early() && (wade_land_anim(animation) ||
+        (grounded_water_modern() && (animation==80 || animation==81)) ||
+        original_step_anim(animation) || animation==86 || animation==87 || animation==92 || animation==93);
+    // D08Q: jetpack flight (mode 10) and the fall after it cuts out keep the
+    // camera-only lease, like swimming; the original handler owns the motion.
+    // D11F: the native off/fuel-out tick can clear the pack before replacing
+    // its flight pose. Retain only first-person presentation for that tick.
+    const bool jet_eye=presentation && camera_only && input_snapshot(Context::Gameplay).first_person &&
+        ((psx_mod_read_byte(player+0x22c)==10 && jetpack_anim(animation)) ||
+         (psx_mod_read_byte(player+0x22c)==9 && psx_mod_read_byte(player+0x22d)==10 && animation==108));
+    const bool jet=camera_only && (jetpack_flying_early() || jet_eye ||
+        (jet_fall_grace && animation==108 && (psx_mod_read_byte(player+0x22c)==9 || psx_mod_read_byte(player+0x22c)==10)));
+    // D11/D22B unowned jump: camera only; original takeoff, flight and landing.
+    const unsigned mode=psx_mod_read_byte(player+0x22c), previous=psx_mod_read_byte(player+0x22d);
+    // Rendering a known jump does not need a previous input lease (a save
+    // can start in midair). Action consumers retain jump_camera's continuity.
+    const bool eye_air=camera_only && (jump_camera || presentation) && jump_animation(animation) &&
+        (mode==0 || mode==9) && (previous==0 || previous==9);
+    // D08T grab/push/pull 119..121: mouse look only; the original owns motion.
+    const bool pushing=camera_only && push_state_early();
+    // D12A: an original boot request (112..115 before its initializer) in the
+    // eye view; the initializer hook turns it into the quick kick (kick.inc).
+    const bool eye_kick=camera_only && fp_blend>=0.5 && animation>=112 && animation<=115 &&
+        psx_mod_read_half(player+0x68)==0;
+    // D08V: mantles, hangs, pull-ups and unowned falls keep the mouse camera, and
+    // so does ordinary gait while the previous-mode byte still says mantle/fall
+    // (the first frames after a pull-up or landing).
+    const bool ladder_eye=presentation && camera_only && ladder_view()==ActionView::First &&
+        input_snapshot(Context::Gameplay).first_person && first_person_ladder();
+    const bool pole_eye=presentation && camera_only && pole_view()==ActionView::First &&
+        input_snapshot(Context::Gameplay).first_person && first_person_pole();
+    const bool mantle_eye=presentation && camera_only && mantle_view()==ActionView::First &&
+        input_snapshot(Context::Gameplay).first_person && first_person_mantle();
+    const bool wall_eye=presentation && camera_only && wall_view()==ActionView::First &&
+        input_snapshot(Context::Gameplay).first_person && first_person_wall();
+    // D10F2: in either view. Without the lease in third person, a door use
+    // (116) dropped the orbit and clear lens to the native camera for about
+    // 0.9 s, which swung out about 900 units into the wall behind Duke.
+    const bool transient_eye=presentation && camera_only &&
+        (idle_fidget_eye() || use_interaction_eye() || mirror_interaction_eye());
+    const bool mantle=camera_only && (traversal_camera_early() || ladder_eye || pole_eye || mantle_eye || wall_eye);
+    // D22B: also the landing poses themselves (an unleased landing frame left a
+    // jump taken from it without camera continuity) and after a slide.
+    const bool settle=camera_only && (land_gait_anim(animation) || original_step_anim(animation) ||
+        landing_pose_anim(animation) || (animation==105 && previous==10 && presentation &&
+        input_snapshot(Context::Gameplay).first_person)) && mode==0 && (previous==8 || previous==9 || previous==2 ||
+        (previous==10 && presentation && input_snapshot(Context::Gameplay).first_person));
+    const bool frozen_eye=presentation && camera_only &&
+        input_snapshot(Context::Gameplay).first_person && frozen_eye_state();
+    if ((psx_mod_read_word(player)&(frozen_eye?0x2u:0x20002u)) || !(land_gait_anim(animation) || original_step_anim(animation) || wade_land ||
+        (camera_only && (animation==70 || animation==71 || animation==80 || animation==81 || landing_pose_anim(animation) ||
+                         animation==175 || animation==176 || animation==177 || animation==181 ||
+                         (animation>=178 && animation<=184))) || preparing || flight || swimming || jet || eye_air || pushing || eye_kick || mantle || settle || transient_eye)) return false;
+    // D11E: original swim weapon transitions briefly set 0x200 (observed
+    // while holstering in 127). Keep the selected eye presentation through
+    // that transient, without widening movement/aim/capture permissions or
+    // the existing third-person policy. Death and special camera guards above
+    // still apply; the script inhibit bit 0x20000000 is never relaxed.
+    const bool swim_eye=presentation && camera_only && swimming && swimming_view()==ActionView::First &&
+        input_snapshot(Context::Gameplay).first_person &&
+        (mode==4 || mode==5) && animation>=122 && animation<=133;
+    // Native held inventory suspends actions, not the selected eye view.
+    // Limit the exception to the observed standing land state. Script and
+    // death/ownership guards remain, and state(false/true,false) is unchanged.
+    const bool inventory_eye=presentation && camera_only && input_snapshot(Context::Gameplay).first_person &&
+        animation==63 && mode==0 && previous==0;
+    const uint32_t inhibit=(shallow_land_water_early() || swim_eye || inventory_eye)?0x20000000u:0x20000200u;
+    return psx_mod_read_word(camera+0xa4)==player && psx_mod_read_word(player+0x7d4)==camera
+        && !(psx_mod_read_word(player+0x224)&inhibit)
+        && (swimming || wade_land || jet || eye_air || mantle || settle || ((flight || (preparing && animation==97)) ? ((psx_mod_read_byte(player+0x22c)==9 && (psx_mod_read_byte(player+0x22d)==9 || psx_mod_read_byte(player+0x22d)==0)) ||
+                      (psx_mod_read_byte(player+0x22c)==0 && psx_mod_read_byte(player+0x22d)==9))
+                   : psx_mod_read_byte(player+0x22c)==0 && psx_mod_read_byte(player+0x22d)==0));
+}
+static bool eligible(bool camera_only=false) {
+    return input_modernized() && input_snapshot(Context::Gameplay).active && state(camera_only);
+}
+static bool lease_ready(bool camera_only=false) {
+    const auto& f=input_snapshot(Context::Gameplay);
+    return eligible(camera_only) && camera_frame && f.epoch==camera_epoch &&
+        within_frame(f.sequence,camera_frame);
+}
+// Camera presentation is not permission to move, aim, fire or capture input.
+// It remains owned while the console/menu/focus suspends those actions.
+static bool camera_eligible() {
+    return input_modern_controls() && state(true,true);
+}
+static bool camera_lease_ready() {
+    // Capture epochs/freshness belong to actions. A pause may keep drawing
+    // this camera without another normal update; it still owns presentation.
+    return camera_eligible() && camera_frame && orbit_valid;
+}
+bool movement_ready() { return lease_ready() && identity(); }
+// D07E: why a shot missed the movement lease (diagnostics only).
+const char* movement_lease_miss() {
+    static char why[96];
+    const auto& f=input_snapshot(Context::Gameplay);
+    if(!input_modernized()) return "legacy";
+    if(!f.active) return "released";
+    if(!state()) {
+        std::snprintf(why,sizeof why,"state a=%u %u/%u f=%08x camera=%d",psx_mod_read_half(player+0x60),
+            psx_mod_read_byte(player+0x22c),psx_mod_read_byte(player+0x22d),psx_mod_read_word(player+0x224),state(true)?1:0);
+        return why;
+    }
+    if(!camera_frame) return "no-camera";
+    if(f.epoch!=camera_epoch) return "epoch";
+    if(!within_frame(f.sequence,camera_frame)) {
+        std::snprintf(why,sizeof why,"gap=%lld window=%u",(long long)(f.sequence-camera_frame),frame_window);return why;
+    }
+    return identity()?"ready":"identity";
+}
+// D08Y: the original run handler queued a jump for the coming edge (+0x228
+// bit 4, see the 0x800780b4 hook) and keeps it only while the jump button stays
+// held and Duke still runs (0x80055ea4). The modern jump is a press, so the host
+// holds the button for that queue (bounded by pc_input to a recent press).
+bool edge_jump_queued() {
+    const unsigned animation=psx_mod_read_half(player+0x60);
+    return (animation==76 || animation==78) && psx_mod_read_byte(player+0x22c)==0 &&
+        (psx_mod_read_word(player+0x228)&4u) && movement_ready();
+}
+// Preserve held locomotion intent through owned jumps and wall bumps so the original
+// landing selector can choose its running continuation instead of idle recovery.
+// This does not authorize movement/facing writes or air steering.
+// D08Q: jetpack flight and its cut-out fall are camera-only leases with their
+// own pad bridge (jetpack.inc / input_pad); they are not ground locomotion.
+static bool jetpack_camera_only() {
+    return jetpack_flying_early() || (jet_fall_grace && psx_mod_read_half(player+0x60)==108 && (psx_mod_read_byte(player+0x22c)==9 || psx_mod_read_byte(player+0x22c)==10));
+}
+bool locomotion_input_ready() { return lease_ready(true) && identity() && !jetpack_camera_only() && !push_state_early() && !traversal_camera_early(); }
+// D08V: the camera-only lease is live through a mantle/hang/pull-up or an
+// unowned fall. Input keeps the original directional buttons there.
+bool traversal_camera_ready() { return lease_ready(true) && identity() && traversal_camera_early(); }
+// D22B: rolls and slides are committed; feeding A/D (S) as the original strafe
+// (Down) pads at a roll's end started the original strafe 90/91 (back-step 84)
+// outside the lease.
+bool committed_camera_ready() { return traversal_camera_ready() && committed_move_early(); }
+bool directional_takeoff_ready() {
+    return takeoff_owned() && takeoff_direction && psx_mod_read_half(player+0x60)==96 && lease_ready(true) && identity();
+}
+bool short_fall_input_ready() { return short_fall && terrain_epoch==input_snapshot(Context::Gameplay).epoch && airborne_input_ready(); }
+bool airborne_input_ready() {
+    return lease_ready(true) && flight_valid && psx_mod_read_byte(player+0x22c)==9 && identity() && !jetpack_camera_only();
+}
+// D07F: a shot in the air (takeoff, owned or unowned jump and fall, the
+// landing frame) keeps the view aim. Only the camera-only lease is live there;
+// attached traversal, pushes and the jetpack keep their own owners.
+bool airborne_shot_ready() {
+    if(!lease_ready(true) || !identity() || jetpack_camera_only() || push_state_early() ||
+       mantle_state_early() || ladder_mount_early() || climb_state_early())return false;
+    const unsigned animation=psx_mod_read_half(player+0x60);
+    const unsigned mode=psx_mod_read_byte(player+0x22c), previous=psx_mod_read_byte(player+0x22d);
+    return mode==9 || (mode==0 && (previous==9 || animation==96 || animation==97));
+}
+bool player_identity_ready() { return input_modernized() && gameplay_context() && psx_mod_read_word(camera+0xa4)==player && psx_mod_read_word(player+0x7d4)==camera && identity(); }
+// The original attached-traversal dispatchers own motion, facing and camera.
+// Supply directional buttons only; never rotate their animation displacement.
+static bool traversal_state_ready() {
+    if(!input_modernized() || !gameplay_context() || psx_mod_read_byte(player+0x3b8)!=0 ||
+       (psx_mod_read_word(player)&0x20002) || (psx_mod_read_word(player+0x224)&0x20000000) ||
+       psx_mod_read_word(camera+0xa4)!=player || psx_mod_read_word(player+0x7d4)!=camera)return false;
+    unsigned mode=psx_mod_read_byte(player+0x22c), previous=psx_mod_read_byte(player+0x22d);
+    unsigned animation=psx_mod_read_half(player+0x60);
+    // Ladders need a settled mode; D08V mantles/hangs also accept their entry
+    // frames (previous mode ground, fall or hang).
+    bool attached=(mode==3 && mode==previous && ((animation>=147 && animation<=156) || (animation>=185 && animation<=211))) ||
+                  mantle_state_early();
+    return attached && identity();
+}
+bool traversal_input_ready() {
+    return input_snapshot(Context::Gameplay).active && traversal_state_ready();
+}
+bool interaction_alive() {
+    // Retain E-owned holster intent through pause/inventory/script suspension.
+    // This predicate grants no input or draw permission: restore_ready still
+    // requires active, settled normal gameplay. Death, frontend, foreign actor
+    // or overlay loss must cancel it.
+    return input_modernized() && psx_mod_read_half(0x800bcbb0)==1 &&
+        psx_mod_read_word(camera+0xa4)==player && psx_mod_read_word(player+0x7d4)==camera &&
+        !(psx_mod_read_word(player)&0x20002) && identity();
+}
+bool interaction_restore_ready() {
+    // Only normal, settled ownership can draw: never the attached/mount/exit
+    // states, an equipment transition, or an active upper-body interaction.
+    return movement_ready() && psx_mod_read_byte(player+0x3b8)==0 &&
+        !(psx_mod_read_word(player+0x224)&4) && psx_mod_read_half(player+0x74)==psx_mod_read_half(player+0x60);
+}
+// The game's tap-or-hold button (Circle by default: holster, draw, use) keeps
+// a per-frame press history; 0x80040584 sums the frame times of consecutive
+// presses and at 100 enters the hold-to-select inventory mode (+0x224 0x200),
+// which stops Duke until the button's release edge. The history word is
+// *(0x800d1a90 + 4 * player+0x233), the same one that routine reads. Bit 0 set:
+// the game's latest frame saw the button pressed.
+bool hold_button_sampled() {
+    const uint32_t index=psx_mod_read_byte(player+0x233);
+    if(index>=4)return false;
+    const uint32_t history=psx_mod_read_word(0x800d1a90+4*index);
+    if(history<0x80000000u || history>=0x80200000u)return false;
+    return (psx_mod_read_word(history)&1)!=0;
+}
+bool fire_draw_ready() {
+    // Flight uses the same native Circle draw as ground, only after its
+    // unarmed upper body has settled. Keep E restoration ground-only and
+    // reject flight equipment/action transitions just like weapon shortcuts.
+    // Boot (selected ID zero) retains its unarmed attack.
+    const bool flight=jetpack_input_ready() && psx_mod_read_byte(player+0x3b8)==0 &&
+        !(psx_mod_read_word(player+0x224)&0x2c5) &&
+        psx_mod_read_half(player+0x74)==psx_mod_read_half(player+0x60);
+    return (interaction_restore_ready() || flight) && psx_mod_read_byte(player+0x3ba)!=0;
+}
+bool interaction_holster_ready() {
+    unsigned upper=psx_mod_read_half(player+0x74);
+    // Do not spend the one-shot stow request inside a manual weapon switch,
+    // draw/reload or attack. The pending E lease waits for original stable idle.
+    return locomotion_input_ready() && psx_mod_read_byte(player+0x3b8)==2 &&
+        !(psx_mod_read_word(player+0x224)&4) &&
+        (upper==5 || upper==20 || upper==29 || upper==35 || upper==39);
+}
+bool interaction_climb_started() {
+    if(!player_identity_ready()) return false;
+    const unsigned mode=psx_mod_read_byte(player+0x22c);
+    // climb / mantle (134-140 run in 8), ledge hang, ladder, monkey bars
+    return mode==8 || mode==6 || mode==3 || mode==7;
+}
+bool weapon_drawn() {
+    return player_identity_ready() && psx_mod_read_byte(player+0x3b8)==2;
+}
+bool weapon_holstered() {
+    return player_identity_ready() && psx_mod_read_byte(player+0x3b8)==0;
+}
+bool interaction_ready() {
+    unsigned upper=psx_mod_read_half(player+0x74);
+    // Temporary equipment0 during a switch is not a completed E stow.
+    // Original557f8 uses this same upper-table bit to gate airborne reaching.
+    return (locomotion_input_ready() || traversal_input_ready()) && psx_mod_read_byte(player+0x3b8)==0 &&
+        !(psx_mod_read_word(player+0x224)&4) && upper<280 &&
+        !(psx_mod_read_word(0x800c2824+4*upper)&8);
+}
+static double view_yaw() {
+    if(free_look.active)return yaw;
+    return std::atan2((int16_t)psx_mod_read_half(camera+12),
+                      (int16_t)psx_mod_read_half(camera+16));
+}
+// The independent camera must opt in: the original camera retains original facing.
+static bool view_facing_input_ready(bool view_aim) {
+    const char* mode=ttk_live_env("DNTTK_WEAPON_AIM");
+    unsigned weapon=psx_mod_read_byte(player+0x3b9);
+    unsigned equipment=psx_mod_read_byte(player+0x3b8);
+    return independent_camera() && mode && !std::strcmp(mode,view_aim?"view":"original") &&
+        (equipment==0 || (equipment==2 && view_weapon_supported(weapon))) &&
+        (movement_ready() || locomotion_input_ready() || jetpack_input_ready() || swim_weapon_ready());
+}
+bool view_aim_input_ready() {return view_facing_input_ready(true);}
+static bool presentation_ready() {
+    return view_aim_input_ready() && !input_snapshot(Context::Gameplay).held[original_aim] &&
+        !(psx_mod_read_word(player+0x224)&0x80);
+}
+// D07E: `original` weapon aiming faces the camera too (camera-relative moves
+// never turn Duke, so his heading stayed where the level or save left it). The
+// shot, auto-aim and energy lock stay original and follow that heading; the arm
+// retargeting and view shots stay with `view`.
+static bool facing_ready() {
+    return (presentation_ready() || view_facing_input_ready(false)) &&
+        !input_snapshot(Context::Gameplay).held[original_aim] && !(psx_mod_read_word(player+0x224)&0x80);
+}
+#include "shortcuts.inc"
+#include "steroids.inc"
+#include "steroids_beat.inc"
+#include "console_idle.inc"
+#include "run_click.inc"
+#include "pickup_select.inc"
+#include "crouch.inc"
+#include "crouch_hull.inc"
+#include "manual_jump.inc"
+#include "terrain.inc"
+#include "cheats.inc"
+#include "damage_flash.inc"
+#include "pickup_flash.inc"
+#include "apartment_interaction.inc"
+#include "push.inc"
+#include "ladder_top.inc"
+#include "pole_climb.inc"
+#include "wall_climb.inc"
+#include "climb_fire.inc"
+#include "door_use.inc"
+#include "jump_walls.inc"
+#include "landing.inc"
+#include "wall_backflip.inc"
+#include "dynamite.inc"
+#include "ledge_reach.inc"
+#include "sidearm_mantle.inc"
+#include "ceiling_hang.inc"
+#include "weapon_pose_guard.inc"
+#include "widescreen.inc"
+#include "gadget_hud.inc"
+#include "ammo_hud.inc"
+#include "dynamic_lights.inc"
+#include "muzzle_settle.inc"
+#include "draw_distance.inc"
+#include "enemy_reach.inc"
+#include "sleeping_enemies.inc"
+#include "spawn.inc"
+#include "pickup_nudge.inc"
+#include "level_lights.inc"
+static void face_view() {
+    // Game yaw: +Z=0, +X=1024. Do not copy view pitch into the body's Euler angles.
+    int heading=static_cast<int>(std::lround(view_yaw()*4096/tau)) & 4095;
+    psx_mod_write_half(player+0x1c,heading);
+    psx_mod_write_half(player+0x24,heading);
+    ++facings;
+}
+#include "duke_model.inc"
+#include "crouch_walk.inc"
+#include "onehand_pullup.inc"
+#include "crouch_landing.inc"
+#include "swim.inc"
+#include "climb_aim.inc"
+#include "grounded_water.inc"
+#include "jetpack.inc"
+#include "first_person.inc"
+#include "clear_lens.inc"
+#include "kick.inc"
+#include "tp_kick.inc"
+#include "weapon_feel.inc"
+#include "pole_visibility.inc"
+#include "earthquake.inc"
+
+static void hook_body(CPUState* cpu, uint32_t address);
+// Frame diagnostics (DNTTK_FRAME_TRACE=1): wall time between player updates
+// (one game logic frame) and the CPU time spent in these hooks during it, with
+// the costliest hook addresses, for frames over 25 ms or with over 3 ms of hooks.
+// D08Y: the runtime CPU overclock (PSX_CPU_OVERCLOCK) is leased from the
+// player update (gameplay in a level, Modernized); it lapses on its own a few
+// fields after the updates stop (boot, menus, movies, loading).
+extern "C" void psx_overclock_renew(void);
+// D23F: the optional fast CPU timing (fast_timing.c) is leased the same way.
+extern "C" void ttk_fast_timing_renew(void);
+// Safety net: if emulation falls behind real time while overclocked (under 57
+// host frames per second over a second), pause the lease for five seconds so
+// the overclock can never be what starves audio. Logged once per pause.
+// D23E/D23H: each second goes to replay_load_window (frame_replay.cpp), which
+// sheds high-refresh presents on a sustained deficit and steps back up when
+// emulation keeps up; the lease pauses only when nothing is left to shed.
+// Seconds that span a gap (menus, loads: 3 s or more between player updates)
+// and seconds while the overclock is paused are not judged. D17AR3 part 4:
+// nor are the 3 s after a savestate load (its catch-up is not the scene's
+// cost; judged, it halved high-refresh presents after loads).
+// D17AQ: the audio ring is the one deficit the player hears. Once it has
+// filled since the last load or gap, or 0.5 s after it (a scene too slow to
+// refill the ring after a load never fills it; a healthy one refills in
+// about 0.2 s), a fall under a third of its target sheds a present step at once
+// (replay_audio_low), the settle window included; a further step waits
+// 0.75 s and needs the ring still falling (5 ms lower than at the last; a
+// game keeping up at 60 holds the ring level, it does not refill it).
+extern "C" int psx_audio_out_stats(double* fill_ms,double* target_ms,uint64_t* underruns,uint64_t* overflow_drops,double* correction,int* legacy,int* host_rate);
+extern "C" void gl_renderer_replay_diag(uint64_t* presents,uint64_t* replays,uint64_t* misses,double* target_hz,uint64_t hist[8]);
+// D50 hitch log: one session-log line for each gameplay second that went
+// wrong, so a slowdown the player feels can be read afterwards: the game
+// under 58 frames/s, late presents (1.4x the second's mean interval or more:
+// 8 ms and over at 180 presents a second), a missed redraw, an audio underrun or the audio ring falling 40
+// ms or more. Presents bucketed as the GL renderer counts them (<2, <4, <5,
+// <6, <8, <12, <20, >=20 ms). Healthy seconds log nothing; at most 300
+// lines a session. Modernized only (the lease runs only there).
+static double hitch_fill_min=1e9,hitch_fill_start=-1;
+static void hitch_sample_fill(double fill) {if(hitch_fill_start<0)hitch_fill_start=fill;hitch_fill_min=std::min(hitch_fill_min,fill);}
+extern uint64_t ro_drops_total();
+static void hitch_second(double rate,double dt,bool unjudged) {
+    static uint64_t last_p,last_m,last_h[8],last_ur,last_ro;static bool primed;static unsigned lines;
+    const uint64_t ro=ro_drops_total(),dro=ro-last_ro;last_ro=ro;
+    uint64_t p=0,r=0,m=0,h[8]{};double hz=0;gl_renderer_replay_diag(&p,&r,&m,&hz,h);
+    double fill=0,target=0,corr=0;uint64_t ur=0,od=0;int legacy=1,host=0;
+    const bool audio=psx_audio_out_stats(&fill,&target,&ur,&od,&corr,&legacy,&host) && !legacy && target>0;
+    const double fill_start=hitch_fill_start,fill_min=std::min(hitch_fill_min,audio?fill:1e9);
+    hitch_fill_start=audio?fill:-1;hitch_fill_min=1e9;
+    if(!primed) {primed=true;last_p=p;last_m=m;std::copy(h,h+8,last_h);last_ur=ur;return;}
+    uint64_t d[8];for(int i=0;i<8;++i)d[i]=h[i]-last_h[i];
+    const uint64_t dp=p-last_p,dm=m-last_m,dur=ur-last_ur;
+    last_p=p;last_m=m;std::copy(h,h+8,last_h);last_ur=ur;
+    if(unjudged || lines>=300) return;
+    // Late: a bucket starting at 1.4x the second's mean present interval or
+    // more (so a governed rate of every 2nd or 3rd refresh is not "late").
+    static constexpr double lo[8]={0,2,4,5,6,8,12,20};
+    const double mean=dp?1000.0*dt/dp:1000.0;
+    uint64_t late=0;for(int i=0;i<8;++i) if(lo[i]>=1.4*mean) late+=d[i];
+    const bool fell=audio && fill_start>=0 && fill_start-fill_min>=40;
+    if(rate>=58 && late<3 && !dm && !dur && !fell && !dro) return;
+    ++lines;
+    std::fprintf(stderr,"[TTK hitch] game %.1f/s, presents %.0f/s, late %llu (presents 8-12 ms %llu, 12-20 %llu, 20+ %llu), missed %llu, audio %.0f->%.0f (min %.0f) ms, underruns %llu, redraw-only off %llu, weapon %u, lights %u, view %s, Duke %d %d %d\n",
+        rate,dp/dt,(unsigned long long)late,(unsigned long long)d[5],(unsigned long long)d[6],(unsigned long long)d[7],(unsigned long long)dm,
+        fill_start,audio?fill:0.0,fill_min>=1e9?0.0:fill_min,(unsigned long long)dur,(unsigned long long)dro,(unsigned)psx_mod_read_byte(player+0x3b9),light_view.n,
+        first_person_view_live()?"first":"third",(int32_t)psx_mod_read_word(player+4),(int32_t)psx_mod_read_word(player+8),(int32_t)psx_mod_read_word(player+12));
+}
+static void overclock_lease() {
+    using clk=std::chrono::steady_clock;
+    static clk::time_point window_start,paused_until,settle_until,last_call,audio_quiet_until,audio_arm_at;static uint64_t window_frame;static unsigned pauses;
+    static bool audio_filled;static double audio_shed_fill;
+    static clk::time_point low_seen_at;static double low_seen_fill;static uint64_t low_underruns;static unsigned steady_notes;  // D50
+    static uint32_t loads_seen=psx_mod_savestate_loads();
+    const auto now=clk::now();const uint64_t frame=input_host_frame();
+    if(psx_mod_savestate_loads()!=loads_seen) {loads_seen=psx_mod_savestate_loads();settle_until=now+std::chrono::seconds(3);audio_filled=false;audio_arm_at=now+std::chrono::milliseconds(500);audio_shed_fill=1e9;}
+    if(now-last_call>std::chrono::milliseconds(500)) {audio_filled=false;audio_arm_at=now+std::chrono::milliseconds(500);audio_shed_fill=1e9;}  // menu, pause, level load: the ring refills
+    last_call=now;
+    double fill=0,target=0,correction=0;uint64_t underruns=0,drops=0;int legacy=1,host_rate=0;
+    if(psx_audio_out_stats(&fill,&target,&underruns,&drops,&correction,&legacy,&host_rate) && !legacy && target>0) {
+        hitch_sample_fill(fill);
+        // D50: a ring that is low but steady is not the game falling behind
+        // (the output's rate correction, at most 0.5%, refills it slowly; a
+        // game keeping up at 60 holds the level), so shedding presents cannot
+        // help it. Shed only on a drain: under a third of the target and at
+        // least 30 ms lower than 0.4-1.5 s before (a game short of real time
+        // drains 100+ ms a second), or an underrun while low. Player logs,
+        // 2026-11-08: four of five sessions shed to 90 presents at 180 Hz a
+        // few seconds after loading with the ring at 38-59 ms and no second
+        // behind real time.
+        if(fill>=target/3) low_seen_at=clk::time_point{};
+        bool draining=false;
+        if(fill<target/3) {
+            const double since=low_seen_at.time_since_epoch().count() ? std::chrono::duration<double>(now-low_seen_at).count() : 9.0;
+            if(since>1.5) {low_seen_at=now;low_seen_fill=fill;low_underruns=underruns;}
+            else if(since>=0.4) {
+                draining=low_seen_fill-fill>=30.0 || underruns>low_underruns;
+                if(!draining) {
+                    if(++steady_notes<=5)std::fprintf(stderr,"[TTK cpu] audio ring low but steady (%.0f of %.0f ms, was %.0f): no present shed\n",fill,target,low_seen_fill);
+                    low_seen_at=now;low_seen_fill=fill;low_underruns=underruns;
+                }
+            }
+        }
+        if(fill>=target*0.9) {audio_filled=true;audio_shed_fill=target;}
+        else if((audio_filled || now>=audio_arm_at) && fill<target/3 && draining && now>=audio_quiet_until && fill<audio_shed_fill-5 && replay_audio_low()>0) {
+            low_seen_at=now;low_seen_fill=fill;low_underruns=underruns;
+            audio_quiet_until=now+std::chrono::milliseconds(750);audio_shed_fill=fill;
+            settle_until=now;window_start=now;window_frame=frame;
+            if(++pauses<=20)std::fprintf(stderr,"[TTK cpu] audio running low (%.0f of %.0f ms): high-refresh presents reduced\n",fill,target);
+        }
+    }
+    if(window_start.time_since_epoch().count()==0 || frame<window_frame) {window_start=now;window_frame=frame;}
+    const double dt=std::chrono::duration<double>(now-window_start).count();
+    if(dt>=1.0) {
+        const double rate=(frame-window_frame)/dt;
+        hitch_second(rate,dt,now<settle_until || now<paused_until || dt>=3.0);
+        const int verdict=replay_load_window(dt>=3.0 || now<paused_until || now<settle_until ? 2 : rate<57.0 ? 1 : 0);
+        if(verdict>0) {
+            if(++pauses<=20)std::fprintf(stderr,"[TTK cpu] emulation behind real time (%.1f frames/s): high-refresh presents reduced\n",rate);
+        } else if(verdict<0) {
+            paused_until=now+std::chrono::seconds(5);
+            if(++pauses<=20)std::fprintf(stderr,"[TTK cpu] emulation behind real time (%.1f frames/s): CPU overclock paused 5 s\n",rate);
+        }
+        window_start=now;window_frame=frame;
+    }
+    if(now>=paused_until)psx_overclock_renew();
+}
+static long frame_us;static std::map<uint32_t,long> frame_per;
+bool frame_trace_on() {static const bool on=std::getenv("DNTTK_FRAME_TRACE")!=nullptr;return on;}
+void frame_trace_account(uint32_t address,long us) {frame_us+=us;frame_per[address]+=us;}
+// D08Q10 diagnostics (DNTTK_SOUND_TRACE): every 8006bbd8 / 8006b270 sound
+// request with its caller and Duke's mode, pose and height.
+static void d08q10_sound_trace(CPUState* cpu,uint32_t address) {
+    static const bool on=std::getenv("DNTTK_SOUND_TRACE")!=nullptr;
+    if(on)std::fprintf(stderr,"ttk-sound %08x id=%04x ra=%08x mode=%u anim=%u y=%d\n",address,cpu->gpr[4],cpu->gpr[31],
+        psx_mod_read_byte(player+0x22c),psx_mod_read_half(player+0x60),(int32_t)psx_mod_read_word(player+8));
+}
+static void hook(CPUState* cpu, uint32_t address) {
+    const bool update=address==0x8005a210 && cpu->gpr[4]==player;
+    if(update && input_modernized() && psx_mod_read_word(0x800c27bc)==1) {overclock_lease();ttk_fast_timing_renew();}
+    const bool trace=frame_trace_on();
+    if(!trace) {hook_body(cpu,address);grounded_water_query(cpu,address);return;}
+    using clk=std::chrono::steady_clock;
+    static clk::time_point last_update;
+    if(update) {
+        const auto now=clk::now();
+        if(last_update.time_since_epoch().count()) {
+            const long wall=(long)std::chrono::duration_cast<std::chrono::microseconds>(now-last_update).count();
+            static const long min_wall=std::getenv("DNTTK_FRAME_TRACE_MS")?std::atol(std::getenv("DNTTK_FRAME_TRACE_MS"))*1000:25000;
+            if(wall>min_wall || frame_us>3000) {
+                std::fprintf(stderr,"frame-trace wall=%ld hooks=%ld anim=%u mode=%u",wall,frame_us,psx_mod_read_half(player+0x60),psx_mod_read_byte(player+0x22c));
+                std::vector<std::pair<long,uint32_t>> top;for(auto& kv:frame_per)top.push_back({kv.second,kv.first});
+                std::sort(top.rbegin(),top.rend());
+                for(size_t i=0;i<top.size() && i<4;++i)std::fprintf(stderr," %08x=%ld",top[i].second,top[i].first);
+                std::fputc('\n',stderr);
+            }
+        }
+        last_update=now;frame_us=0;frame_per.clear();
+    }
+    const auto t0=clk::now();hook_body(cpu,address);grounded_water_query(cpu,address);
+    const long us=(long)std::chrono::duration_cast<std::chrono::microseconds>(clk::now()-t0).count();
+    frame_trace_account(address,us);
+}
+
+// Host-owned pointers and smoothing describe one guest world only. A load
+// may resume midway through drawing, before the next normal-camera callback.
+// Discard old draw tokens without writing them into the newly loaded RAM;
+// first_person_draw reclaims any hidden flags stored in the save itself.
+static bool piano_use_held;
+static void camera_world_reset() {
+    piano_audio_reset();
+    piano_use_held=input_snapshot(Context::Gameplay).held[interact];
+    free_look={};free_look_cancelled=false;
+    wall_last_direction=0;wall_epoch=0;
+    pole_visibility_object=0;
+    jet_lift_active=false;jet_air_height_hold=false;
+    if(jetpack_eduke32()) {
+        jet_fuel_pending=false;jet_fuel_frame=0;jet_fuel_fraction=0;jet_fuel_expected=-1;
+        jet_flight_live=false;jet_hold_valid=false;jet_was_flying=false;jet_fall_grace=false;
+    }
+    push_manual_object=0;push_sound_distance=0;push_blocked_pad=0;
+    tight_distance=6144;tight_hold_until=0;tight_compressed=false;
+    orbit_valid=false;look.reset();camera_frame=0;fp_frame=0;walking=false;
+    fp_blend=0;PerspectiveFacts reset{};reset.selected=input_snapshot(Context::Gameplay).first_person;
+    reset.denial=PerspectiveReason::WorldChange;fp_policy=resolve_perspective(reset);
+    limb_scope_forget();
+    head_flag=backpack_flag=0;min_boom_written=false;fade_save.active=false;third_body_drawing=false;mirror_duke_drawing=false;
+    eye_offset_valid=false;eye_rel_valid=false;bob_last_valid=false;bob_frame=0;
+    jump_camera=false;flight_valid=false;takeoff_valid=false;
+}
+static void hook_body(CPUState* cpu, uint32_t address) {
+    static uint32_t loads_seen=psx_mod_savestate_loads();
+    const uint32_t loads=psx_mod_savestate_loads();
+    if(loads!=loads_seen) {
+        // D08G8: a load's longjmp can abandon a host guest call
+        // (original_call and friends) mid-flight; that call never clears
+        // guest_busy, which would refuse every later one.
+        loads_seen=loads;camera_world_reset();input_state_loaded();guest_busy=false;
+    }
+    // D08S pause/menus can keep fields advancing without a player update.
+    // Do not charge that gap when normal flight resumes.
+    if(jetpack_eduke32() && !gameplay_context())jet_fuel_frame=0;
+    // D44A: the steady camera is back before the camera update (normally
+    // already at the composition's end).
+    if(address==0x8003ade4) replay_quake_restore();
+    grounded_water_restore();
+    crouch_water_restore(); // D08K11: scoped native crouch water veto, also after loads/Vanilla.
+    // D08A13: running steroids hidden from Duke's damage handler come back at
+    // the first hook after it.
+    steroids_damage_restore();
+    // D08O1: hidden fire comes back at the next player-update step, an
+    // animation start or the camera update, whichever runs first. Routines
+    // the swim handler calls before its fire test (0x80076330) must not.
+    if(address==0x80055e80 || address==0x800493a4 || address==0x8003ade4) swim_fire_restore(address);
+    // D08O2A: the swim arm aim lives only inside Duke's model build.
+    if(address==0x80055e80 || address==0x800493a4 || address==0x8003ade4 ||
+       address==0x800455bc || address==0x800411b8) {swim_aim_restore();climb_aim_return();climb_aim_set=false;}
+    // D08A8: steroids hidden from the status bar's armour element come back
+    // after it, whatever the mode is by then.
+    if(address==0x8001fc44 || address==0x800b4d9c) steroids_hud_restore();
+    if (!input_modernized()) return;
+    steroids_death_clear(); // D08A14
+    dynamite_track(); // D08A12
+    const auto& f=input_snapshot(Context::Gameplay);
+    if((address==0x8005a210 || address==0x800493a4) && cpu->gpr[4]==player && !f.held[interact])
+        piano_use_held=false;
+    uint32_t ra=cpu->gpr[31], sp=cpu->gpr[29];
+    if (sp<0x80010100 || sp>0x801ffff0 || (sp&3)) {head_restore();return;}
+    if(address==0x8006276c || address==0x80062b48 || address==0x8002ffec) {draw_distance_apply(cpu,address,ra);if(address==0x8002ffec) pole_visibility_draw(cpu,ra);return;}
+    if(address==0x80076330) {apartment_switch_query(cpu);mirror_use_query(cpu);return;}
+    if(address==0x80081a48) {pickup_flash_begin();pickup_select_begin(cpu);steroids_pickup(cpu);apartment_pickup(cpu);return;}
+    if(address==0x80051cf0) {sidearm_obstacle_action(cpu,ra);push_obstacle_action(cpu,ra);return;}
+    if(address==0x80051890) {push_idle_action(cpu,ra);door_click_action(cpu,ra);return;}
+    if(address==0x800455bc) {
+        swim_plunge_begin(cpu);
+        // D08O1: the ground weapon-selection point (0x80058120) is not reached
+        // in the original swim states; their handler entry takes its place.
+        if(cpu->gpr[4]==player && ra==0x8004b5bc && swim_weapon_ready()) select_weapon(cpu);
+        swim_fire_hide(cpu,ra);
+        return;
+    }
+    if(address==0x80055e80) {jet_cutout_prestate(cpu,ra);crouch_landing_finish(cpu,ra);grounded_water_transition(cpu,ra);return;}
+    if(address==0x800411b8) {crouch_walk_pose(cpu);tp_kick_pose(cpu);onehand_pullup_pose(cpu);swim_aim_begin(cpu,ra);climb_aim_begin(cpu,ra);return;}
+    if(address==0x8002b9f4) {
+        // The original level teardown destroys these records. Forget host
+        // ownership before their addresses can be reused by another scene.
+        bool reset_caller=false;
+        for(uint32_t r:{0x8001b510u,0x8001b8a0u,0x800222a8u,0x80025474u,0x800270d0u,0x80028594u})reset_caller|=ra==r;
+        if(cpu->gpr[4]==1 && reset_caller && psx_mod_read_word(ra-8)==0x0c00ae7d) {
+            camera_world_reset(); // also a same-level restart/new game, not just a new overlay
+            hidden_enemies.clear();monsters_hidden=false;hidden_table=hidden_count=0;
+        }
+        return;
+    }
+    if (address==0x800493a4) {
+        // D38: native use selector 800515d0 selects pose 277 for class 2.
+        // Current LEVEL01 piano is type 102, actor kind 16. The initializer
+        // is reached only after native contact/alignment and committed use.
+        // Observe it without changing animation, callback, or equipment state.
+        const uint32_t piano=psx_mod_read_word(player+0x290);
+        if(cpu->gpr[4]==player && ra==0x8005a3a0 &&
+           psx_mod_read_half(player+0x60)==277 && psx_mod_read_half(player+0x68)==0 &&
+           psx_mod_read_byte(player+0x22c)==0 && psx_mod_read_byte(player+0x22d)==0 &&
+           psx_mod_read_byte(player+0x3b8)==0 && (psx_mod_read_word(player+0x224)&0x40) &&
+           piano>=0x800e0000 && piano<=0x801fff80 && !(piano&3) &&
+           psx_mod_read_half(piano+0x2c)==102 && psx_mod_read_byte(piano+0x19)==16 &&
+           player_identity_ready() && identity_tag==4 && !piano_use_held) {
+            piano_use_held=f.held[interact];
+            piano_sound(int32_t(psx_mod_read_word(piano+4)),
+                        int32_t(psx_mod_read_word(piano+8)),int32_t(psx_mod_read_word(piano+12)));
+        }
+        if(std::getenv("DNTTK_TRAVERSAL_TRACE") && cpu->gpr[4]==player && psx_mod_read_half(player+0x60)==96)
+            std::fprintf(stderr,"ttk-standing ra=%08x track=%u active=%d dir=%.2f/%.2f frame=%llu/%llu epoch=%llu/%llu state=%u/%u flags=%08x player=%08x identity=%d aim=%d crouch=%d\n",ra,psx_mod_read_half(player+0x68),f.active,f.move_x,f.move_y,(unsigned long long)f.sequence,(unsigned long long)camera_frame,(unsigned long long)f.epoch,(unsigned long long)camera_epoch,psx_mod_read_byte(player+0x22c),psx_mod_read_byte(player+0x22d),psx_mod_read_word(player+0x224),psx_mod_read_word(player),player_identity_ready(),f.held[original_aim],f.held[crouch]);
+        if(cpu->gpr[4]==player && (ra==0x8005a3a0 || ra==0x8005a4d0 || ra==0x8005a490 || ra==0x8005a520 || ra==0x8005a548))
+            grounded_water_gait();
+        crouch_landing_start(cpu,ra);
+        kick_convert(cpu,ra);
+        tp_kick_convert(cpu,ra);
+        // Original lower-body initializer, after the game accepted jump from
+        // normal ground. Keep its 96 preparation and clearance choice intact.
+        // D08Z7: a held jump can land and take off again in one update, so
+        // the last camera sample is still the live jump camera, not ground.
+        const bool landed_ground=jump_camera && camera_frame && camera_epoch==f.epoch &&
+            within_frame(f.sequence,camera_frame);
+        if(cpu->gpr[4]!=player || (ra!=0x8005a3a0 && ra!=0x8005a4d0) || psx_mod_read_half(player+0x60)!=96 ||
+           psx_mod_read_half(player+0x68)!=0 || !f.active || !independent_camera() ||
+           !(landed_ground || (ground_frame && ground_epoch==f.epoch && within_frame(f.sequence,ground_frame))) ||
+           !player_identity_ready() || (psx_mod_read_word(player)&0x20002) ||
+           psx_mod_read_byte(player+0x22c)!=0 ||
+           (psx_mod_read_byte(player+0x22d)!=0 && !(landed_ground && psx_mod_read_byte(player+0x22d)==9)) ||
+           (psx_mod_read_word(player+0x224)&0x202002c1) || f.held[crouch] || f.held[original_aim])return;
+        if(takeoff_owned())return;
+        takeoff_intent=movement(view_yaw(),f.move_x,f.move_y);
+        takeoff_epoch=f.epoch;takeoff_frame=f.sequence;takeoff_valid=true;takeoff_obstacle=false;takeoff_direction=f.move_x || f.move_y;
+        if(takeoff_direction)++standing_takeoffs;
+    } else if (address==0x8005a210) {
+        if(cpu->gpr[4]==player && cpu->gpr[5]==0x800c2754 && ra==0x80041b34) {
+            push_manual_prepare(cpu);
+            // Attached cameras remain original-owned. Resume capture through
+            // the authenticated player update, without needing an active input
+            // frame or a normal locomotion camera to bootstrap it.
+            // Escape sets initial_capture and releases. Recapture must not wait
+            // for 0x8003ade4 (absent on alternate camera) or for walk-only
+            // state() (anim 70/71 in the turret wade are turns, not gaits).
+            if(input_wants_initial_capture() && gameplay_context() && identity())
+                input_offer_gameplay_capture();
+            if(shallow_land_water() && f.active && !f.held[original_aim] && identity())
+                face_view();
+            trav_aim_flag_clear(); // D08J8D: the build's fire-request bit, before the game reads it
+            weapon_update_sp=sp;weapon_transition_boost=false;quick_takeoff_boost=false;
+            cheats_update(cpu);
+            spawn_update(cpu);
+            pickup_nudge_update(cpu); // D08A41
+            level_lamps_update(cpu); // D41D
+            steroids_beat(cpu); // D08A10
+            console_idle_hold(); // D26K
+            weapon_feel_update(f.held[fire] && !switch_fire_masked()); // D10H4
+            grounded_water_gait();
+            terrain_update(cpu);
+            crouch_landing_track(cpu);
+            stance_request(cpu);
+            crouch_hull_update(cpu); // D08K2
+            crouch_walk_update(cpu); // D08K4
+            swim_update(cpu,false);
+            jetpack_update(cpu);
+            ladder_top_update(cpu);
+            pole_climb_update();
+            ladder_leap_update();
+            jump_walls_update(); // D08Z1, before the ledge helpers read it
+            ledge_reach_mantle(cpu);
+            ledge_reach_retry(cpu);
+            ledge_step_up(cpu);
+            mantle_glide();
+            mantle_upper_restore(); // D08Z2
+            ledge_hang_settle();
+            hang_fire_update(); // D08J7A; D08J7C: its armed pull-up handoff feeds the retry
+            ledge_pullup_retry(cpu); // D08T8
+            object_hang_update();
+            ceiling_hang_update();
+            climb_turn_update(cpu); // D08J6E
+            mantle_fire_update(); // D08J7B; D08J8 traversal draw
+            door_use_update(cpu); // D08J9
+            sidearm_mantle_update(cpu); // D08Z8
+            weapon_pose_guard(); // stuck-weapon backstop
+            unsigned animation=psx_mod_read_half(player+0x60);
+            // Space may precede direction. An authenticated neutral preparation
+            // keeps its input/camera lease, but supplies no Forward until the
+            // first direction arrives. Never reset the original animation timer.
+            if(animation==96 && takeoff_owned() && !takeoff_direction &&
+               (f.move_x || f.move_y) && locomotion_input_ready() &&
+               !(psx_mod_read_word(player+0x224)&0x202002c1) &&
+               !f.held[crouch] && !f.held[original_aim]) {
+                takeoff_intent=movement(view_yaw(),f.move_x,f.move_y);
+                takeoff_direction=true;++standing_takeoffs;
+            }
+            // Walking's 53404 handler has no jump branch. Start the same
+            // original 96 preparation on a fresh buffered press, before the
+            // original animation initializer/events. Running selection stays original.
+            const unsigned jet=psx_mod_read_half(player+0x358);
+            const bool thrust=(jet&3)==3 && (int16_t)psx_mod_read_half(player+0x35a)>=
+                (int32_t)psx_mod_read_word(0x800d21fc);
+            // D08Z6: a wall ends the run in 94/95 for about 20 fields.
+            // That exceeds the jump buffer, so a press just after contact
+            // used to vanish before idle. A fresh grounded manual-run press
+            // may enter the same preparation now, using the camera-only
+            // stop lease. Do not interrupt landings or other committed moves.
+            const bool stopped_run=(animation==94 || animation==95) && manual_jump() &&
+                input_running() && psx_mod_read_byte(player+0x22c)==0 &&
+                psx_mod_read_byte(player+0x22d)==0 && !psx_mod_read_word(player+0x20c) &&
+                lease_ready(true) && identity();
+            if((((animation==63 || (animation>=72 && animation<=75)) && movement_ready()) || stopped_run) &&
+               independent_camera() && (f.move_x || f.move_y) &&
+               !(psx_mod_read_word(player+0x224)&0x202002c1) && !thrust &&
+               !f.held[crouch] && !f.held[original_aim] && input_take_jump()) {
+                // Neutral jumps use the original idle handler on dry and Modern water ground.
+                takeoff_intent=movement(view_yaw(),f.move_x,f.move_y);
+                takeoff_epoch=f.epoch;takeoff_frame=f.sequence;takeoff_valid=true;takeoff_obstacle=false;takeoff_direction=true;++standing_takeoffs;
+                psx_mod_write_half(player+0x60,96);psx_mod_write_half(player+0x68,0);psx_mod_write_half(player+0x6a,0);
+            }
+        }
+    } else if(address==0x80059db0) {
+        stance_advance(cpu);
+        manual_quick_takeoff(cpu,ra);
+        pullup_advance(cpu,ra); // D08J7B
+        // Only original upper-body equip/stow tracks, with their normal event
+        // runner intact. Consume the extra time once per player update: the
+        // original runner may call back repeatedly with a remaining delta.
+        const unsigned upper=psx_mod_read_half(player+0x74);
+        const bool transition=upper==6 || upper==7 || upper==13 || upper==21 ||
+            upper==22 || upper==30 || upper==31 || upper==36 || upper==40;
+        // E-owned stow must finish before original reach (upper-table bit8).
+        // Boost on the ground as well as in flight so armed run→jump→E can
+        // clear the weapon before contact and feel like the holstered grab.
+        const bool e_stow=input_auto_stow_pending() &&
+            (airborne_input_ready() || movement_ready() || locomotion_input_ready());
+        // Two-handed stow finishes through original generic blend0/1 AFTER
+        // equipment becomes zero. Its table bit8 still blocks the reach at558a0.
+        // Keep the E-owned budget through that tail; never skip its events.
+        const bool stow_tail=e_stow && psx_mod_read_byte(player+0x3b8)==0 && (upper==0 || upper==1);
+        // D08J6A: on a climb the sidearm's draw and stow run 2x and, once
+        // fire is let go, its one-arm aim lowering (8/9/11) 4x, so stop,
+        // draw, fire and climb on feel quick. Held fire keeps the original rate.
+        const bool climb_lowering=climb_weapon_ready() && !f.held[fire] && (upper==8 || upper==9 || upper==11);
+        // D08J7B: the queued draw on landing after a mantle runs 2x too,
+        // with the generic blend (0/1) a two-handed draw starts with.
+        // D08J8: the sidearm drawn inside a climb over a lip comes out 4x.
+        const bool trav_draw=trav_drawn && transition && trav_weapon_ready();
+        const bool climb=climb_lowering || trav_draw || (climb_weapon_ready() && (transition || upper==3 || upper==0)) ||
+            (mantle_draw_boost && (transition || upper==0 || upper==1));
+        // D08A36: a switch in a jump or fall runs 2x, with the generic blend
+        // (0/1) between stow and draw (the D08J7B rule), so the new weapon is
+        // ready while Duke is still in the air (1x took the whole jump).
+        const bool air_switch=airborne_shot_ready() && !roll_state_early() && (transition ||
+            ((upper==0 || upper==1) && psx_mod_read_byte(player+0x3b8)==0 && psx_mod_read_byte(player+0x3ba)!=0));
+        if(!weapon_transition_boost && (transition || stow_tail || climb || air_switch) && (movement_ready() || e_stow || climb || air_switch) &&
+           cpu->gpr[4]==player+0x74 && cpu->gpr[5]==player && ra==0x8005a5a8 &&
+           cpu->gpr[7]==1 && cpu->gpr[6]==weapon_update_sp-0x2e) {
+            int delta=(int16_t)psx_mod_read_half(cpu->gpr[6]);
+            if(delta>0 && delta<=4096) {
+                // 4x finishes E stow inside the flight window without skipping
+                // original upper events (8x left upper stuck on jump poses).
+                psx_mod_write_half(cpu->gpr[6],e_stow || climb_lowering || trav_draw?delta*4:climb || air_switch?delta*2:delta+delta/2);weapon_transition_boost=true;
+            }
+        }
+        // D08J8D: held fire in the mantles 134-139 puts the fire track on the gun arm.
+        if(!weapon_transition_boost && cpu->gpr[4]==player+0x74 && cpu->gpr[5]==player && ra==0x8005a5a8 &&
+           cpu->gpr[7]==1 && cpu->gpr[6]==weapon_update_sp-0x2e)
+            trav_fire_drive(upper,f.held[fire] && !f.held[holster] && !switch_fire_masked());
+        // D10H4: WEAPON FEEL RETRO runs a press's raise and fire track
+        // faster until its round leaves; D10H6 paces held fire to EDuke32's
+        // tics. The original runs every event.
+        if(!weapon_transition_boost && cpu->gpr[4]==player+0x74 && cpu->gpr[5]==player && ra==0x8005a5a8 &&
+           cpu->gpr[7]==1 && cpu->gpr[6]==weapon_update_sp-0x2e) {
+            const int delta=(int16_t)psx_mod_read_half(cpu->gpr[6]);
+            int feel=delta>0 && delta<=4096 ? weapon_feel_delta(upper,delta,f.held[fire] && !switch_fire_masked()) : delta;
+            if(feel>=0 && feel<=4096)feel=trav_fire_wrap(feel); // D08J8: the driven track loops
+            if(feel!=delta && feel>=0 && feel<=4096) {
+                psx_mod_write_half(cpu->gpr[6],(uint16_t)feel);weapon_transition_boost=true;++feel_boost_updates;
+            }
+        }
+    } else if (address==0x80048410) {
+        push_manual_dispatch(cpu,ra);
+        if(cpu->gpr[4]==player && ra==0x8004b634)grounded_water_gait();
+        if(crouch_water_dispatch(cpu,ra))return;
+        if(landing_recover(cpu,ra,f))return; // D08Z3
+        // Switch only the two ordinary walk/run gait pairs, at the original
+        // locomotion dispatcher. Restart their original animation just as the
+        // transition routine does; retain root delta and all collision handling.
+        unsigned animation=psx_mod_read_half(player+0x60);
+        const bool wade_turn=locomotion_input_ready() && (animation==70 || animation==71);
+        if(cpu->gpr[4]!=player || ra!=0x8004b634 ||
+           !(movement_ready() || wade_turn) ||
+           f.held[original_aim] || f.held[jump] || !(f.move_x || f.move_y))return;
+        step_dispatch=false;
+        if(!input_running() && (animation==63 || animation==72 || animation==74 || animation==76 || animation==78))
+            step_dispatch=terrain_step_probe(cpu);
+        const bool run=input_running() || step_dispatch;
+        if((animation==70 || animation==71) && (f.move_x || f.move_y)) {
+            psx_mod_write_half(player+0x60,run?76:72);psx_mod_write_half(player+0x68,0);psx_mod_write_half(player+0x6a,0);
+            ++speed_changes;
+        }
+        if(step_dispatch && animation==63) {
+            psx_mod_write_half(player+0x60,76);psx_mod_write_half(player+0x68,0);psx_mod_write_half(player+0x6a,0);
+        }
+        if((run && (animation==72 || animation==74)) || (!run && (animation==76 || animation==78))) {
+            // Immediate frame-0 restart (original transition). Plant-aligned delay
+            // felt laggy and still clunked; soft mid-stride phase reuse froze pose.
+            // Shift-run plant SFX silencing is deferred low-priority (D27).
+            psx_mod_write_half(player+0x60,run?animation+4:animation-4);
+            psx_mod_write_half(player+0x68,0);psx_mod_write_half(player+0x6a,0);
+            ++speed_changes;
+        }
+    } else if (address==0x8003ebf4) {
+        if(std::getenv("DNTTK_TRAVERSAL_TRACE") && cpu->gpr[4]==player)
+            std::fprintf(stderr,"ttk-jump ra=%08x anim=%u state=%u/%u flags=%08x had=%d gap=%llu epoch=%llu/%llu\n",ra,psx_mod_read_half(player+0x60),psx_mod_read_byte(player+0x22c),psx_mod_read_byte(player+0x22d),psx_mod_read_word(player+0x224),had_movement,(unsigned long long)(f.sequence-movement_frame),(unsigned long long)f.epoch,(unsigned long long)intent_epoch);
+
+        // D08Z7: the vertical jump 97 of an owned takeoff. When original
+        // clearance refused a directional takeoff, its small drift along Duke's
+        // facing (it shows on the descent) points where the player pressed
+        // instead, so a blocked backward jump never travels forward. Manual
+        // style steers it like any other jump, capped at that drift (at least
+        // the walking-fall floor): jump, then hold S, and Duke comes down
+        // behind, not in front. Original gravity, height and swept collision;
+        // with no key held Space alone keeps the original drift.
+        if(cpu->gpr[4]==player && ra==0x80055bc4 && f.active && psx_mod_read_half(player+0x60)==97 &&
+           psx_mod_read_byte(player+0x22c)==9 &&
+           !(psx_mod_read_word(player)&0x20002) && !(psx_mod_read_word(player+0x224)&0x20000200) && identity()) {
+            if(psx_mod_read_byte(player+0x22d)==0) {
+                vertical_steer=false;
+                if(takeoff_owned() && !f.held[original_aim]) {
+                    if(takeoff_direction) {
+                        auto v=redirect((int32_t)psx_mod_read_word(player+0x1f4),
+                                        (int32_t)psx_mod_read_word(player+0x1fc),takeoff_intent);
+                        psx_mod_write_word(player+0x1f4,(int32_t)std::lround(v.x));
+                        psx_mod_write_word(player+0x1fc,(int32_t)std::lround(v.z));
+                        ++blocked_drifts;
+                    }
+                    vertical_steer=true;vertical_epoch=f.epoch;
+                    vertical_cap=std::max(std::hypot((double)(int32_t)psx_mod_read_word(player+0x1f4),
+                                                     (double)(int32_t)psx_mod_read_word(player+0x1fc)),air_cap_floor);
+                }
+            } else if(vertical_steer && vertical_epoch==f.epoch && manual_jump() && !f.held[original_aim]) {
+                manual_air_steer(f,vertical_cap);
+            }
+            return;
+        }
+        // Directional-jump ballistic update: initial takeoff is 9/0 before 9/9.
+        // Latch the last supported movement
+        // direction once, before original gravity, swept collision and integration.
+        // Subsequent impacts retain their own velocity; no air steering/reinjection.
+        // D08Z: the E reach 109 keeps the same ballistic update; only the
+        // manual style's air steering acts on it.
+        const bool reach_steer=psx_mod_read_half(player+0x60)==109 && manual_jump();
+        if (cpu->gpr[4]!=player || ra!=0x80055934 || !f.active ||
+            (psx_mod_read_half(player+0x60)!=98 && psx_mod_read_half(player+0x60)!=103 && psx_mod_read_half(player+0x60)!=104 &&
+             !reach_steer && !(psx_mod_read_half(player+0x60)==108 && short_fall && terrain_epoch==f.epoch)) ||
+            (psx_mod_read_word(player)&0x20002) ||
+            (psx_mod_read_word(player+0x224)&0x20000200) ||
+            psx_mod_read_byte(player+0x22c)!=9 ||
+            (psx_mod_read_byte(player+0x22d)!=9 && psx_mod_read_byte(player+0x22d)!=0) ||
+            psx_mod_read_word(camera+0xa4)!=player || psx_mod_read_word(player+0x7d4)!=camera ||
+            !identity()) return;
+        if(reach_steer) {manual_air_control(f);return;}
+        if(psx_mod_read_half(player+0x60)==108) {
+            if(fall_velocity_pending) {
+                auto v=redirect((int32_t)psx_mod_read_word(player+0x1f4),
+                                (int32_t)psx_mod_read_word(player+0x1fc),flight_intent);
+                const double magnitude=std::hypot(v.x,v.z);
+                double speed=fall_speed>0?fall_speed:(fall_walking?std::min(magnitude,2048.0):magnitude);
+                // D08L: never above the running jump (10085) or walking's 2048.
+                // The stride estimate can spike to its 14000 clamp at a run
+                // start; a ledge departure must not outreach the original jump.
+                speed=std::min(speed,fall_walking?2048.0:10000.0);
+                if(magnitude>0) {v.x*=speed/magnitude;v.z*=speed/magnitude;}
+                psx_mod_write_word(player+0x1f4,(int32_t)std::lround(v.x));
+                psx_mod_write_word(player+0x1fc,(int32_t)std::lround(v.z));
+                fall_velocity_pending=false;
+                manual_air_seed();
+            }
+            manual_air_control(f);
+            return;
+        }
+        // D08Z6: a blocked running request takes the standing 97 -> 98
+        // clearance path. Its small horizontal initializer must not also cap
+        // manual air steering for the whole flight. Only after terrain_update
+        // has accepted clearance, allow held run input to build toward the
+        // ordinary running speed. Keep the original vertical arc and sweep.
+        const bool cleared_run=delayed_takeoff && terrain_epoch==f.epoch &&
+            takeoff_owned() && takeoff_direction && manual_jump() && input_running() &&
+            (f.move_x || f.move_y) && !f.held[original_aim] &&
+            !psx_mod_read_word(player+0x20c);
+        if(delayed_takeoff && terrain_epoch==f.epoch) {
+            psx_mod_write_word(player+0x1f8,delayed_vertical);delayed_takeoff=false;
+        }
+        swim_ledge_ballistic(f);
+        if(flight_valid && flight_epoch!=f.epoch) flight_valid=false;
+        const bool standing=psx_mod_read_half(player+0x60)==98;
+        const bool fresh=standing ? takeoff_owned() && takeoff_direction : had_movement && intent_epoch==f.epoch &&
+            within_frame(f.sequence,movement_frame);
+        // Own the flight lease even if Mouse2 is still held. View-aim clears
+        // original_aim only while movement_ready; once airborne that clears
+        // and the physical button returns, which used to skip flight_valid and
+        // block E-owned airborne stow/ladder grabs. Keep aim's original jump
+        // arc: only redirect ballistic velocity when aim is not held.
+        ledge_reach_arm(f);
+        sidearm_reach(cpu,f); // D08Z8 revisions 4-5
+        if(!flight_valid && fresh) {
+            input_take_jump(); // A committed launch cannot leave a second buffered press.
+            flight_intent=standing?takeoff_intent:intent;flight_epoch=f.epoch;flight_valid=true;
+            if(!f.held[original_aim]) {
+                auto v=redirect((int32_t)psx_mod_read_word(player+0x1f4),
+                                (int32_t)psx_mod_read_word(player+0x1fc),flight_intent);
+                psx_mod_write_word(player+0x1f4,(int32_t)std::lround(v.x));
+                psx_mod_write_word(player+0x1fc,(int32_t)std::lround(v.z));++jumps;
+            }
+            manual_air_seed();
+            if(cleared_run) {
+                air_cap=std::max(air_cap,10000.0);
+                manual_air_control(f);
+            }
+        } else manual_air_control(f);
+    } else if (address==0x8002a7fc) {
+        min_boom_restore();
+        // Normal camera's final orientation conversion after position collision.
+        // Supply the requested view matrix to its original quaternion/smoothing
+        // path, so a shortened/sideways boom cannot pin look-at yaw to the wall.
+        if (!orbit_valid || !camera_lease_ready() || !identity() ||
+            cpu->gpr[18]!=camera || sp!=orbit_sp-0xb8-0xa8) return;
+        const bool smooth=ra==0x80029220 && cpu->gpr[4]==sp+0x18 && cpu->gpr[5]==sp+0x68;
+        const bool direct=ra==0x8002920c && cpu->gpr[4]==camera && cpu->gpr[5]==camera+0x54;
+        if (!smooth && !direct) return;
+        view_matrix(cpu->gpr[4]);++orientations;
+    } else if (address==0x8004ac08) {
+        jet_clearance_step(cpu);
+    } else if (address==0x80058120) {
+        // Immediately after original heading update; before original aim/model work.
+        if (cpu->gpr[4]==player && ra==0x80041c44) {
+            door_fire_window_end(); // D08J9: before anything reads the use state
+            sidearm_loan_close(); // D08Z8: the weapon back before anything reads it
+            god_mode_update(); // after this update's mode-10 fuel drain, before the HUD
+            jet_post_update(cpu);
+            bio_mask_boundary(true);
+            select_weapon(cpu);
+            kick_update(cpu);
+            tp_kick_update(cpu);
+            if(facing_ready())face_view();
+        }
+    } else if (address==0x80097a44) {
+        // D08J6B: on a climb the head's look-at takes the clamped view direction.
+        if (ra==0x80097f28 && climb_aim_direction(cpu)) {++climb_look_aims;return;}
+        // Existing upper-body aim path only. Replace its direction argument,
+        // never persistent auto-aim state, model flags, or body pitch.
+        if (ra!=0x80097f28 || cpu->gpr[18]!=player || cpu->gpr[5]!=player+0x124 ||
+            cpu->gpr[4]<0x1f800000 || cpu->gpr[4]>0x1f8003e0 || (cpu->gpr[4]&31) ||
+            psx_mod_read_byte(player+0x3b8)!=2 || !(presentation_ready() || armed_pullup_view_aim())) return;
+        if (!presentation_vector) presentation_vector=psx_mod_alloc_guest_memory(16,16);
+        if (!presentation_vector) return;
+        int32_t dir[3];
+        for(int i=0;i<3;++i) dir[i]=(int32_t)(int16_t)psx_mod_read_half(camera+12+2*i);
+        if(free_look.active) {
+            double eye[3],forward[3];free_look_aim(eye,forward);
+            for(int i=0;i<3;++i)dir[i]=(int32_t)std::lround(forward[i]);
+        }
+        // D08K6: the chest (depth 2, 0x1f800040) stays hunched when firing crouched.
+        if(cpu->gpr[4]==0x1f800040) crouch_fire_direction(dir);
+        for(int i=0;i<3;++i) psx_mod_write_word(presentation_vector+4*i,dir[i]);
+        cpu->gpr[5]=presentation_vector;
+        ++arms;
+    } else if (address==0x8002a038) {
+        min_boom_restore();
+        first_person_follow(cpu,ra,sp);
+        first_person_unsolved_eye(cpu,ra,sp);
+        // Native solver has already checked the requested position. Its delta
+        // is now in view space. Enter a constraint immediately; ease only the
+        // outward boom, never yaw/pitch or the player's preferred distance.
+        if(tight_camera_enabled() && fp_blend==0 && orbit_valid && camera_lease_ready() &&
+           sp==orbit_sp-0xb8 && (ra==0x8003af40 || ra==0x8003af60 || ra==0x8003af80) && identity()) {
+            if(ra==0x8003af40) {
+                double target[3];
+                if(pivot(target)) {
+                    double current=0;
+                    const double forward[]={std::sin(inspection_yaw())*std::cos(inspection_pitch()),std::sin(inspection_pitch()),std::cos(inspection_yaw())*std::cos(inspection_pitch())};
+                    for(int i=0;i<3;++i) current+=(target[i]-(int32_t)psx_mod_read_word(sp+0x28+4*i))*forward[i];
+                    tight_distance=std::max(0.0,current-(int32_t)psx_mod_read_word(sp+0x20));
+                    tight_compressed=tight_distance<radius-96;
+                    if(tight_compressed && (int32_t)psx_mod_read_word(sp+0x20)>16) tight_hold_until=f.sequence+8;
+                }
+            }
+            if(tight_compressed) cpu->gpr[5]=1;
+            if(ra==0x8003af80 && (int32_t)cpu->gpr[4]<0) {
+                if(f.sequence<tight_hold_until) cpu->gpr[4]=0;
+                else cpu->gpr[5]=tight_return_rate;
+            }
+        } else if(!tight_camera_enabled() && clear_lens_enabled() && fp_blend==0 && orbit_valid &&
+                  camera_lease_ready() && identity()) {
+            // D10F1: a clear lens on the orbit axis replaces the native solve's result.
+            clear_lens_follow(cpu,ra,sp);
+        }
+    } else if (address==0x8008ba30) {
+        widescreen_hud_begin(ra);
+        keyed_icons_begin(cpu);
+        gadget_hud(cpu);
+        ammo_hud(cpu);
+        hud_border_begin();
+    } else if (address==0x8001fc44) {
+        widescreen_hud_restore();
+    } else if (address==0x800b4d9c) {
+        widescreen_hud_restore();
+        widescreen_view_rect(ra);
+        first_person_projection(cpu,ra);
+    } else if (address==0x800348d8) {
+        // An actor entry is a boundary even if the previous draw was interrupted.
+        // Reflections and foreign actors must never inherit a primary joint owner.
+        limb_scope_end(cpu);weapon_live=false;weapon_duke_draw=false;
+        if(mirror_duke_drawing)fade_restore(cpu);
+        mirror_duke_drawing=cpu->gpr[5]==player && ra==0x8003816c &&
+            input_modernized() && identity();
+        // The main draw consumes the flame bit before the mirror pass
+        // (0x8003816c). Re-arm native flames for each draw of the running pack.
+        if(cpu->gpr[5]==player && jet_flight_live && jetpack_flying_early() &&
+           input_modernized() && !jetpack_classic() && identity() &&
+           psx_mod_read_word(camera+0xa4)==player && psx_mod_read_word(player+0x7d4)==camera)
+            psx_mod_write_word(player+0x224,psx_mod_read_word(player+0x224)|0x82000000u);
+        // Original actor draw (a0 camera, a1 actor) from the object-list loop.
+        actor_drawing=true;actor_draw_sp=cpu->gpr[29];
+        // D42: a dying Duke is drawn from the second object loop (0x800376c0,
+        // its list step returns to 0x80037724); the death eye owns that draw.
+        duke_drawing=cpu->gpr[4]==camera && cpu->gpr[5]==player && (ra==0x8003769c || (ra==0x8003771c && death_eye_state()));
+        third_body_drawing=duke_drawing;
+        weapon_draw_bounds(duke_drawing && fp_blend>0 && identity(),false);
+        {
+            // D17: the live evaluation is kept for render replay workers;
+            // lease_ready() itself must not be called again (state() has effects).
+            const bool lease_cam=render_override ? override_lease_cam : camera_lease_ready();
+            if(!render_override && duke_drawing) last_lease_cam=lease_cam;
+            first_person_draw(duke_drawing && identity(),psx_mod_read_word(camera+0xa4)==player && lease_cam);
+        }
+    } else if (address==0x8001ca4c) {
+        if(ra==0x80038184 && mirror_duke_drawing) {
+            fade_restore(cpu);mirror_duke_drawing=false;
+        }
+        // Next object-list step after Duke's draw returns: the head joint flag is cleared.
+        // D36H9: the same list iterator also runs inside an actor draw (ra
+        // 0x80075810 in the ledge hang, below the loop's stack frame). That
+        // call is not a list step and must not end Duke's draw ownership.
+        const bool nested=actor_drawing && cpu->gpr[29]<actor_draw_sp;
+        if(!nested) {duke_drawing=false;actor_drawing=false;}
+        if(ra==0x8007fe78) pickup_select_end(); // D08A9: after the pickup dispatcher
+        if(ra==0x800376b4 || ra==0x80037724) {third_body_drawing=false;head_restore();weapon_draw_bounds(false,true);}
+    } else if (address==0x800b4d2c) {
+        first_person_ladder_near(cpu,ra);
+        camera_target_near(cpu,ra);
+    } else if (address==0x800292a0) {
+        first_person_weapon_joint(cpu,ra);
+        if(ra==0x80034c6c) third_person_mesh_begin(cpu);
+    } else if (address==0x80033e40 || address==0x800341e4 || address==0x80033f5c) {
+        first_person_weapon_attached(cpu,address,ra);
+    } else if (address==0x8003ade4) {
+        min_boom_restore();
+        if (cpu->gpr[4]!=camera || cpu->gpr[5]!=player || ra!=0x80025ee8) return;
+        earthquake_tremor_mask(); // D44C
+        const bool ident=identity();
+        // A different authenticated level is a different world, even if no
+        // normal-camera callback ran during the intervening loading screen.
+        static uint32_t camera_level_tag;
+        if(ident && camera_level_tag!=identity_tag) {
+            camera_level_tag=identity_tag;camera_world_reset();
+        }
+        if(input_wants_initial_capture() && ident && gameplay_context() &&
+           (state() || state(true) || swim_lease_ready())) input_offer_gameplay_capture();
+        unsigned animation=psx_mod_read_half(player+0x60);
+        if(!takeoff_owned() || (animation!=96 && animation!=97 && animation!=98)) {takeoff_valid=false;takeoff_direction=false;}
+        // Continue the camera only from a live lease on the previous camera update.
+        if(!jump_animation(animation)) jump_camera=false;
+        else if(!jump_camera && orbit_valid && camera_frame && camera_epoch==f.epoch &&
+                within_frame(f.sequence,camera_frame)) jump_camera=true;
+        if (!camera_eligible() || !ident) {
+            const auto reason=!input_modern_controls()?PerspectiveReason::Legacy:!ident?PerspectiveReason::Identity:
+                psx_mod_read_half(0x800bcbb0)!=1 || psx_mod_read_half(0x800d2540)?PerspectiveReason::Frontend:
+                psx_mod_read_word(camera+0xa4)!=player?PerspectiveReason::Scripted:PerspectiveReason::Unsupported;
+            lease_refuse_trace(perspective_reason(reason),ident);
+            free_look={};distance_seen=f.distance_total;distance_epoch=f.epoch;camera_frame=0;walking=false;orbit_valid=false;look.reset();
+            first_person_release(reason);return;
+        }
+        if (flight_epoch!=f.epoch || (psx_mod_read_half(player+0x60)!=98 && psx_mod_read_half(player+0x60)!=103 && psx_mod_read_half(player+0x60)!=104 && psx_mod_read_half(player+0x60)!=105 && psx_mod_read_half(player+0x60)!=109 && !(short_fall && psx_mod_read_half(player+0x60)==108))) flight_valid=false;
+        if(first_map())apartment_patch_install();
+        const bool acquiring=!orbit_valid;
+        orbit_begin(sp);
+        if(!orbit_valid) first_person_release(independent_camera()?PerspectiveReason::Orbit:PerspectiveReason::Original);
+        else {
+            const unsigned ticks=fp_frame && f.sequence>fp_frame ? unsigned(std::min<uint64_t>(f.sequence-fp_frame,4)) : 1;
+            pole_visibility_update();
+            first_person_update(f,ticks,acquiring);fp_frame=f.sequence;
+        }
+        if(f.active && gameplay_context() && shallow_land_water_early() && !f.held[original_aim])face_view();
+        if(camera_frame && camera_epoch==f.epoch) frame_window_note(f.sequence-camera_frame);
+        else frame_window_reset();
+        camera_frame=f.sequence; camera_epoch=f.epoch; ++cameras;
+        if(f.active && swim_lease_ready()) {
+            swim_frame=f.sequence;swim_epoch=f.epoch;
+            swim_update(cpu,true);
+        }
+        // D08Z7: the original also takes a held or repeated jump straight out
+        // of a landing (105/106) or a wall bump (94/95). Those are settled
+        // ground poses with camera-only leases; without a sample here the
+        // takeoff was unowned and 98 left along Duke's facing (a forward jump
+        // with S held).
+        if((state() && (animation==63 || (animation>=72 && animation<=79))) ||
+           (state(true) && (landing_pose_anim(animation) || animation==105) &&
+            psx_mod_read_byte(player+0x22c)==0 && psx_mod_read_byte(player+0x22d)==0)) {
+            ground_frame=f.sequence;ground_epoch=f.epoch;
+        }
+        // A short run-up can enter jump before a root-motion callback. Keep the
+        // verified normal-state input intent fresh independently of gait phase.
+        if(state() && (f.move_x || f.move_y) && !f.held[original_aim]) {
+            intent=movement(view_yaw(),f.move_x,f.move_y);had_movement=true;
+            intent_epoch=f.epoch;movement_frame=f.sequence;
+        }
+        if (psx_mod_read_half(player+0x60)==63 && !f.move_x && !f.move_y) had_movement=false;
+    } else if (address==0x8003aa48) {
+        if (!orbit_valid || !camera_lease_ready() || !identity() || cpu->gpr[4]!=camera || ra!=0x8003aeb0 ||
+            sp!=orbit_sp-0xb8 || sp<0x80010000 || sp>0x801fffdc || (sp&3) ||
+            cpu->gpr[5]!=sp+0x18) {min_boom_restore();return;}
+        first_person_constraint();
+        // The original minimum re-expands an already collision-solved boom.
+        // Let confined third-person views compress instead of pushing the
+        // camera back through the obstruction; restore at the next follow hook.
+        if(tight_camera_enabled() && fp_blend==0 && psx_mod_read_word(min_boom_word)==min_boom_original) {
+            psx_mod_write_word(min_boom_word,256);min_boom_written=true;
+        }
+        orbit_constraint(cpu->gpr[5]);
+    } else if(address==0x80054308) {
+        walking=false;
+        if(cpu->gpr[4]!=player || (ra!=0x80048a68 && ra!=0x80048ab0) || !movement_ready())return;
+        if(f.move_x || f.move_y) {
+            intent=movement(view_yaw(),f.move_x,f.move_y);
+            auto delta=redirect((int16_t)psx_mod_read_half(player+0xfc),(int16_t)psx_mod_read_half(player+0x100),intent);
+            psx_mod_write_half(player+0xfc,(int16_t)std::lround(delta.x));psx_mod_write_half(player+0x100,(int16_t)std::lround(delta.z));
+            walking_sp=sp;walking_size=0x20;probe_return=0x8005432c;walking=true;
+        }
+    } else if (address==0x800539f8) {
+        // Mid-depth wade handler (anims 80/81, mode 1), entered from the gait
+        // dispatcher's wade cases only. The track advance has already written
+        // this update's world-space root; the handler's own 800788e0 collision
+        // and position add still follow. Retarget that root to camera-relative
+        // WASD at the land pace instead of the clip's forward-only ~22 units.
+        // No direction held: keep the original displacement and stop.
+        if(cpu->gpr[4]!=player || (ra!=0x8004870c && ra!=0x8004873c && ra!=0x8004876c && ra!=0x8004879c))return;
+        if(!mid_wade_input_ready() || (!f.move_x && !f.move_y) || f.held[original_aim])return;
+        const auto dir=movement(view_yaw(),f.move_x,f.move_y);
+        double length=std::hypot((int16_t)psx_mod_read_half(player+0xfc),
+                                 (int16_t)psx_mod_read_half(player+0x100));
+        // The wade clip's stride is uneven (6..44 per tick, ~25 average) and,
+        // unlike the land handlers, not time-scaled. Keep its rhythm, but at
+        // the shared walk/run pace (D08AA; Shift decides as on land).
+        const bool run=input_running();
+        if(swimming_modern()) {
+            const double step=modern_pace_step(run);
+            length=std::clamp(length*step/mid_wade_clip_average,step*0.8,step*1.2);
+        } else {
+            length=std::clamp(length*(run?mid_wade_run_gain:mid_wade_walk_gain),
+                              run?mid_wade_run_floor:mid_wade_walk_floor,
+                              run?mid_wade_run_ceiling:mid_wade_walk_ceiling);
+        }
+        psx_mod_write_half(player+0xfc,(int16_t)std::lround(dir.x*length));
+        psx_mod_write_half(player+0x100,(int16_t)std::lround(dir.z*length));
+        ++moves;
+    } else if (address==0x80053500 || address==0x80053404 || address==0x80054218) {
+        walking=false;
+        bool run=address==0x80053500, stopping=address==0x80054218;
+        if (stopping && ((ra!=0x800487c4 && ra!=0x80048810) || cpu->gpr[5]!=63 || cpu->gpr[6]!=4)) return;
+        if (cpu->gpr[4]!=player || (!stopping && (run ? (ra!=0x80048664 && ra!=0x800486a8) : (ra!=0x80048620 && ra!=0x800485dc)))
+            || !movement_ready()) return;
+        // Original 52298/4bc68 set bit 8 on run entry; 539b4 rejects jump
+        // until the stride completes at 4b938. A fresh bounded press may remove
+        // that animation delay. The original run handler still owns its floor,
+        // obstruction, jetpack and takeoff checks; never clear other flags.
+        if(run && input_jump_pending() && independent_camera() &&
+           (f.move_x || f.move_y) && !f.held[crouch] && !f.held[original_aim] &&
+           !(psx_mod_read_word(player+0x224)&0x202002c1))
+            psx_mod_write_word(player+0x228,psx_mod_read_word(player+0x228)&~8u);
+        if (intent_epoch!=f.epoch) {had_movement=false;intent_epoch=f.epoch;}
+        if (f.move_x || f.move_y) {intent=movement(view_yaw(),f.move_x,f.move_y);had_movement=true;movement_frame=f.sequence;}
+        else if (!had_movement) return;
+        // Continue the original animation's deceleration in the last requested
+        // direction. Never revert its tail displacement to actor facing.
+        walking_size=run?0x30:0x20; probe_return=stopping?0x80054240:(run?0x80053548:0x80053424);
+        double length=std::hypot((int16_t)psx_mod_read_half(player+0xfc),
+                                 (int16_t)psx_mod_read_half(player+0x100));
+        if(stopping) {
+            // Shorten the animation-driven braking tail; original collision still commits it.
+            length*=0.35;gait_frame=0;
+        } else if(f.move_x || f.move_y) {
+            if(!gait_frame || gait_epoch!=f.epoch || f.sequence-gait_frame>4 || gait_running!=run)
+                gait_length=std::max(length,run?80.0:20.0);
+            else if(f.sequence!=gait_frame) gait_length=(gait_length+length)*0.5;
+            else gait_length=length; // multiple original updates, never replay a cached displacement
+            gait_frame=f.sequence;gait_epoch=f.epoch;gait_running=run;length=gait_length;
+        }
+        const unsigned dt=psx_mod_read_half(player+0xba);
+        if(!stopping && (f.move_x || f.move_y) && dt>0 && dt<=64) {
+            if(landing_epoch==f.epoch && f.sequence<=landing_until && fall_speed>0) {
+                // The original landing starts with a running stride even for
+                // walking. Bridge its first few updates at the owned approach
+                // speed; no position write and no extension after release.
+                length=fall_speed*dt/1024.0;gait_length=length;
+            } else if(!step_dispatch && !small_landing && run==input_running()) {
+                stride_speed=std::clamp(length*1024.0/dt,0.0,run?14000.0:4096.0);
+                stride_epoch=f.epoch;
+            }
+        }
+        if(step_dispatch && !input_running()) {
+            length=std::min(length,20.0);gait_length=length;
+        }
+        if(!stopping) length=tp_kick_pace(length,dt);   // D12E1: walking pace through a kick
+        Vec2 delta{length*intent.x,length*intent.z};
+        psx_mod_write_half(player+0xfc,(int16_t)std::lround(delta.x));
+        psx_mod_write_half(player+0x100,(int16_t)std::lround(delta.z));
+        walking_sp=sp; walking=true; ++moves;
+    } else if (address==0x800780b4) {
+        // Standing preparation's original 375-unit clearance query. Rotate
+        // vector AND endpoint; original room/headroom/wall tests still decide.
+        if(cpu->gpr[4]==player && ra==0x8007985c && cpu->gpr[5]==sp+0x10 &&
+           psx_mod_read_word(sp+0x44)==0x800549c4 && directional_takeoff_ready()) {
+            auto v=redirect((int32_t)psx_mod_read_word(sp+0x10),
+                            (int32_t)psx_mod_read_word(sp+0x18),takeoff_intent);
+            int32_t x=std::lround(v.x),z=std::lround(v.z);
+            psx_mod_write_word(sp+0x10,x);psx_mod_write_word(sp+0x18,z);
+            psx_mod_write_word(sp+0x30,psx_mod_read_word(player+4)+x);
+            psx_mod_write_word(sp+0x38,psx_mod_read_word(player+12)+z);
+            return;
+        }
+        // The original run-jump helper looks 1024 units ahead and postpones
+        // takeoff until the edge. Modern jump means jump now. Probe the current
+        // support instead; original jump selection, gravity and swept collision
+        // still run. This caller is not the actual movement collision query.
+        // D08Y: except before a real gap. The levels are built around that
+        // postponement (Duke leaps from the lip: the slot-5 gap is ~200 units
+        // too long for a takeoff where Space was pressed). When the original
+        // floor probe at the helper's 1024-ahead endpoint (sp+0x20) finds a
+        // large drop (over 768, D08L's run-off threshold), leave the helper
+        // alone so the original queues the jump (+0x228 bit 4) and launches
+        // it at the edge. Small drops (furniture, steps) still jump now.
+        if(cpu->gpr[4]==player && ra==0x80078c78 && cpu->gpr[5]==sp+0x10 &&
+           psx_mod_read_word(sp+0x44)==0x8005398c && movement_ready() &&
+           !f.held[original_aim] && (f.move_x || f.move_y) && input_running()) {
+            // D08Z: the manual jump style leaves on the press before gaps too.
+            if(!manual_jump()) {
+                uint32_t probe[0x60/4];
+                for(unsigned i=0;i<0x60/4;++i)probe[i]=psx_mod_read_word(player+0x174+4*i);
+                int32_t ignored=0;
+                const bool probed=!psx_mod_read_word(player+0x174) && original_call(cpu,0x8007765c,sp+0x20,&ignored);
+                const int32_t ahead=(int32_t)psx_mod_read_word(player+0x1c4);
+                for(unsigned i=0;i<0x60/4;++i)psx_mod_write_word(player+0x174+4*i,probe[i]);
+                if(probed && ahead>768) {++edge_postpones;return;}
+            }
+            for(int i=0;i<3;++i) {
+                psx_mod_write_word(sp+0x10+4*i,0);
+                psx_mod_write_word(sp+0x20+4*i,psx_mod_read_word(player+4+4*i));
+            }
+            return;
+        }
+        // 7926c's world probe is fully rotated at this point. Its local endpoint
+        // is already calculated, so update BOTH vector and endpoint before the
+        // original world query; preserve probe length, vertical component/mode.
+        if (cpu->gpr[4]!=player || ra!=0x800794b8 || cpu->gpr[5]!=sp+0x10 ||
+            !movement_ready()) return;
+        const bool starting=(psx_mod_read_word(sp+0x54)==0x80052228 || psx_mod_read_word(sp+0x54)==0x80052d34) &&
+            (psx_mod_read_half(player+0x60)==63 || psx_mod_read_half(player+0x60)==178) && (f.move_x || f.move_y) &&
+            !f.held[original_aim];
+        // Idle's forward clearance test runs BEFORE locomotion is selected.
+        // It must test requested WASD direction too, otherwise a wall in front
+        // prevents starting a strafe/backpedal although that path is clear.
+        if (starting) intent=movement(view_yaw(),f.move_x,f.move_y);
+        else if (!walking || sp!=walking_sp-walking_size-0x58 ||
+                 psx_mod_read_word(sp+0x54)!=probe_return) return;
+        auto v=redirect((int32_t)psx_mod_read_word(sp+0x10),
+                        (int32_t)psx_mod_read_word(sp+0x18),intent);
+        int32_t x=std::lround(v.x),z=std::lround(v.z);
+        psx_mod_write_word(sp+0x10,x); psx_mod_write_word(sp+0x18,z);
+        psx_mod_write_word(sp+0x30,psx_mod_read_word(player+4)+x);
+        psx_mod_write_word(sp+0x38,psx_mod_read_word(player+12)+z);
+        walking=false; ++probes;
+    }
+}
+// D17 render replay: the host state the draw-time hooks read, captured with each
+// published frame and loaded in the worker process that redraws it (a worker
+// holds only a fork-time copy of this file's statics).
+struct RenderState {
+    int eye_projection;
+    bool hud_borderless;
+    FreeLook inspection;
+    double mask_bob;
+    ActionPerspective perspective;
+    uint32_t pole_visibility_object;
+    double fp_blend; bool orbit_valid, eye_offset_valid, live_valid, lease_cam, crouch_weapon, swim_weapon, body_coverage, third_camera;
+    double eye_offset[3], live_q[4], live_rel[3], live_torso_q[4], live_torso[3], kick;
+    FirePose fire_poses[32];
+    RifleReload rifle_reload; RunArms run_arms; unsigned weapon_slot;
+    uint32_t weapon_matrix, hidden_matrix;
+    bool kick_active; double kick_frame; uint32_t kick_point, leg_matrices;
+    // D17AR2: the live frame's host visibility switch (the console toggle
+    // changes only this process; redraw workers forked before it).
+    bool host_visibility;
+    // D40: the live frame's world renderer (switchable in game).
+    bool world_classic;
+    bool push_letgo;
+    // D17AY: tick-rate presentation values blended per redraw, and the
+    // jetpack flame re-arm's flight flag (workers fork before a flight).
+    bool door_valid; double door_frame;
+    ChannelHand channel_hand;
+    double projection_blend;
+    bool jet_flight;
+    // D08J7D: the one-handed pull-up's off hand and viewmodel high ready.
+    OnehandView onehand_view;
+    // D44A: the earthquake offset of this image (held, never blended).
+    QuakeView quake;
+    // D41A: this image's dynamic lights.
+    LightView lights;
+    // D08A32: the ammo box icon cell the live frame chose (-1 the game's belt).
+    int ammo_view;
+    // D49F: the live frame's "boltlaunch" switch (the Laser Gatling's toe-in).
+    bool laser_toe_in;
+};
+bool replay_gameplay_context() { return gameplay_context(); }
+void render_state_prepare() {
+    // These matrices are completely populated by their draw hooks before use.
+    // Reserve the host pointers before forking so first exposure does not
+    // synchronously replace every worker during active camera movement.
+    if(!weapon_matrix) weapon_matrix=psx_mod_alloc_guest_memory(0x20,16);
+    if(!hidden_matrix) hidden_matrix=psx_mod_alloc_guest_memory(0x20,16);
+    if(!kick_point) kick_point=psx_mod_alloc_guest_memory(16,16);
+    if(!leg_matrices) leg_matrices=psx_mod_alloc_guest_memory(0x20*leg_joints,16);
+    if(!tp_point) tp_point=psx_mod_alloc_guest_memory(16,16);
+    if(!tp_spark_point) tp_spark_point=psx_mod_alloc_guest_memory(16,16);
+    if(!presentation_vector) presentation_vector=psx_mod_alloc_guest_memory(16,16);
+    if(!ignored_pickup) ignored_pickup=psx_mod_alloc_guest_memory(0x40,16);
+}
+bool late_view(double& out_yaw,double& out_pitch,double at_ms) {
+    // Only while the modern camera owns the view (the live frame's lease at
+    // Duke's draw) and follows Duke: a game-owned camera (new-game opening,
+    // scripted views, climbs) must never get the mouse direction.
+    if(!input_modernized() || !orbit_valid || recentering || !independent_camera() || !last_lease_cam || frozen_eye_state() || death_eye_state() ||
+       psx_mod_read_word(camera+0xa4)!=player) return false;
+    uint64_t live_epoch=0; double x=0,y=0;
+    if(!input_live_look(live_epoch,x,y,at_ms) || !look.valid || look.epoch!=live_epoch) return false;
+    const char* inverted=ttk_live_env("DNTTK_MOUSE_INVERT_Y");
+    out_yaw=wrap_yaw(turn_yaw_at(at_ms<0?input_clock_ms():at_ms)+(x-look.x)*sensitivity());
+    out_pitch=clamp_pitch(key_pitch_at(at_ms<0?input_clock_ms():at_ms)+(y-look.y)*sensitivity()*(inverted && !std::strcmp(inverted,"1")?-1:1));
+    if(free_look.active) {
+        const double dt=std::clamp(((at_ms<0?input_clock_ms():at_ms)-free_look.ms)/1000.0,0.0,0.1);
+        const double decay=free_look.held?1:std::exp(-12.0*dt);
+        out_yaw=wrap_yaw(out_yaw+free_look.x*decay);
+        out_pitch=clamp_pitch(out_pitch+free_look.y*decay);
+    }
+    return true;
+}
+bool late_pivot(double* xyz) {return pivot(xyz);}
+double late_fp_blend() {return fp_blend;}
+size_t render_state_size() {return sizeof(RenderState);}
+void render_state_save(void* out) {
+    RenderState r{};
+    r.eye_projection=eye_projection();
+    r.hud_borderless=hud_borderless();
+    r.inspection=free_look;
+    r.perspective=fp_policy;r.pole_visibility_object=pole_visibility_object;
+    r.mask_bob=bob_dip; r.fp_blend=fp_blend; r.orbit_valid=orbit_valid; r.eye_offset_valid=eye_offset_valid; r.live_valid=live_valid;
+    r.lease_cam=last_lease_cam;
+    r.body_coverage=psx_mod_present_replay_available()!=0;
+    r.third_camera=third_person_camera_live();
+    r.crouch_weapon=crouch_weapon_active();
+    r.swim_weapon=swim_weapon_view_active();
+    r.rifle_reload=rifle_reload_pose();r.run_arms=running_arm_pose();r.weapon_slot=weapon_view_slot();
+    std::memcpy(r.eye_offset,eye_offset,sizeof eye_offset); std::memcpy(r.live_q,live_q,sizeof live_q);
+    std::memcpy(r.live_rel,live_rel,sizeof live_rel); std::memcpy(r.live_torso_q,live_torso_q,sizeof live_torso_q);
+    std::memcpy(r.live_torso,live_torso,sizeof live_torso); r.kick=kick;
+    std::memcpy(r.fire_poses,fire_poses,sizeof fire_poses);
+    r.weapon_matrix=weapon_matrix; r.hidden_matrix=hidden_matrix;
+    r.kick_active=kick_active; r.kick_frame=kick_active ? kick_frame() : 0u;
+    r.door_valid=door_kick_frame_live(r.door_frame);
+    r.channel_hand={};r.channel_hand.valid=animated_weapon_channel_live(r.channel_hand.q,r.channel_hand.rel);
+    r.projection_blend=fp_blend;
+    r.jet_flight=jet_flight_live;
+    r.kick_point=kick_point; r.leg_matrices=leg_matrices;
+    r.host_visibility=host_visibility_enabled();
+    r.world_classic=ttk_world_classic()!=0;
+    r.push_letgo=push_letgo;
+    r.onehand_view=onehand_view_live();
+    r.quake=quake_view;
+    r.lights=light_view;
+    r.ammo_view=ammo_view;
+    r.laser_toe_in=aim_bolt_launch_enabled();
+    std::memcpy(out,&r,sizeof r);
+}
+void render_state_blend_mask(void* out,const void* next,double alpha) {
+    RenderState a,b;std::memcpy(&a,out,sizeof a);std::memcpy(&b,next,sizeof b);
+    alpha=std::clamp(alpha,0.0,1.0);
+    a.mask_bob+=(b.mask_bob-a.mask_bob)*alpha;
+    if(a.weapon_slot==b.weapon_slot) {
+        if(a.run_arms.weight==0 && b.run_arms.weight>0) {a.run_arms=b.run_arms;a.run_arms.weight=0;}
+        a.run_arms.weight+=(b.run_arms.weight-a.run_arms.weight)*alpha;
+    }
+    if(a.weapon_slot==6 && b.weapon_slot==6) {
+        a.rifle_reload.lift+=(b.rifle_reload.lift-a.rifle_reload.lift)*alpha;
+        a.rifle_reload.pull+=(b.rifle_reload.pull-a.rifle_reload.pull)*alpha;
+        a.kick+=(b.kick-a.kick)*alpha;
+    }
+    // DNTTK_DRAW_POSE=tick (developer, D17AY): the values below keep the last tick.
+    static const bool tick=[]{const char* t=std::getenv("DNTTK_DRAW_POSE");return t && !std::strcmp(t,"tick");}();
+    if(tick) {std::memcpy(out,&a,sizeof a);return;}
+    if(!(a.weapon_slot==6 && b.weapon_slot==6) && a.weapon_slot==b.weapon_slot && b.kick<=a.kick) {
+        // D17AY: every weapon's recoil eases back between game ticks. A new
+        // shot (kick rising) still starts with its muzzle flash, at the tick.
+        a.kick+=(b.kick-a.kick)*alpha;
+    }
+    // D17AY: the quick kick's leg frame, the door kick and the crouch/swim
+    // animated hand advance between ticks; the FOV eases into the eye.
+    if(a.kick_active && b.kick_active && b.kick_frame>=a.kick_frame && b.kick_frame-a.kick_frame<=8)
+        a.kick_frame+=(b.kick_frame-a.kick_frame)*alpha;
+    if(a.door_valid && b.door_valid && b.door_frame>=a.door_frame)
+        a.door_frame+=(b.door_frame-a.door_frame)*alpha;
+    if(a.channel_hand.valid && b.channel_hand.valid && a.weapon_slot==b.weapon_slot) {
+        double* q=a.channel_hand.q;const double* p=b.channel_hand.q;
+        const double sign=q[0]*p[0]+q[1]*p[1]+q[2]*p[2]+q[3]*p[3]<0 ? -1 : 1;
+        double n=0;
+        for(int i=0;i<4;++i) {q[i]+=(sign*p[i]-q[i])*alpha;n+=q[i]*q[i];}
+        n=std::sqrt(n);
+        if(n>1e-9) for(int i=0;i<4;++i) q[i]/=n;
+        for(int i=0;i<3;++i) a.channel_hand.rel[i]+=(b.channel_hand.rel[i]-a.channel_hand.rel[i])*alpha;
+    }
+    a.projection_blend+=(b.projection_blend-a.projection_blend)*alpha;
+    a.onehand_view.raise+=(b.onehand_view.raise-a.onehand_view.raise)*alpha;
+    std::memcpy(out,&a,sizeof a);
+}
+// D10H8: the draw-time state for a redraw of the newer frame's display list.
+// Discrete state (weapon, frames, flags) is the newer frame's; the values the
+// base list blends between ticks take the same blended value, under the same
+// conditions, so poses match the pair blend. A new shot (kick rising) shows at
+// the newer tick with its muzzle flash, as the base list shows it at its tick.
+void render_state_blend_newer(void* out,const void* older,double alpha) {
+    RenderState n,a,f;std::memcpy(&n,out,sizeof n);std::memcpy(&a,older,sizeof a);
+    alignas(RenderState) unsigned char buf[sizeof(RenderState)];
+    std::memcpy(buf,&a,sizeof a);render_state_blend_mask(buf,&n,alpha);std::memcpy(&f,buf,sizeof f);
+    n.mask_bob=f.mask_bob;
+    if(a.weapon_slot==n.weapon_slot) n.run_arms=f.run_arms;
+    if(a.weapon_slot==6 && n.weapon_slot==6) {n.rifle_reload=f.rifle_reload;n.kick=f.kick;}
+    static const bool tick=[]{const char* t=std::getenv("DNTTK_DRAW_POSE");return t && !std::strcmp(t,"tick");}();
+    if(!tick) {
+        if(!(a.weapon_slot==6 && n.weapon_slot==6) && a.weapon_slot==n.weapon_slot && n.kick<=a.kick) n.kick=f.kick;
+        if(a.kick_active && n.kick_active && n.kick_frame>=a.kick_frame && n.kick_frame-a.kick_frame<=8) n.kick_frame=f.kick_frame;
+        if(a.door_valid && n.door_valid && n.door_frame>=a.door_frame) n.door_frame=f.door_frame;
+        if(a.channel_hand.valid && n.channel_hand.valid && a.weapon_slot==n.weapon_slot) n.channel_hand=f.channel_hand;
+        n.projection_blend=f.projection_blend;
+        n.onehand_view.raise=f.onehand_view.raise;
+    }
+    std::memcpy(out,&n,sizeof n);
+}
+void render_state_load(const void* in) {
+    RenderState r;
+    std::memcpy(&r,in,sizeof r);
+    override_eye_projection=r.eye_projection;
+    override_hud_borderless=r.hud_borderless;
+    hud_applied=hud_border_applied=false;
+    free_look=r.inspection;
+    fp_policy=r.perspective;pole_visibility_object=r.pole_visibility_object;
+    bob_dip=r.mask_bob; fp_blend=r.fp_blend; orbit_valid=r.orbit_valid; eye_offset_valid=r.eye_offset_valid; live_valid=r.live_valid;
+    std::memcpy(eye_offset,r.eye_offset,sizeof eye_offset); std::memcpy(live_q,r.live_q,sizeof live_q);
+    std::memcpy(live_rel,r.live_rel,sizeof live_rel); std::memcpy(live_torso_q,r.live_torso_q,sizeof live_torso_q);
+    std::memcpy(live_torso,r.live_torso,sizeof live_torso); kick=r.kick;
+    std::memcpy(fire_poses,r.fire_poses,sizeof fire_poses);
+    weapon_matrix=r.weapon_matrix; hidden_matrix=r.hidden_matrix;
+    kick_active=r.kick_active; override_kick_frame=r.kick_frame;
+    kick_point=r.kick_point; leg_matrices=r.leg_matrices;
+    host_vis_override=r.host_visibility?1:0;
+    ttk_world_classic_set(r.world_classic);
+    push_letgo=r.push_letgo;
+    override_onehand_view=r.onehand_view;
+    override_door_valid=r.door_valid; override_door_frame=r.door_frame;
+    override_channel_hand=r.channel_hand;
+    override_projection_blend=r.projection_blend;
+    jet_flight_live=r.jet_flight;
+    quake_view=r.quake;
+    light_view=r.lights;
+    override_ammo_view=r.ammo_view;
+    laser_toe_in_replay=r.laser_toe_in?1:0;
+    // Draw-time transients start clean, as at the start of a live frame.
+    head_flag=backpack_flag=0; third_body_drawing=false; mirror_duke_drawing=false; duke_drawing=false; actor_drawing=false; limb_scope_forget();
+    render_override=true; override_lease_cam=r.lease_cam;
+    override_crouch_weapon=r.crouch_weapon;
+    override_swim_weapon=r.swim_weapon;
+    override_rifle_reload=r.rifle_reload;
+    override_run_arms=r.run_arms;
+    override_body_coverage=r.body_coverage;
+    override_third_camera=r.third_camera;
+    fade_save.active=false;
+}
+bool third_person_duke_drawing() {return third_body_drawing;}
+bool third_person_camera_live() {
+    if(render_override)return override_third_camera && fp_blend==0 && psx_mod_read_word(camera+0xa4)==player;
+    return tight_camera_enabled() && input_modernized() && independent_camera() && orbit_valid && fp_blend==0 &&
+        (render_override?override_lease_cam:last_lease_cam) && psx_mod_read_word(camera+0xa4)==player;
+}
+static bool body_coverage_supported() {return render_override?override_body_coverage:psx_mod_present_replay_available()!=0;}
+static bool third_person_body_effect() {
+    return (psx_mod_read_word(player)&0x6040) || (psx_mod_read_word(player+0x224)&0x200000) ||
+        psx_mod_read_half(player+0x89c) || psx_mod_read_half(player+0x89e) || psx_mod_read_half(player+0x8a0);
+}
+// D41C: Duke's primary body in an outside view (not the eye view or its
+// blend, not the death eye, no power-up effect): it may be host-drawn, lit.
+bool third_person_body_lightable() {
+    return third_body_drawing && fp_blend==0 && input_modernized() && !death_eye_state() &&
+        !third_person_body_effect() && identity();
+}
+void third_person_mesh_begin(CPUState* cpu) {
+    // The root sets the native fade AFTER its transform. Catch it at its
+    // mesh too, before any pelvis polygons; subsequent joints use the same
+    // saved context. Reflected Duke stays opaque at close range in Modernized;
+    // this never enables the primary-body dissolve. Power-up effects remain native.
+    if((mirror_duke_drawing || (third_body_drawing && third_person_camera_live() && body_coverage_supported())) &&
+       !third_person_body_effect() && identity()) fade_clear(cpu);
+}
+void first_person_mesh_begin(CPUState* cpu) {
+    // D14E: pelvis/root proximity fade is installed after the joint hook.
+    // Correct it at mesh submission, using the same scoped restoration as the
+    // other body parts. Actor effects and the native shader's tint stay native.
+    const uint32_t desc=duke_model(),sp=cpu->gpr[29];
+    if(!weapon_duke_draw || !first_person_view_live() || !fp_policy.effective ||
+       limb_draw.owner!=LimbOwner::Body || limb_draw.parts!=limb_part(0) ||
+       cpu->gpr[31]!=0x800351f4 || cpu->gpr[20]!=player || !desc ||
+       duke_joint_part(desc,cpu->gpr[23])!=0 ||
+       cpu->gpr[4]!=psx_mod_read_word(desc+0x44+0x28*cpu->gpr[23]+0x24) ||
+       sp<0x80010000 || sp>0x801fff60 || (sp&3) || psx_mod_read_word(sp+0x98)!=camera ||
+       third_person_body_effect() || !identity()) return;
+    fade_clear(cpu);
+}
+// D08A35: the Bio Mask (face equipment 2, [800ddb18]+0x1030) and the goggles
+// (3, +0x10c4) replace the whole head joint's mesh with a bare default head,
+// so the Old West costume lost its hat. When that head is submitted for Duke,
+// draw instead a private copy of it with the hat faces of the costume's own
+// head (the pristine model, [[800ddb14]+4]) appended, the D17Y way: only a0
+// changes, the game's model and saves never hold the copy. The hat is every
+// face of the original head lying wholly above the bare skull (y <= -60) and
+// reaching the crown, the brim or its back; the original's vertices keep their
+// light data. Rebuilt at every draw (redraw workers draw from their own RAM).
+// DNTTK_COWBOY_HAT=0 (developer) keeps the native bare head.
+static uint32_t hat_copy[2];
+static uint64_t hat_draws;
+static constexpr uint32_t hat_copy_bytes=0x1000;
+bool cowboy_hat_mesh(uint32_t address) {
+    for(const uint32_t c:hat_copy) if(c && address>=c && address<c+hat_copy_bytes) return true;
+    return false;
+}
+void cowboy_hat_mesh_begin(CPUState* cpu) {
+    static const bool on=[]{const char* t=std::getenv("DNTTK_COWBOY_HAT");return !(t && t[0]=='0' && !t[1]);}();
+    const unsigned face=psx_mod_read_half(player+0x854);
+    const uint32_t desc=duke_model(),mesh=cpu->gpr[4];
+    if(!on || (face!=2 && face!=3) || cpu->gpr[31]!=0x800351f4 || cpu->gpr[20]!=player || !desc ||
+       duke_part_joint(desc,part_neck)!=(int)cpu->gpr[23] || !identity()) return;
+    // Only the Old West model wears a hat: its neck is joint 15 (D11D). The
+    // other costumes' heads (hair, helmets) never match.
+    if(cpu->gpr[23]!=15) return;
+    auto valid=[](uint32_t a,uint32_t n) {return a>=0x80010000u && a<=0x80200000u-n && !(a&3);};
+    const uint32_t gadgets=psx_mod_read_word(0x800ddb18),heads=psx_mod_read_word(0x800ddb14);
+    if(!valid(gadgets,0x10c8) || mesh!=psx_mod_read_word(gadgets+(face==2?0x1030:0x10c4)) || !valid(heads,8)) return;
+    const uint32_t pristine=psx_mod_read_word(heads+4);
+    if(!valid(pristine,0x44+0x28*duke_joints)) return;
+    const uint32_t head=psx_mod_read_word(pristine+0x44+0x28*cpu->gpr[23]+0x24);
+    if(!valid(head,0x18) || !valid(mesh,0x18) || head==mesh) return;
+    struct Mesh {unsigned count;uint32_t box,verts,list;};
+    auto read=[&](uint32_t m,Mesh& out) {
+        out={psx_mod_read_byte(m+6),psx_mod_read_word(m+8),psx_mod_read_word(m+0x10),psx_mod_read_word(m+0x14)};
+        return out.count && valid(out.box,0x10) && valid(out.verts,8*out.count) && valid(out.list,4);
+    };
+    Mesh bare{},own{};
+    if(!read(mesh,bare) || !read(head,own)) return;
+    auto vy=[&](unsigned i){return (int16_t)psx_mod_read_half(own.verts+8*i+2);};
+    // The bare head's list, kept whole; the costume head's hat faces (GT3).
+    uint32_t cursor=bare.list,bare_bytes=0;
+    for(unsigned guard=0;;++guard) {
+        if(guard>16 || !valid(cursor,4)) return;
+        const uint32_t header=psx_mod_read_word(cursor);
+        const unsigned type=header&0xff,n=header>>16;
+        if(type==0xff) break;
+        const unsigned size=type==0x2c || type==0x24 ? 16 : type==0x28 || type==0x20 ? 8 : 0;
+        if(!size || !n || n>512 || !valid(cursor,4+n*size)) return;
+        cursor+=4+n*size;bare_bytes+=4+n*size;
+    }
+    const uint32_t end_word=psx_mod_read_word(cursor);
+    std::vector<uint32_t> hat;std::array<int,256> remap;remap.fill(-1);
+    unsigned added=0,brim=0;
+    cursor=own.list;
+    for(unsigned guard=0;;++guard) {
+        if(guard>16 || !valid(cursor,4)) return;
+        const uint32_t header=psx_mod_read_word(cursor);cursor+=4;
+        const unsigned type=header&0xff,n=header>>16;
+        if(type==0xff) break;
+        const unsigned size=type==0x2c || type==0x24 ? 16 : type==0x28 || type==0x20 ? 8 : 0;
+        if(!size || !n || n>512 || !valid(cursor,n*size)) return;
+        for(unsigned k=0;k<n && type==0x24;++k) {
+            const uint32_t r=cursor+16*k,idx=psx_mod_read_word(r);
+            bool above=true,crown=false,wide=false;
+            for(unsigned j=0;j<3;++j) {
+                const unsigned i=(idx>>(8*j))&0xff;
+                if(i>=own.count) return;
+                const int16_t x=(int16_t)psx_mod_read_half(own.verts+8*i),y=vy(i),z=(int16_t)psx_mod_read_half(own.verts+8*i+4);
+                above&=y<=-60;crown|=y<-98 || std::abs(x)>35 || z<-60;wide|=std::abs(x)>60;
+            }
+            if(!above || !crown) continue;
+            hat.push_back(r);brim+=wide;
+            for(unsigned j=0;j<3;++j) {const unsigned i=(idx>>(8*j))&0xff;if(remap[i]<0) remap[i]=int(bare.count+added++);}
+        }
+        cursor+=n*size;
+    }
+    // A costume without a hat (or another costume's head) draws as native.
+    if(hat.size()<16 || brim<8 || bare.count+added>255) return;
+    const uint32_t verts_at=0x28,list_at=verts_at+8*(bare.count+added);
+    if(list_at+bare_bytes+4+16*hat.size()+4>hat_copy_bytes) return;
+    uint32_t& copy=hat_copy[face==2?0:1];
+    if(!copy) copy=psx_mod_alloc_guest_memory(hat_copy_bytes,16);
+    if(!copy) return;
+    for(uint32_t i=0;i<0x18;i+=4) psx_mod_write_word(copy+i,psx_mod_read_word(mesh+i));
+    psx_mod_write_byte(copy+6,bare.count+added);
+    psx_mod_write_word(copy+8,copy+0x18);
+    psx_mod_write_word(copy+0x10,copy+verts_at);
+    psx_mod_write_word(copy+0x14,copy+list_at);
+    // Box: min x, y, z, extent; max x, y, z, extent. The costume head's box
+    // already holds its hat, so the union is conservative.
+    for(unsigned k=0;k<8;++k) {
+        const int16_t a=(int16_t)psx_mod_read_half(bare.box+2*k),b=(int16_t)psx_mod_read_half(own.box+2*k);
+        psx_mod_write_half(copy+0x18+2*k,(uint16_t)(k<3?std::min(a,b):std::max(a,b)));
+    }
+    // The bare head is taller and wider than the costume's skull (flat top at
+    // -122 and 40 across). At the back the hat's brim meets the crown low
+    // (about -84 at z -41) and the head's hair sat between them, where the
+    // painter sort drew it over the hat: there the head's top (above -66) is
+    // pressed under the brim line, to -76 at most, and in by 15%. At the front
+    // the brim meets the crown high (about -98 at z 49), so only the forehead
+    // above -95 is lowered to -95: pressing it further folded the mask's face
+    // plate and opened a hole at the eyes. Blended over z 0..20. The side
+    // respirator canisters (|x| >= 45) keep their shape.
+    for(unsigned i=0;i<bare.count;++i) {
+        const uint32_t v=bare.verts+8*i,o=copy+verts_at+8*i;
+        psx_mod_write_word(o,psx_mod_read_word(v));psx_mod_write_word(o+4,psx_mod_read_word(v+4));
+        const int x=(int16_t)psx_mod_read_half(v),y=(int16_t)psx_mod_read_half(v+2),z=(int16_t)psx_mod_read_half(v+4);
+        if(y>=-66 || std::abs(x)>=45) continue;
+        const int front=std::clamp(z,0,20); // 0 back .. 20 front
+        const int bx=x*85/100,by=-66+(y+66)*10/56,bz=z*85/100,fy=std::max(y,-95);
+        psx_mod_write_half(o,(uint16_t)(int16_t)((bx*(20-front)+x*front)/20));
+        psx_mod_write_half(o+2,(uint16_t)(int16_t)((by*(20-front)+fy*front)/20));
+        psx_mod_write_half(o+4,(uint16_t)(int16_t)((bz*(20-front)+z*front)/20));
+    }
+    for(unsigned i=0;i<own.count;++i)
+        if(remap[i]>=0) for(unsigned w=0;w<2;++w)
+            psx_mod_write_word(copy+verts_at+8*remap[i]+4*w,psx_mod_read_word(own.verts+8*i+4*w));
+    for(uint32_t i=0;i<bare_bytes;i+=4) psx_mod_write_word(copy+list_at+i,psx_mod_read_word(bare.list+i));
+    uint32_t out=copy+list_at+bare_bytes;
+    psx_mod_write_word(out,0x24u|(uint32_t)hat.size()<<16);out+=4;
+    for(const uint32_t r:hat) {
+        const uint32_t idx=psx_mod_read_word(r);
+        uint32_t mapped=idx&0xff000000u;
+        for(unsigned j=0;j<3;++j) mapped|=(uint32_t)remap[(idx>>(8*j))&0xff]<<(8*j);
+        psx_mod_write_word(out,mapped);
+        for(uint32_t w=4;w<16;w+=4) psx_mod_write_word(out+w,psx_mod_read_word(r+w));
+        out+=16;
+    }
+    psx_mod_write_word(out,end_word);
+    cpu->gpr[4]=copy;++hat_draws;
+}
+double first_person_legs_coverage() {return body_coverage_supported()?hang_legs_alpha():1.0;}
+double third_person_body_coverage() {
+    if(!third_person_camera_live() || !body_coverage_supported() || third_person_body_effect()) return 1.0;
+    double d[3];
+    // Chest centre, independent of animation jitter and costume joint indices.
+    // D17AY: Duke where this draw shows him (between game ticks in a redraw).
+    draw_object_pose(player,d,nullptr);
+    for(int i=0;i<3;++i) d[i]-=(int32_t)psx_mod_read_word(camera+0x14+4*i);
+    d[1]-=640;
+    const double lateral=d[0]*(int16_t)psx_mod_read_half(camera)/4096.0+d[1]*(int16_t)psx_mod_read_half(camera+2)/4096.0+d[2]*(int16_t)psx_mod_read_half(camera+4)/4096.0;
+    const double coverage=camera_body_coverage(std::sqrt(d[0]*d[0]+d[1]*d[1]+d[2]*d[2]),lateral);
+    present_trace_value("body_coverage",coverage);
+    return coverage;
+}
+bool first_person_view_live() {return input_modernized() && fp_blend>0 && orbit_valid;}
+bool first_person_duke_drawing() {return duke_drawing;}
+bool first_person_actor_drawing() {return actor_drawing;}
+LimbPresentation first_person_limb_presentation() {
+    return weapon_duke_draw && first_person_view_live() ? limb_draw : LimbPresentation{};
+}
+bool first_person_interaction_drawing() {return first_person_limb_presentation().interaction();}
+bool first_person_weapon_drawing() {return first_person_limb_presentation().viewmodel();}
+const char* controls_debug_json() {
+    static char buffer[13056];
+    std::snprintf(buffer,sizeof buffer,"{\"free_look\":{\"active\":%s,\"held\":%s,\"offset_yaw\":%.6f,\"offset_pitch\":%.6f},\"tight_camera\":{\"live\":%s,\"safe_boom\":%.2f,\"compressed\":%s,\"coverage\":%.4f},\"clear_lens\":%s,\"mouse_deg\":%.4f,\"edge_jumps\":%u,\"step_drops\":%u,\"run_offs\":%u,\"delayed_jumps\":%u,\"standing_takeoffs\":%u,\"blocked_drifts\":%u,\"swim_mantles\":%u,\"wade_jumps\":%u,\"swim_dives\":%u,\"swim_dive_stops\":%u,\"swim_paces\":%u,\"swimming\":\"%s\",\"swim_fire_masks\":%u,\"swim_fire_restores\":%u,\"swim_aims\":%u,\"swim_aim_restores\":%u,\"swim_arm_aims\":%u,\"swim_redraws\":%u,\"swim_fire_draws\":%u,\"ledge_assists\":%u,\"jet_updates\":%u,\"jet_hovers\":%u,\"jet_descents\":%u,\"jet_hold_captures\":%u,\"jet_root_nudges\":%u,\"jet\":%s,\"jet_scheme\":\"%s\",\"jet_classic\":%s,\"jet_classic_updates\":%u,\"push_masks\":%u,\"push_idle_masks\":%u,\"push_grab\":%s,\"ledge_reach_arms\":%u,\"air_mantles\":%u,\"hang_releases\":%u,\"lift_catches\":%u,\"turn_catches\":%u,\"drop_mantles\":%u,\"last_drop_rel\":%d,\"step_ups\":%u,\"mantle_upper_handoffs\":%u,\"mantle_upper_restores\":%u,\"last_step_rel\":%d,\"edge_postpones\":%u,\"jump_style\":\"%s\",\"air_steers\":%u,\"coyote_jumps\":%u,\"quick_takeoffs\":%u,\"air_cap\":%.0f,\"hang_settles\":%u,\"ceiling\":{\"ready\":%s,\"updates\":%u,\"turns\":%u,\"advances\":%u,\"drops\":%u},\"ladder_top\":{\"available\":%s,\"active\":%s,\"starts\":%u,\"mounts\":%u,\"aborts\":%u,\"leaps\":%u,\"leap_nudges\":%u,\"end_probes\":%u,\"end_hits\":%u,\"end_stops\":%u,\"mount_finishes\":%u,\"actor_exits\":%u,\"actor_exit_checks\":%u},\"pole\":{\"mount_starts\":%u,\"mounts\":%u,\"mount_aborts\":%u,\"floor_rejects\":%u,\"stall_drops\":%u,\"mounting\":%s},\"identity_calls\":%llu,\"identity_checks\":%llu,\"identity_us\":%llu,\"selections\":%llu,\"jumps\":%llu,\"speed_changes\":%llu,\"moves\":%llu,\"probes\":%llu,\"cameras\":%llu,\"frame_window\":%u,\"refusals\":%llu,\"ready\":%s,\"swim\":%s,\"looks\":%llu,\"orbits\":%llu,\"yaw\":%.6f,\"pitch\":%.6f,\"radius\":%.3f,\"preferred_radius\":%.3f,\"shoulder_offset\":%.3f,\"recentering\":%s,\"recenters\":%llu,\"rest_pitch\":%.6f,\"key_look\":{\"hold\":%d,\"lock\":%s,\"returning\":%s,\"looks\":%llu,\"returns\":%llu,\"taps\":%llu},\"key_turn\":{\"hold\":%d,\"running\":%s,\"turns\":%llu},\"selected_item\":%u,\"last_weapon\":%u,\"crouch_entries\":%u,\"crouch_exits\":%u,\"crouch_blocked\":%u,\"facings\":%llu,\"arms\":%llu,\"orientations\":%llu,\"fp\":{\"action\":\"%s\",\"effective\":%s,\"requested\":%s,\"supported\":%s,\"blend\":%.3f,\"reason\":\"%s\",\"updates\":%llu,\"fallbacks\":%llu,\"follows\":%llu,\"head_hides\":%llu,\"head_reclaims\":%llu,\"head_flag\":%u,\"min_boom\":%u,\"projection\":%d,\"fov\":%s,\"projections\":%llu,\"near\":%s,\"weapon\":{\"enabled\":%s,\"hands\":%llu,\"draws\":%llu,\"flashes\":%llu,\"items\":%llu,\"readies\":%llu,\"pose\":\"%s\",\"recorded\":%llu,\"arm_hides\":%llu,\"fade_clears\":%llu,\"matrix\":%u},\"kick\":%s,\"tp_kick\":%s},\"aim\":%s,\"draw_distance\":%s,\"steroids\":%s,\"steroid_beat\":%s,\"pickup_select\":%s,\"run_click\":%s,\"powerups\":%s,\"ammo_icons\":%s,\"jump_walls\":%s,\"landing\":%s,\"wall_backflip\":%s,\"dynamite\":%s,\"climb_fire\":%s,\"climb_aim\":%s,\"mantle_fire\":%s,\"sidearm_mantle\":%s,\"weapon_feel\":%s,\"weapon_switch\":%s,\"weapon_pose\":%s,\"muzzle_settle\":%s}",
+        free_look.active?"true":"false",free_look.held?"true":"false",free_look.x,free_look.y,
+        third_person_camera_live()?"true":"false",tight_distance,tight_compressed?"true":"false",third_person_body_coverage(),clear_lens_debug_json(),sensitivity()*360/tau,
+        edge_jumps,step_drops,run_offs,delayed_jumps,standing_takeoffs,blocked_drifts,swim_mantles,wade_jumps,swim_dives,swim_dive_stops,swim_paces,swimming_modern()?"modern":"original",swim_fire_masks,swim_fire_restores,swim_aims,swim_aim_restores,swim_arm_aims,swim_redraws,swim_fire_draws,ledge_assists,jet_updates,jet_hover_engages,jet_descents,jet_hold_captures,jet_root_nudges,jetpack_input_ready()?"true":"false",jetpack_classic()?"classic":jetpack_eduke32()?"eduke32":"modern",jetpack_classic_input_ready()?"true":"false",jet_classic_updates,push_masks,push_idle_masks,push_grab_ready()?"true":"false",ledge_reach_arms,air_mantles,hang_releases,lift_catches,turn_catches,drop_mantles,last_drop_rel,step_ups,mantle_upper_handoffs,mantle_upper_restores,last_step_rel,edge_postpones,manual_jump()?"manual":"assisted",air_steers,coyote_jumps,quick_takeoffs,air_cap,hang_settles,ceiling_hang_ready()?"true":"false",ceiling_updates,ceiling_turns,ceiling_advances,ceiling_drops,ladder_top_available()?"true":"false",mount.active?"true":"false",ladder_mount_starts,ladder_mounts,ladder_mount_aborts,ladder_leaps,ladder_leap_nudges,ladder_end_probes,ladder_end_hits,ladder_end_stops,ladder_mount_finishes,ladder_actor_exits,ladder_actor_checks,pole_mount_starts,pole_mounts,pole_mount_aborts,pole_floor_rejects,pole_stall_drops,pole_mount.active?"true":"false",(unsigned long long)identity_calls,(unsigned long long)identity_checks,(unsigned long long)(identity_ns/1000),(unsigned long long)selections,(unsigned long long)jumps,(unsigned long long)speed_changes,(unsigned long long)moves,(unsigned long long)probes,(unsigned long long)cameras,frame_window,
+        (unsigned long long)refusals,lease_ready()?"true":"false",swim_lease_ready()?"true":"false",(unsigned long long)looks,(unsigned long long)orbits,yaw,pitch,radius,preferred_radius,shoulder_offset,recentering?"true":"false",(unsigned long long)recenters,rest_pitch,key_hold,key_lock?"true":"false",key_return?"true":"false",(unsigned long long)key_looks,(unsigned long long)key_returns,(unsigned long long)key_taps,turn_hold,turn_running?"true":"false",(unsigned long long)key_turns,selected_item,last_equipped,crouch_entries,crouch_exits,crouch_blocked,(unsigned long long)facings,(unsigned long long)arms,(unsigned long long)orientations,
+        perspective_action(fp_policy.action),fp_policy.effective?"true":"false",fp_policy.selected?"true":"false",fp_policy.capable?"true":"false",fp_blend,perspective_reason(fp_policy.reason),(unsigned long long)fp_updates,(unsigned long long)fp_fallbacks,(unsigned long long)fp_follows,(unsigned long long)head_hides,(unsigned long long)head_reclaims,head_flag,psx_mod_read_word(min_boom_word),fp_blend>0?last_projection:(int)(int16_t)psx_mod_read_half(camera+0x42),first_person_fov_debug_json(),(unsigned long long)projections,near_clip_debug_json(),weapon_view_enabled()?"true":"false",(unsigned long long)weapon_hands,(unsigned long long)weapon_draws,(unsigned long long)weapon_flashes,(unsigned long long)weapon_items,(unsigned long long)weapon_readies,weapon_ready_pose()?"ready":"animated",(unsigned long long)poses_recorded,(unsigned long long)arm_hides,(unsigned long long)fade_clears,weapon_matrix,kick_debug_json(),tp_kick_debug_json(),aim_debug_json(),draw_distance_debug_json(),steroids_debug_json(),steroids_beat_debug_json(),pickup_select_debug_json(),run_click_debug_json(),powerups_debug_json(),ammo_hud_debug_json(),jump_walls_debug_json(),landing_debug_json(),wall_backflip_debug_json(),dynamite_debug_json(),climb_fire_debug_json(),climb_aim_debug_json(),mantle_fire_debug_json(),sidearm_mantle_debug_json(),weapon_feel_debug_json(),weapon_switch_debug_json(),weapon_pose_debug_json(),muzzle_settle_debug_json());
+    return buffer;
+}
+}
+PSX_MOD_CONSTRUCTOR(register_ttk_controls) {
+    psx_mod_register_activation_plugin("ttk.widescreen",ttk::widescreen_activate);
+    for (uint32_t address: {0x8004ac08u,0x80076330u,0x80081a48u,0x8002b9f4u,0x800493a4u,0x80054308u,0x8005a210u,0x80059db0u,0x80048410u,0x8004b644u,0x8003ebf4u,0x8002a7fcu,0x80058120u,0x80097a44u,0x80054218u,0x80053404u,0x80053500u,0x800539f8u,0x800780b4u,0x8003ade4u,0x8003aa48u,0x800348d8u,0x8001ca4cu,0x8002a038u,0x800b4d9cu,0x800b4d2cu,0x800292a0u,0x80033e40u,0x800341e4u,0x80033f5cu,0x80051cf0u,0x80051890u,0x8008ba30u,0x8001fc44u,0x8006276cu,0x80062b48u,0x8002ffecu,0x800455bcu,0x80055e80u,0x800411b8u})
+        psx_mod_register_function_entry_plugin("ttk.modern.controls",address,ttk::hook);
+    // D17AQ dormant enemies: spawner range, spawner tick, actor prep, the empty
+    // class handler and the call after the actor loop.
+    psx_mod_register_function_entry_plugin("ttk.modern.controls",0x80099164,[](CPUState* cpu,uint32_t){ttk::reach_range(cpu);});
+    psx_mod_register_function_entry_plugin("ttk.modern.controls",0x80099530,[](CPUState* cpu,uint32_t){ttk::reach_tick(cpu);ttk::sleeping_update(cpu);});
+    // D41B: every round's launch and impact (shot lights).
+    psx_mod_register_function_entry_plugin("ttk.lights",0x800718ac,[](CPUState* cpu,uint32_t){ttk::lights_launch(cpu);});
+    psx_mod_register_function_entry_plugin("ttk.lights",0x8006f1b8,[](CPUState* cpu,uint32_t){ttk::lights_impact(cpu);});
+    // D47: a shot from rest smokes at the drawn muzzle (gun call, then Duke's draw).
+    psx_mod_register_function_entry_plugin("ttk.muzzle.settle",0x8003c500,[](CPUState* cpu,uint32_t){ttk::muzzle_settle_shot(cpu);});
+    psx_mod_register_function_entry_plugin("ttk.muzzle.settle",0x80032bd8,[](CPUState* cpu,uint32_t){ttk::muzzle_settle_drawn(cpu);});
+    // D41I developer probe: DNTTK_LIGHT_PROBE=<hex>[,<hex>...] counts entries of
+    // game functions that carry the mod hook (note 413 section 11).
+    if(const char* probe=std::getenv("DNTTK_LIGHT_PROBE")) for(const char* q=probe;*q;) {
+        char* end=nullptr;const unsigned long a=std::strtoul(q,&end,16);if(end==q) break;
+        if(a) psx_mod_register_function_entry_plugin("ttk.lights.probe",(uint32_t)a,[](CPUState* cpu,uint32_t fn){ttk::lights_probe_entry(cpu,fn);});
+        q=*end?end+1:end;
+    }
+    psx_mod_register_function_entry_plugin("ttk.modern.controls",0x80028a2c,[](CPUState* cpu,uint32_t){ttk::lights_shake(cpu);ttk::earthquake_native_shake(cpu);});
+    psx_mod_register_function_entry_plugin("ttk.modern.controls",0x80025944,[](CPUState* cpu,uint32_t){ttk::reach_hold(cpu);});
+    psx_mod_register_function_entry_plugin("ttk.modern.controls",0x800632b8,[](CPUState* cpu,uint32_t){ttk::reach_release(cpu);});
+    psx_mod_register_function_entry_plugin("ttk.modern.controls",0x800374cc,[](CPUState* cpu,uint32_t){ttk::open_sky_object_pass(cpu);ttk::sleeping_draw(cpu);});
+    psx_mod_register_function_entry_plugin("ttk.modern.controls",0x8006cefc,[](CPUState*,uint32_t){ttk::reach_restore();});
+    // D08O2A: a shared matrix routine; its own hook keeps the per-joint cost to a few compares.
+    psx_mod_register_function_entry_plugin("ttk.modern.controls",0x800b42ec,[](CPUState* cpu,uint32_t){ttk::swim_aim_arm(cpu);ttk::climb_aim_arm(cpu);});
+    // D08AA: a shared rotation; only the swim tail's call (ra 0x80046ec8) goes further.
+    psx_mod_register_function_entry_plugin("ttk.modern.controls",0x80066e34,[](CPUState* cpu,uint32_t){if(cpu->gpr[31]==0x80046ec8u)ttk::swim_pace(cpu);});
+    // Shared bone lookup: D08AF plunge sweep, D08J5 pole floor probe and D08AC final water-entry
+    // neck query only. Other joint lookups retain the cheap caller check.
+    psx_mod_register_function_entry_plugin("ttk.modern.controls",0x8003964c,[](CPUState* cpu,uint32_t){if(cpu->gpr[31]==0x8007a9f8u)ttk::swim_plunge_sweep(cpu);else if(cpu->gpr[31]==0x8007d7fcu)ttk::pole_probe_floor(cpu);else if(cpu->gpr[31]==0x8005610cu)ttk::hook(cpu,0x8003964c);});
+    // D08A4: the sound routine; only the pickup tail's call (ra 0x800828d8) goes further.
+    psx_mod_register_function_entry_plugin("ttk.modern.controls",0x8006b73c,[](CPUState* cpu,uint32_t){ttk::steroids_damage_restore();ttk::sound_logged(cpu);ttk::lights_sound(cpu);if(cpu->gpr[31]==0x800828d8u){ttk::steroids_pickup_sound(cpu);ttk::pickup_flash_sound(cpu);}});
+    // D27A: the player update; only Duke's call goes further.
+    psx_mod_register_function_entry_plugin("ttk.modern.controls",0x800412a4,[](CPUState* cpu,uint32_t){ttk::steroids_damage_restore();if(cpu->gpr[4]==ttk::player){ttk::lights_tick();ttk::flash_frame(cpu);ttk::run_click_presync();ttk::jet_water_start(cpu);ttk::grounded_water_jet_close_arm(cpu);}});
+    // D12C: the damage sphere; only the original kick's call (ra 0x80049098) goes further.
+    psx_mod_register_function_entry_plugin("ttk.modern.controls",0x800a979c,[](CPUState* cpu,uint32_t){ttk::steroids_damage_restore();if(cpu->gpr[31]==0x80049098u)ttk::kick_sphere_entry(cpu);});
+    // D08A8: the composition's call after the status bar when 0x8001fc44 is skipped.
+    psx_mod_register_function_entry_plugin("ttk.modern.controls",0x8002e850,[](CPUState* cpu,uint32_t){ttk::steroids_damage_restore();if(cpu->gpr[31]==0x800265d4u){ttk::steroids_hud_restore();ttk::widescreen_hud_restore();ttk::flash_dead_frame();}});
+    // D35I: authenticated wall motion before the native climb dispatcher.
+    psx_mod_register_function_entry_plugin("ttk.wall.climb",0x80043eb8,[](CPUState* cpu,uint32_t){ttk::wall_climb_dispatch(cpu,cpu->gpr[31]);});
+    psx_mod_register_function_entry_plugin("ttk.climb.fire",0x80043eb8,[](CPUState* cpu,uint32_t){ttk::climb_fire_dispatch(cpu);});
+    // D08Z5: the slope jump's first airborne update, before D08Z1 sees the velocity.
+    psx_mod_register_function_entry_plugin("ttk.wall.backflip",0x8003ebf4,[](CPUState* cpu,uint32_t){ttk::wall_backflip_climb(cpu);});
+    // D08Z1: after ttk.modern.controls at the same entry, so the velocity is final.
+    psx_mod_register_function_entry_plugin("ttk.jump.walls",0x8003ebf4,[](CPUState* cpu,uint32_t){ttk::jump_walls_presolve(cpu);ttk::jump_walls_bounce_rerun(cpu);});
+    // D08Z2: the sound call; only the bounce's contact sound (ra 0x80055a10) goes further.
+    psx_mod_register_function_entry_plugin("ttk.jump.walls",0x8006bbd8,[](CPUState* cpu,uint32_t){ttk::d08q10_sound_trace(cpu,0x8006bbd8);ttk::jump_walls_bounce_sound(cpu);if(cpu->gpr[31]==0x80082d3cu)ttk::pickup_flash_sound(cpu);});
+    // D08Z5: the slope slide start (after the mode 2 store), its fall start and that fall's launch rotation.
+    psx_mod_register_function_entry_plugin("ttk.wall.backflip",0x8005446c,[](CPUState* cpu,uint32_t){ttk::wall_backflip_slide_start(cpu);});
+    psx_mod_register_function_entry_plugin("ttk.wall.backflip",0x8003f060,[](CPUState* cpu,uint32_t){ttk::wall_backflip_fall(cpu);});
+    psx_mod_register_function_entry_plugin("ttk.wall.backflip",0x80066e34,[](CPUState* cpu,uint32_t){ttk::wall_backflip_launch(cpu);});
+    // D08Z5: the slide's jump start (99/100 backwards) at the lower-body initializer.
+    psx_mod_register_function_entry_plugin("ttk.wall.backflip",0x800493a4,[](CPUState* cpu,uint32_t){ttk::wall_backflip_jump(cpu);});
+    // D08A13: Duke's damage handler; running steroids no longer shield the hit.
+    psx_mod_register_function_entry_plugin("ttk.modern.controls",0x800a40a8,[](CPUState* cpu,uint32_t){ttk::steroids_damage_entry(cpu);ttk::bio_mask_damage_entry(cpu);ttk::damage_flash_entry(cpu);});
+    // D08A12: the held-throwable handler; dynamite stays unlit until fire.
+    psx_mod_register_function_entry_plugin("ttk.modern.controls",0x8004dea4,[](CPUState* cpu,uint32_t){ttk::dynamite_entry(cpu);});
+    // D08A12: the sparks and the sizzle; only the unlit stick's calls (ra 0x8004e138 / 0x8004e154) go further.
+    psx_mod_register_function_entry_plugin("ttk.modern.controls",0x8006d594,[](CPUState* cpu,uint32_t){ttk::dynamite_sparks(cpu);});
+    psx_mod_register_function_entry_plugin("ttk.modern.controls",0x8006b270,[](CPUState* cpu,uint32_t){ttk::d08q10_sound_trace(cpu,0x8006b270);if(cpu->gpr[31]==0x80054cb0u)ttk::hook(cpu,0x8006b270);if(cpu->gpr[31]==0x800538c4u)ttk::weapon_feel_bump(cpu);ttk::dynamite_sizzle(cpu);ttk::lights_sound_water(cpu);});
+}

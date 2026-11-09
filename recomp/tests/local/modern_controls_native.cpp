@@ -1,0 +1,8948 @@
+#include "action_perspective.h"
+#include "live_env.h"
+#include "tight_camera.h"
+static unsigned night_vision_sounds,bio_mask_sounds,piano_sounds;
+namespace ttk { void piano_sound(int,int,int) {++piano_sounds;} void piano_audio_reset() {} void night_vision_sound() {++night_vision_sounds;} void bio_mask_sound() {++bio_mask_sounds;} }
+static bool renderer_available=true;
+extern "C" int psx_mod_present_replay_available(void){return renderer_available;}
+#include <cstdint>
+#include <cstdlib>
+#include <string_view>
+extern "C" int pgxp_mesh_geometry(void) {const char* s=std::getenv("DNTTK_GEOMETRY_PRECISION");return s && std::string_view(s)=="corrected";}
+extern "C" int pgxp_mesh_textures(void) {const char* s=std::getenv("DNTTK_TEXTURE_PRECISION");return s && std::string_view(s)=="corrected";}
+extern "C" void pgxp_mesh_register_boundary(void) {}
+extern "C" void pgxp_invalidate_all(void) {}
+extern "C" {int g_pgxp_mesh_active=0;}
+extern "C" int pgxp_mesh_vertex(uint32_t,uint32_t,int32_t*,int32_t*,uint16_t*) {return 0;}
+extern "C" void gte_nclip_culling_set(int) {}
+extern "C" void gte_nclip_culling_stats(uint64_t* checks,uint64_t* flips) {*checks=*flips=0;}
+// Owned-data integration harness. Models call contracts, not terrain/animation.
+#include "modern_controls.h"
+#include "level_select.h"
+#include "control_math.h"
+#include "first_person_fov.h"
+#include "contact_arm_ik.h"
+#include "pc_input.h"
+#include "cpu_state.h"
+#include "mod_plugins.h"
+#include <cassert>
+#include <cmath>
+#include <cstdio>
+#include <cstring>
+#include <cstdlib>
+#include <fstream>
+#include <map>
+#include <array>
+#include <vector>
+#include <unistd.h>
+#include <sys/wait.h>
+#include <string>
+#include <iterator>
+#include <algorithm>
+static uint8_t ram[0x200000];
+// The runtime runs every plugin registered at an address, in registration order.
+struct HookChain {
+    std::vector<PSXModFunctionEntryCallback> list;
+    void operator()(CPUState* cpu,uint32_t address) const {for(auto hook:list)hook(cpu,address);}
+};
+static auto& hooks() {static std::map<uint32_t,HookChain> value;return value;}
+static unsigned writes, code_writes;
+// Distinct aligned allocations, like the runtime. Aliasing every request hid
+// lifetime bugs when a weapon and its arm scratch coexist in one draw.
+extern "C" uint32_t psx_mod_alloc_guest_memory(uint32_t size,uint32_t align){
+    static uint32_t next=0x801e0000;
+    next=(next+align-1)&~(align-1);const uint32_t result=next;next+=size;
+    assert(next<0x801e1000);return result;
+}
+extern "C" uint32_t psx_mod_alloc_gpu_dma_memory(uint32_t,uint32_t){return 0;}
+// D17AX: no second aperture here (the region keeps its D17AR2 size).
+extern "C" uint32_t psx_mod_alloc_gpu_dma_extra_memory(uint32_t,uint32_t){return 0;}
+extern "C" uint8_t psx_mod_read_byte(uint32_t a) {return ram[a&0x1fffff];}
+extern "C" uint16_t psx_mod_read_half(uint32_t a) {return psx_mod_read_byte(a)|(psx_mod_read_byte(a+1)<<8);}
+extern "C" uint32_t psx_mod_read_word(uint32_t a) {return psx_mod_read_half(a)|(uint32_t(psx_mod_read_half(a+2))<<16);}
+// Runtime RAM image + RAM-code generation (memory.c). The runtime bumps the
+// generation on clean->dirty page transitions and executable-range marks;
+// this mock bumps on every store, the conservative model.
+extern "C" {uint8_t* g_psx_ram=ram;uint32_t g_dirty_ram_code_gen=1;}
+// A guest store into guarded code: the runtime marks the page (generation bump).
+static void poke(uint32_t offset) {ram[offset]^=1;++g_dirty_ram_code_gen;}
+extern "C" void psx_mod_write_byte(uint32_t a,uint8_t v) {ram[a&0x1fffff]=v;++writes;++g_dirty_ram_code_gen;}
+extern "C" void psx_mod_write_half(uint32_t a,uint16_t v) {ram[a&0x1fffff]=v;ram[(a+1)&0x1fffff]=v>>8;++writes;++g_dirty_ram_code_gen;}
+extern "C" void psx_mod_write_word(uint32_t a,uint32_t v) {psx_mod_write_half(a,v);psx_mod_write_half(a+2,v>>16);}
+extern "C" void psx_mod_write_code_word(uint32_t a,uint32_t v) {++code_writes;psx_mod_write_word(a,v);}
+extern "C" int psx_mod_register_function_entry_plugin(const char*,uint32_t a,PSXModFunctionEntryCallback cb) {hooks()[a].list.push_back(cb);return 1;}
+extern "C" int psx_mod_gpu_host_vertex(uint32_t,uint32_t,int32_t,int32_t,float,float,float){return 1;}
+extern "C" int psx_mod_gpu_host_vertex_depth(uint32_t,uint32_t,int32_t,int32_t,float,float,float,float){return 1;}
+extern "C" int psx_mod_gpu_host_vertex_coverage(uint32_t,uint32_t,int32_t,int32_t,float,float,float,float,float){return 1;}
+extern "C" int psx_mod_gpu_host_vertex_depth_only(uint32_t,uint32_t,int32_t,int32_t,float,float,float,float,float){return 1;}
+extern "C" int psx_mod_gpu_host_vertex_test_only(uint32_t,uint32_t,int32_t,int32_t,float,float,float,float,float){return 1;}
+extern "C" int psx_mod_gpu_host_vertex_foreign(uint32_t,uint32_t,int32_t,int32_t,float,float,float,float,float){return 1;}
+// D41A dynamic lighting.
+extern "C" int psx_mod_gpu_host_vertex_world(uint32_t,uint32_t,float,float,float){return 1;}
+extern "C" int psx_mod_gpu_host_vertex_world_normal(uint32_t,uint32_t,float,float,float,float,float,float){return 1;}
+extern "C" void psx_mod_gpu_set_lights(const PSXModLight*,int,float){}
+static PSXModActivationCallback activation;static unsigned aspect_num,aspect_den;
+extern "C" int psx_mod_register_activation_plugin(const char*,PSXModActivationCallback cb) {activation=cb;return 1;}
+extern "C" int psx_mod_set_fixed_display_aspect(uint32_t n,uint32_t d) {aspect_num=n;aspect_den=d;return 1;}
+static unsigned adaptive_num,adaptive_den;static int32_t ws_margin;
+extern "C" int psx_mod_set_adaptive_display_aspect(uint32_t n,uint32_t d) {adaptive_num=n;adaptive_den=d;return 1;}
+extern "C" int32_t psx_mod_widescreen_x_margin(void) {return ws_margin;}
+extern "C" {int g_precise_mode=0,g_ls_mode=0,g_psx_call_bail=0;}
+static int clearance_result=2048;
+static uint32_t hull_object;static int hull_ray_hit,hull_steep;static std::vector<int32_t> hull_ray_y;   // D08K2
+static int32_t hull_object_top;   // D08K7: the step 0x80077748 reports onto the contact's top
+static int ladder_end_result=0;static unsigned ladder_end_calls;
+static unsigned kicks, edge_launches, crouch_falls;
+static unsigned bubbles; static int32_t bubble_y; // D08Q10 80044fa4(actor, count, position)
+static std::vector<uint32_t> surface_sounds; // D08Q10 8006bbd8 ids, 0x80000000|handle for 8006af44
+static bool terrain_nested_hook;static unsigned terrain_nested_calls;
+static int terrain_result=3,terrain_floor=-1000;
+static uint32_t terrain_reference;
+static unsigned ledge_probe_calls; static bool ledge_probe_pass;
+static std::vector<uint32_t> cheat_calls;
+static uint32_t enemy_restore_actor;
+// D08X lift: the stubbed acquisition catches only when Duke is at or above lift_catch_y.
+static int32_t lift_catch_y=-100000;static unsigned lineups;static int lineup_ok=1;static std::vector<int32_t> lift_calls;
+// D08Y drop: the stub also catches when Duke is lowered to drop_catch_y or below,
+// as drop_mode with the ledge top drop_top; held_seen records the held bit.
+static int32_t drop_catch_y=100000,drop_top=0,lookahead_drop=-100000;static unsigned drop_mode=6;static std::vector<int> held_seen;
+// D12A quick kick: damage sphere and sound calls (address, a0..a3, two stack words, point).
+struct KickCall {uint32_t address,a[4],stack[2];int32_t point[3];};
+static std::vector<KickCall> kick_calls;
+// D12C: the stubbed sphere strikes something (it stores its attacker argument
+// at sp+0x10 of its own 0x80-byte frame, as 0x800a979c does on a hit).
+static bool sphere_strike;
+static std::vector<std::array<uint32_t,4>> steroid_sounds;
+
+// D08Y: the runtime CPU overclock lease (renewed from the player update).
+static unsigned overclock_renewals;extern "C" void psx_overclock_renew(void){++overclock_renewals;}
+// D10H6: the overclock scale held fire raises (CPU SPEED 150).
+extern "C" uint32_t g_psx_overclock_q16=43690u;
+// D08Z1: the isolated flight sweep 0x8007a98c reports `jw_result` with the
+// normal (jw_nx, 0, jw_nz) for its first `jw_hits` calls, then a clear path.
+static unsigned pole_draw_calls;
+static int wall_results[4]{};static std::vector<std::array<int,5>> wall_queries;
+static bool jet_geometry,jet_side_wall,jet_route_wall;
+static int jet_slope=0,jet_ceiling_slope=0;
+static unsigned medkit_heals; // D08A34
+static int jet_floor=1000000,jet_ceiling=-1000000,jet_step_x=1000000,jet_step_floor=1000000,jet_step_ceiling=-1000000;
+static int jw_result,jw_hits,jw_sweeps;static int32_t jw_nx,jw_nz;
+// D19U2: ordering-table adds (slot, packet) and the VRAM the keyed icons read.
+static std::vector<std::array<uint32_t,2>> ot_adds;
+static uint16_t test_vram[1024*512];
+extern "C" const uint16_t* gpu_get_vram(void){return test_vram;}
+// D08J9: the door finder and the original Action press.
+static uint32_t door_finder_object;static bool door_press_accept=true;
+static unsigned door_finds,door_presses,host_calls_open;static uint32_t door_press_word;
+extern "C" void psx_mod_host_call_begin(void){++host_calls_open;}
+extern "C" void psx_mod_host_call_end(void){assert(host_calls_open);--host_calls_open;}
+extern "C" void psx_dispatch_call(CPUState* cpu,uint32_t address,uint32_t) {
+    if(address==0x80077f28) {++door_finds;psx_mod_write_word(0x800d7198+0x174,door_finder_object);psx_mod_write_half(0x800d7198+0x178,7);cpu->pc=0;return;}
+    if(address==0x80051890) {
+        const uint32_t p=0x800d7198,word=psx_mod_read_word(0x800d1b50+4*psx_mod_read_byte(p+0x233));
+        ++door_presses;door_press_word=psx_mod_read_word(word);assert(host_calls_open);
+        if(door_press_accept && (door_press_word&3)==1 && !(psx_mod_read_word(p+0x224)&0x241)) {
+            psx_mod_write_byte(p+0x27c,2);psx_mod_write_byte(p+0x27d,1);psx_mod_write_word(p+0x290,psx_mod_read_word(p+0x174));
+            psx_mod_write_word(p+0x224,psx_mod_read_word(p+0x224)|0x40);
+        }
+        cpu->pc=0;return;
+    }
+    if(address==0x8002bc18) {ot_adds.push_back({cpu->gpr[4],cpu->gpr[5]});cpu->pc=0;return;}
+    if(address==0x8007d65c) {
+        const uint32_t p=0x800d7198;const unsigned dir=cpu->gpr[5];assert(dir<4 && cpu->gpr[6]==0);
+        wall_queries.push_back({int(dir),int16_t(psx_mod_read_half(p+0xfc)),int16_t(psx_mod_read_half(p+0xfe)),int16_t(psx_mod_read_half(p+0x100)),int(psx_mod_read_word(0x801e4018))});
+        psx_mod_write_word(p+0x174,0x1234);psx_mod_write_word(p+0x1c8,42);
+        cpu->gpr[2]=wall_results[dir];cpu->pc=0;return;
+    }
+    if(address==0x80031d10) {
+        assert(cpu->gpr[4]==0x800d6eb0 && cpu->gpr[5]==0x801ea000 && cpu->gpr[6]==0x800d2210);
+        ++pole_draw_calls;
+        psx_mod_write_word(cpu->gpr[29]-4,0x12345678);
+        psx_mod_write_word(0x1f800000,0xabcdef01);
+        cpu->gte_ctrl[26]=99;cpu->gpr[16]=123;cpu->pc=0;return;
+    }
+    if(address==0x8007d240) {
+        const uint32_t p=0x800d7198;++ledge_probe_calls;
+        assert(psx_mod_read_word(p+0x17c)==0 && psx_mod_read_word(p+0x174)==0);
+        psx_mod_write_word(p+0x184,1234); // query scratch must roll back on refusal
+        psx_mod_write_word(p+0x1c8,uint32_t(-11264));
+        cpu->gpr[2]=ledge_probe_pass;cpu->pc=0;return;
+    }
+    if(address==0x8003f060) {
+        assert(cpu->gpr[4]==0x800d7198 && cpu->gpr[5]==1);++crouch_falls;
+        psx_mod_write_half(0x800d7198+0x60,108);psx_mod_write_byte(0x800d7198+0x22c,9);
+        psx_mod_write_word(0x800d7198+0x1f8,0);cpu->pc=0;return;
+    }
+    if(address==0x80095cb0) {cpu->pc=0;return;} // D08T3 room membership
+    if(address==0x8007a98c) {
+        if(jet_geometry) {
+            const uint32_t p=0x800d7198;
+            const int x=(int32_t)psx_mod_read_word(p+4)+(int16_t)psx_mod_read_half(p+0xfc);
+            const int y=(int32_t)psx_mod_read_word(p+8)+(int16_t)psx_mod_read_half(p+0xfe);
+            const int foot=(int32_t)psx_mod_read_word(p+0x10)+(int16_t)psx_mod_read_half(p+0xfe);
+            const int floor=(x>=jet_step_x?jet_step_floor:jet_floor)+x*jet_slope/4;
+            const int ceiling=(x>=jet_step_x?jet_step_ceiling:jet_ceiling)+x*jet_ceiling_slope/4;
+            const int result=(jet_side_wall || (jet_route_wall && psx_mod_read_half(p+0xfc)))?1:y-352<ceiling?3:foot>=floor?2:0;
+            psx_mod_write_word(p+0x198,result==3?4096:result==2?uint32_t(-4096):0);
+            psx_mod_write_word(p+0x194,result==2?jet_slope*1024:result==3?-jet_ceiling_slope*1024:0);psx_mod_write_word(p+0x19c,jet_side_wall?4096:0);
+            psx_mod_write_word(p+0x184,x);psx_mod_write_word(p+0x188,result==3?ceiling:floor);
+            psx_mod_write_word(p+0x18c,psx_mod_read_word(p+12)); // query scratch must roll back
+            cpu->gpr[2]=result;cpu->pc=0;return;
+        }
+        const bool hit=++jw_sweeps<=jw_hits;
+        psx_mod_write_word(0x800d7198+0x194,uint32_t(jw_nx));psx_mod_write_word(0x800d7198+0x198,0);
+        psx_mod_write_word(0x800d7198+0x19c,uint32_t(jw_nz));
+        cpu->gpr[2]=hit?uint32_t(jw_result):0;cpu->pc=0;return;
+    }
+    if(address==0x8003ebf4) {cpu->pc=0;return;}   // D08Z1: its isolated integration
+    if(address==0x8003d738 || address==0x8003d7bc || address==0x8003d840) {
+        cheat_calls.push_back(address);cpu->pc=0;return;
+    }
+    if(address==0x80098d70 || address==0x80098f3c) {
+        auto row=cpu->gpr[4];cheat_calls.push_back(address);
+        if(address==0x80098d70){psx_mod_write_word(row+4,0);psx_mod_write_word(row+20,0);}
+        else {psx_mod_write_word(row+4,enemy_restore_actor);psx_mod_write_word(row+20,1);}
+        cpu->pc=0;return;
+    }
+    if(address==0x8003e2d0) {++edge_launches;cpu->pc=0;return;}
+    if(address==0x8006b73c) { // D08A4: the pickup sound R plays at Duke
+        steroid_sounds.push_back({cpu->gpr[4],cpu->gpr[5],cpu->gpr[6],cpu->gpr[7]});
+        if(cpu->gpr[4]==0x2007) { // D12C impact: a sound object (id +0x5c, table volume +0x6a) and its handle
+            kick_calls.push_back({0x8006b73c,{cpu->gpr[4],cpu->gpr[5],cpu->gpr[6],cpu->gpr[7]},{},{}});
+            psx_mod_write_word(0x801e1000+0x5c,0x2007);psx_mod_write_half(0x801e1000+0x6a,5192);
+            cpu->gpr[2]=0x05000000u|(0x801e1000u&0xffffffu);
+        }
+        cpu->pc=0;return;
+    }
+    if(address==0x8007ec4c) {++lineups;cpu->gpr[2]=lineup_ok;cpu->pc=0;return;}   // D08X mantle line-up
+    if(address==0x80055208) {
+        const uint32_t p=0x800d7198;const int32_t y=int32_t(psx_mod_read_word(p+8));lift_calls.push_back(y);
+        const uint32_t held=psx_mod_read_word(0x800d1b50+4*psx_mod_read_byte(p+0x233));
+        held_seen.push_back(held>=0x80010000u && held<0x80200000u ? int(psx_mod_read_word(held)&1) : -1);
+        if(y<=lift_catch_y){psx_mod_write_byte(p+0x22c,6);psx_mod_write_half(p+0x60,148);cpu->gpr[2]=1;}
+        else if(y>=drop_catch_y){psx_mod_write_byte(p+0x22c,drop_mode);psx_mod_write_half(p+0x60,148);psx_mod_write_word(p+0x1c8,uint32_t(drop_top));
+            psx_mod_write_half(p+0x24,1024);psx_mod_write_word(p+4,111);psx_mod_write_word(p+12,222);psx_mod_write_word(p+0x17c,0x5678);cpu->gpr[2]=1;}
+        else {psx_mod_write_word(p+0x174,0x1234);psx_mod_write_word(p+0x1c4,999);cpu->gpr[2]=0;}
+        cpu->pc=0;return;
+    }
+    if(address==0x800a979c || address==0x8006b270) {
+        KickCall k{address,{cpu->gpr[4],cpu->gpr[5],cpu->gpr[6],cpu->gpr[7]},
+                   {psx_mod_read_word(cpu->gpr[29]+0x10),psx_mod_read_word(cpu->gpr[29]+0x14)},{}};
+        if(address==0x800a979c) for(int i=0;i<3;++i) k.point[i]=(int32_t)psx_mod_read_word(cpu->gpr[4]+4*i);
+        if(address==0x800a979c && sphere_strike) psx_mod_write_word(cpu->gpr[29]-0x80+0x10,k.stack[0]);
+        kick_calls.push_back(k);cpu->pc=0;return;
+    }
+    if(address==0x8007ded0) { // D08U1 ladder-end probe; it clobbers the touch fields like 0x8007dd50
+        ++ladder_end_calls;psx_mod_write_word(0x800d7198+0x174,0);psx_mod_write_half(0x800d7198+0x178,0xffff);
+        cpu->gpr[2]=ladder_end_result;cpu->pc=0;return;
+    }
+    // D08K2 crouch probe: object probe, head ray (records the ray height), slope test.
+    if(address==0x800780b4) {psx_mod_write_word(0x800d7198+0x174,hull_object);cpu->pc=0;return;}
+    if(address==0x800774cc) {
+        hull_ray_y.push_back(int32_t(psx_mod_read_word(cpu->gpr[5]+4)));hull_ray_y.push_back(int32_t(psx_mod_read_word(cpu->gpr[6]+4)));
+        cpu->gpr[2]=hull_ray_hit;cpu->pc=0;return;
+    }
+    if(address==0x80077438) {assert(cpu->gpr[4]==0x800d7198+0x1a4);cpu->gpr[2]=hull_steep;cpu->pc=0;return;}
+    if(address==0x80077748) {assert(psx_mod_read_word(0x800d7198+0x174));psx_mod_write_word(0x800d7198+0x1c4,uint32_t(hull_object_top));cpu->pc=0;return;}
+    if(address==0x8003ff6c) {
+        psx_mod_write_half(0x800d7198+0x358,psx_mod_read_half(0x800d7198+0x358)&~2u);
+        psx_mod_write_word(0x800d7198+0x224,psx_mod_read_word(0x800d7198+0x224)|0x10000000);
+        cpu->pc=0;return;
+    }
+    if(address==0x8004001c) {
+        constexpr uint32_t p=0x800d7198;
+        const bool on=psx_mod_read_half(p+0x358)&2;
+        psx_mod_write_half(p+0x84c,on?5:0);
+        psx_mod_write_half(p+0x358,psx_mod_read_half(p+0x358)&~0x8000u);
+        psx_mod_write_word(p+0x224,psx_mod_read_word(p+0x224)&~0x10001000u);
+        cpu->pc=0;return;
+    }
+    if(address==0x8006bbd8 || address==0x8006af44) {
+        surface_sounds.push_back(address==0x8006bbd8 ? cpu->gpr[4] : 0x80000000u|cpu->gpr[4]);
+        cpu->gpr[2]=0x1234;cpu->pc=0;return;
+    }
+    if(address==0x80044fa4) {
+        // The position must sit between the isolated call frame and the caller.
+        assert(cpu->gpr[4]==0x800d7198 && cpu->gpr[5]>=1 && cpu->gpr[5]<=2 &&
+               cpu->gpr[6]>cpu->gpr[29] && cpu->gpr[6]<cpu->gpr[29]+0x100);
+        bubbles+=cpu->gpr[5];bubble_y=std::max(bubble_y,(int32_t)psx_mod_read_word(cpu->gpr[6]+4));
+        cpu->pc=0;return;
+    }
+    assert(address==0x8007926c || address==0x800797f4 || address==0x800402d0 || address==0x8007765c || address==0x800517a4);
+    if(address==0x800517a4)++kicks;
+    // D08A34: the medkit branch of 800402d0 (instant heal, pending bit cleared).
+    if(address==0x800402d0 && cpu->gpr[5]==5 && (psx_mod_read_half(0x800d7198+0x368)&0x8000)) {
+        ++medkit_heals;psx_mod_write_half(0x800d7198+0x368,psx_mod_read_half(0x800d7198+0x368)&0x7fff);
+    }
+    if(address==0x8007926c || address==0x800797f4) {
+        if(terrain_nested_hook) {
+            CPUState nested=*cpu;nested.gpr[29]-=0x158;nested.gpr[31]=0x800794b8;
+            hooks()[0x800780b4](&nested,0x800780b4);++terrain_nested_calls;
+        }
+        terrain_reference=psx_mod_read_word(0x800d7198+0x1c8);
+        psx_mod_write_word(0x800d7198+0x1c4,terrain_floor);cpu->gpr[2]=terrain_result;
+    } else {
+        if(address==0x8007765c && lookahead_drop!=-100000)psx_mod_write_word(0x800d7198+0x1c4,uint32_t(lookahead_drop));
+        cpu->gpr[2]=clearance_result;
+    }
+    cpu->pc=0;
+}
+namespace ttk {bool input_live_look(uint64_t&,double&,double&,double){return false;} void input_state_loaded(){}}
+// D08K9: opt-in clip availability for landing ownership fixtures.
+static bool landing_clips;
+namespace ttk {bool anim_extra_clip(unsigned clip,uint32_t& first,uint32_t& count){
+    if(!landing_clips)return false;first=10000+clip*10;count=3;return true;
+}}
+// D23E: no high-refresh redraws in the harness; the overclock lease pauses.
+namespace ttk {int replay_load_window(int window){return window==1 ? -1 : 0;}}
+// D50 hitch log stubs (frame_replay.cpp, gpu_gl_renderer.c).
+namespace ttk {uint64_t ro_drops_total(){return 0;}}
+extern "C" void gl_renderer_replay_diag(uint64_t* p,uint64_t* r,uint64_t* m,double* hz,uint64_t h[8]){if(p)*p=0;if(r)*r=0;if(m)*m=0;if(hz)*hz=0;if(h)for(int i=0;i<8;++i)h[i]=0;}
+namespace ttk {bool live_frame_redraw_only(){return false;}}
+namespace ttk {int replay_audio_low(){return 0;}}
+namespace ttk {void replay_beam_roots(){}} // D49: late first-person redraws only
+namespace ttk {bool aim_bolt_launch_enabled(){return false;}} // D49F: test stub
+namespace ttk {void replay_body_camera(bool){}void replay_quake_camera(bool){}void replay_quake_restore(){}bool replay_late_rotation(int16_t*){return false;}} // D14H/D35D1: replay workers only
+// D17AY: a redraw's in-between object poses (frame_replay.cpp); empty = a live draw.
+struct TestDrawPose {uint32_t obj; double pos[3]; double yaw;};
+static std::vector<TestDrawPose> test_draw_poses;
+namespace ttk {
+bool draw_object_pose(uint32_t obj,double pos[3],double* yaw) {
+    for(const auto& t:test_draw_poses) if(t.obj==obj) {
+        for(int k=0;k<3;++k)pos[k]=t.pos[k];
+        if(yaw)*yaw=t.yaw;
+        return true;
+    }
+    for(int k=0;k<3;++k)pos[k]=int32_t(psx_mod_read_word(obj+4+4*k));
+    if(yaw)*yaw=psx_mod_read_half(obj+0x1c)&0xfff;
+    return false;
+}
+bool present_trace_reference=false;
+static bool test_redraw=false;
+bool replay_redraw_active() {return test_redraw;}
+bool present_trace_enabled() {return false;}
+void present_trace(const char*,const double*) {}
+void present_trace_value(const char*,double) {}
+}
+extern "C" int psx_audio_out_stats(double*,double*,uint64_t*,uint64_t*,double*,int* legacy,int*){*legacy=1;return 0;}
+extern "C" void ttk_fast_timing_renew(void) {}
+static uint32_t save_loads;
+extern "C" uint32_t psx_mod_savestate_loads(void){return save_loads;}
+extern "C" int psx_mod_replay_active(void){return 0;}
+namespace ttk {
+const char* aim_debug_json(){return "{}";}
+// D12A: the crosshair segment query (weapon_aim.cpp in the player build).
+static bool segment_hit;static double segment_point[3];static int segment_kind=2;
+bool view_segment_query(CPUState*,const double*,const double* to,double* hit,int& kind) {
+    kind=segment_hit?segment_kind:0;for(int i=0;i<3;++i)hit[i]=segment_hit?segment_point[i]:to[i];return true;
+}
+// D10F1: the camera lens query. A world plane at camera_wall (0: none)
+// along camera_wall_axis blocks every segment crossing it.
+static double camera_wall;static int camera_wall_axis;static unsigned camera_queries;
+bool camera_segment_query(CPUState*,const double* from,const double* to,double* hit,int& kind,uint32_t,uint32_t* actor) {
+    ++camera_queries;if(actor)*actor=0;
+    const int a=camera_wall_axis;
+    const double d=to[a]-from[a];
+    if(camera_wall && d && (camera_wall-from[a])/d>0 && (camera_wall-from[a])/d<1) {
+        const double t=(camera_wall-from[a])/d;
+        for(int i=0;i<3;++i)hit[i]=from[i]+(to[i]-from[i])*t;
+        kind=1;return true;
+    }
+    kind=0;for(int i=0;i<3;++i)hit[i]=to[i];return true;
+}
+static InputFrame input;
+static Cheat pending_cheat=Cheat::None;
+Cheat input_take_cheat(){auto c=pending_cheat;pending_cheat=Cheat::None;return c;}
+void input_notice(const char*){}
+void input_request_interaction(){}
+unsigned inventory_announcements;
+void inventory_update(unsigned,const uint16_t*,const int16_t*,const uint16_t*,bool announce){inventory_announcements+=announce;}
+void mission_update(unsigned,const uint16_t*){}
+bool mission_open;bool mission_visible(){return mission_open;}void mission_close(){mission_open=false;}int mission_browsed_item(){return -1;}
+static bool modern;
+static bool running, jump_pending, auto_stow;
+bool input_auto_stow_pending(){return auto_stow;}
+bool input_jump_pending(){return jump_pending;}
+void input_jetpack_started(bool){}
+bool input_take_jump(){bool result=jump_pending;jump_pending=false;return result;}
+bool input_take_swim_redraw(){return false;}
+static bool want_capture;
+static unsigned capture_offers;
+void input_offer_gameplay_capture() {++capture_offers;}
+void input_ack_commands(uint64_t) {}
+bool input_wants_initial_capture() {return want_capture;}
+bool input_running(bool){return running;}
+static bool console_holding;
+bool input_console_holding(){return console_holding;}
+static bool grab_owns;
+bool input_push_grab_owns_cross(){return grab_owns;}
+static bool reach_held;
+bool input_airborne_reach_held(){return reach_held;}
+bool input_modernized(){return modern;}bool input_modern_controls(){const char* s=std::getenv("DNTTK_CONTROL_SCHEME");return modern && (!s || std::strcmp(s,"legacy"));}
+const InputFrame& input_snapshot(Context){return input;}
+static uint16_t test_pad=0xffff;
+uint16_t input_last_pad(){return test_pad;}
+uint64_t input_host_frame(){return input.sequence;}
+static double clock_ms=1000;
+double input_clock_ms(){return clock_ms;}
+}
+static void call(uint32_t address,uint32_t a0,uint32_t a1,uint32_t ra,uint32_t sp=0x801f0000,uint32_t a2=0) {
+    CPUState cpu{};cpu.gpr[4]=a0;cpu.gpr[5]=a1;cpu.gpr[6]=a2;cpu.gpr[31]=ra;cpu.gpr[29]=sp;
+    hooks().at(address)(&cpu,address);
+}
+int main(int argc,char** argv) {
+    // D14F: a clean launch really uses the new default. Keep the historical
+    // fixture suite explicitly at 64 after checking this in a fresh child.
+    {
+        const pid_t child=fork();assert(child>=0);
+        if(!child) {
+            unsetenv("DNTTK_FP_FOV");unsetenv("DNTTK_FP_PROJECTION");
+            assert(std::abs(ttk::first_person_fov_setting()-90)<.0001);
+            _exit(0);
+        }
+        int status=0;waitpid(child,&status,0);
+        assert(WIFEXITED(status) && WEXITSTATUS(status)==0);
+    }
+    setenv("DNTTK_FP_FOV","64",1);
+
+    setenv("DNTTK_FP_LEGS","off",1); // retain explicit no-body regression coverage
+    {
+        using namespace ttk::contact_arm;
+        Pose pose{};
+        // Reachable, stretched, almost folded and straight-source targets.
+        // The target stays exact and every generated coordinate stays finite.
+        for(double reach:{1.0,50.0,150.0,240.0,400.0,700.0})
+            for(Vec elbow:{Vec{0,100,0},Vec{0,0,100}}) {
+                assert(solve({0,0,0},{0,0,reach},elbow,{0,1,0},135,128,pose));
+                assert((pose.hand-Vec{0,0,reach}).length()==0);
+                assert(std::isfinite(pose.elbow.x+pose.elbow.y+pose.elbow.z));
+                assert(std::abs((pose.elbow-pose.shoulder).length()-135*pose.upper_scale)<1e-8);
+                assert(std::abs((pose.hand-pose.elbow).length()-128*pose.lower_scale)<1e-8);
+                if(reach>=7 && reach<250) {
+                    assert(std::abs(pose.upper_scale-1)<1e-8);
+                    assert(std::abs(pose.lower_scale-1)<1e-8);
+                }
+            }
+        for(Vec hand:{Vec{20,150,50},Vec{0,0,300},Vec{90,5,424},Vec{-60,-163,32},Vec{0,-600,400}}) {
+            const Vec anchor={200,150,-64};
+            const Vec adjusted=reachable_shoulder(anchor,hand,135,128);
+            const double old_distance=(hand-anchor).length();
+            assert((adjusted-anchor).length()<=96.000001);
+            assert(adjusted.y-.8*adjusted.z>=95.999999);
+            assert((hand-adjusted).length()<=old_distance+1e-8);
+            if(old_distance<=.98*263)assert((adjusted-anchor).length()<1e-8);
+            else assert((hand-adjusted).length()<old_distance);
+            Pose fixed{};assert(solve(anchor,hand,{0,100,0},{0,1,-1},135,128,fixed));
+            assert(solve(adjusted,hand,{0,100,0},{0,1,-1},135,128,pose));
+            assert((pose.hand-hand).length()==0);
+            assert(pose.upper_scale<=fixed.upper_scale+1e-8 && pose.lower_scale<=fixed.lower_scale+1e-8);
+        }
+        assert(!solve({},{},{},{0,1,0},135,128,pose));
+        assert(!solve({},{0,0,100},{},{0,1,0},0,128,pose));
+        std::puts("PASS: D36H5 contact IK reachable, extended, folded and singular-source targets");
+    }
+    const char* tight_env=std::getenv("DNTTK_TIGHT_CAMERA");
+    const bool tight_enabled=tight_env && !std::strcmp(tight_env,"1");
+    // D35G: water exits and ledges have eye paths; other traversal stays gated.
+    for(unsigned mask=0;mask<16384;++mask) {
+        ttk::PerspectiveFacts f{};
+        f.selected=mask&1;f.active=mask&2;f.water_exit=mask&4;f.push=mask&8;
+        f.traversal=mask&16;f.committed=mask&32;f.fall=mask&64;f.swim=mask&128;f.jet=mask&256;f.ladder=mask&512;f.pole=mask&1024;f.mantle=mask&2048;f.overhead=mask&4096;f.wall=mask&8192;
+        const auto r=ttk::resolve_perspective(f);
+        const bool old=f.wall || f.overhead || f.water_exit || f.mantle || f.push || f.ladder || f.pole || !f.traversal || f.committed || f.fall;
+        assert(r.capable==old && r.effective==(f.selected && old));
+        const char* reason=!f.selected?"off":!old?"traversal":f.active?"active":"input-suspended";
+        assert(!std::strcmp(ttk::perspective_reason(r.reason),reason));
+        assert(!ttk::resolve_perspective(f,ttk::ActionView::LegacyThird).effective);
+        for(auto denied:{ttk::PerspectiveReason::Identity,ttk::PerspectiveReason::Scripted,
+                         ttk::PerspectiveReason::Original,ttk::PerspectiveReason::WorldChange}) {
+            f.denial=denied;const auto d=ttk::resolve_perspective(f);
+            assert(!d.capable && !d.effective && d.selected==f.selected && d.reason==denied);
+        }
+    }
+    ttk::ActionView choice=ttk::ActionView::First;
+    assert(ttk::parse_action_view("legacy-third",choice) && choice==ttk::ActionView::LegacyThird);
+    assert(!ttk::parse_action_view("third",choice) && choice==ttk::ActionView::LegacyThird);
+    assert(!ttk::parse_action_view(nullptr,choice));
+    assert(ttk::parse_action_view("first",choice) && choice==ttk::ActionView::First);
+    std::puts("PASS: D35G presentation policy covers all 8192 fact combinations; denials and enum validation");
+    setenv("DNTTK_DRAW_DISTANCE","extended",1);
+    // D08J7C: the sidearm return timer cases below run with AUTO (NEVER is the
+    // default; the D08J7C group checks the unset default).
+    ttk_live_env_set("DNTTK_SIDEARM_RETURN","auto");
+    assert(argc>=3 && argc<=5);
+    std::ifstream exe(argv[1],std::ios::binary);exe.seekg(2048);exe.read((char*)ram+0x10000,0xbb000);assert(exe.gcount()==0xbb000);
+    std::ifstream overlay(argv[2],std::ios::binary);overlay.read((char*)ram+0xca968,9668);assert(overlay.gcount()==9668);
+    constexpr uint32_t p=0x800d7198,c=0x800d6eb0;
+    psx_mod_write_half(0x800bcbb0,1);
+    psx_mod_write_word(c+0xa4,p);psx_mod_write_word(p+0x7d4,c);
+    psx_mod_write_half(p+0x60,63);
+    psx_mod_write_half(c+12,0);psx_mod_write_half(c+16,4096);
+    ttk::input.active=true;ttk::input.sequence=1;ttk::input.epoch=1;ttk::input.move_x=1;
+    writes=0;call(0x8003ade4,c,p,0x80025ee8);call(0x80053500,p,0,0x80048664);assert(writes==0); // Vanilla
+    call(0x8005a210,p,0x800c2754,0x80041b34,0x801fff00);
+    call(0x80048410,p,0,0x8004b634,0x801fff00);call(0x8003ebf4,p,0,0x80055934);assert(writes==0);
+    assert(code_writes==0 && psx_mod_read_word(0x800cc57c)==0x24020008);
+    ttk::modern=true;
+    psx_mod_write_word(0x800be570,1);
+    call(0x8003ade4,c,p,0x80025ee8);assert(code_writes==0);
+    psx_mod_write_word(0x800be570,0);
+    call(0x8003ade4,c,p,0x80025ee4);assert(code_writes==0);
+    const auto secret_flags=psx_mod_read_word(0x800dd878);
+    call(0x8003ade4,c,p,0x80025ee8);assert(ttk::movement_ready());
+    assert(code_writes==2 && psx_mod_read_word(0x800cc57c)==0x24020000 &&
+           psx_mod_read_word(0x800cc580)==0x30a30400);
+    assert(psx_mod_read_word(0x800dd878)==secret_flags); // no invented conversation
+    call(0x8003ade4,c,p,0x80025ee8);assert(code_writes==2); // idempotent
+    // D07E: the lease lasts one game frame. Slow updates (5 fields, an upgraded
+    // energy stream) widen it to 6; a pause longer than the cap resets it to 4.
+    {
+        auto camera=[&](unsigned fields){ttk::input.sequence+=fields;call(0x8003ade4,c,p,0x80025ee8);};
+        for(int i=0;i<4;++i)camera(5);
+        ttk::input.sequence+=5;assert(ttk::movement_ready());
+        ttk::input.sequence+=1;assert(ttk::movement_ready());
+        ttk::input.sequence+=1;assert(!ttk::movement_ready());
+        camera(30);ttk::input.sequence+=5;assert(!ttk::movement_ready());
+        camera(30);for(int i=0;i<4;++i)camera(3); // a stall interval is not remembered
+        ttk::input.sequence+=4;assert(ttk::movement_ready());
+        ttk::input.sequence+=1;assert(!ttk::movement_ready());
+        camera(1);assert(ttk::movement_ready());
+        std::puts("PASS: D07E lease lasts one game frame, also in slow scenes");
+    }
+    if(const char* scheme=std::getenv("DNTTK_JETPACK");scheme && !std::strcmp(scheme,"eduke32")) {
+        auto camera=[&](){call(0x8003ade4,c,p,0x80025ee8);};
+        auto poll=[&](){call(0x80058120,p,0,0x80041c44,0x801fff00);};
+        auto toggle=[&](){ttk::input.commands[0]=ttk::jetpack;ttk::input.command_count=1;++ttk::input.command_serial;camera();poll();ttk::input.command_count=0;};
+        auto update=[&](unsigned fields){ttk::input.sequence+=fields;camera();call(0x8005a210,p,0x800c2754,0x80041b34,0x801fff00);poll();};
+        ttk::input.move_x=0;ttk::input.move_y=0;
+        psx_mod_write_half(p+0x32,10000);psx_mod_write_half(p+0x358,1);psx_mod_write_half(p+0x35a,9000);
+        psx_mod_write_word(p+0x834,0x40000000);psx_mod_write_word(p+0x224,0);
+        psx_mod_write_word(0x800d21fc,10);psx_mod_write_half(0x800c3cc4,0);psx_mod_write_half(0x800c3cc6,0);
+        toggle();assert(psx_mod_read_byte(p+0x22c)==10 && psx_mod_read_half(p+0x60)==163 && psx_mod_read_half(p+0x84c)==5);
+        update(2);assert((int32_t)psx_mod_read_word(p+0x1f8)<0); // J alone starts lift, no Space
+        // This hook-only fixture does not integrate the preceding lift.
+        psx_mod_write_word(p+0x1c8,psx_mod_read_word(p+0x10)+1000);
+        ttk::input.held[ttk::crouch]=true;update(2);
+        assert((int32_t)psx_mod_read_word(p+0x1f8)>0); // Ctrl cancels startup lift immediately
+        ttk::input.held[ttk::crouch]=false;
+        for(int i=0;i<28;++i)update(2);
+        assert(psx_mod_read_half(p+0x35a)==8853); // one second, independent of animation dt
+        toggle();assert(psx_mod_read_byte(p+0x22c)==9 && psx_mod_read_half(p+0x60)==108 && psx_mod_read_half(p+0x84c)==0);
+        const auto fuel=psx_mod_read_half(p+0x35a);update(2);assert(psx_mod_read_half(p+0x35a)==fuel);
+        psx_mod_write_word(p+0x224,0x41);toggle();assert(psx_mod_read_byte(p+0x22c)==10); // airborne flags
+        psx_mod_write_half(p+0x35a,9000);
+        ++ttk::input.epoch;update(2);const auto restored=psx_mod_read_half(p+0x35a);
+        assert(restored==9000); // new capture/load never bills an old interval
+        for(int i=0;i<1829;++i)update(2);
+        assert(psx_mod_read_byte(p+0x22c)==10 && psx_mod_read_half(p+0x35a)>0);
+        update(2);assert(psx_mod_read_half(p+0x35a)==0 && psx_mod_read_byte(p+0x22c)==9);
+        toggle();assert(psx_mod_read_byte(p+0x22c)==9); // empty cannot activate
+        // D08Q10: a fall under the water level starts too and, as in EDuke32,
+        // holds Duke where he is (no automatic rise, no ground lift).
+        psx_mod_write_half(p+0x35a,9000);psx_mod_write_word(p+0x834,0);psx_mod_write_word(p+8,10);
+        toggle();assert(psx_mod_read_byte(p+0x22c)==10 && psx_mod_read_half(p+0x60)==163 &&
+                        (psx_mod_read_half(p+0x358)&3)==3 && psx_mod_read_word(p+0x834)==0);
+        update(2);assert(psx_mod_read_word(p+0x1f8)==0); // holds, no launch
+        ttk::input.held[ttk::jump]=true;update(2);
+        assert((int32_t)psx_mod_read_word(p+0x1f8)<0); // Space climbs out
+        ttk::input.held[ttk::jump]=false;
+        toggle(); // off under water: native underwater swimming at once, no fall
+        assert(psx_mod_read_byte(p+0x22c)==5 && psx_mod_read_half(p+0x60)==127 && !(psx_mod_read_half(p+0x358)&2));
+        // Surface/underwater swim: J is read inside the swim handler, so the
+        // start waits for Duke's next update entry (800412a4).
+        for(unsigned swim:{4u,5u}) {
+            psx_mod_write_byte(p+0x22c,swim);psx_mod_write_byte(p+0x22d,swim);psx_mod_write_half(p+0x60,swim==4?122:127);
+            psx_mod_write_half(p+0x358,1);psx_mod_write_half(p+0x26,swim==5?(uint16_t)-900:0);psx_mod_write_word(p+0x224,0x100);
+            toggle();assert(psx_mod_read_byte(p+0x22c)==swim && !(psx_mod_read_half(p+0x358)&2));
+            ++ttk::input.epoch;call(0x800412a4,p,0,0x80041000,0x801fff00);
+            assert(psx_mod_read_byte(p+0x22c)==swim); // a new capture/load drops the request
+            toggle();call(0x800412a4,p,0,0x80041000,0x801fff00);
+            assert(psx_mod_read_byte(p+0x22c)==10 && psx_mod_read_half(p+0x60)==163 && (psx_mod_read_half(p+0x358)&3)==3);
+            assert(psx_mod_read_word(p+0x834)==0 && psx_mod_read_half(p+0x26)==0 && !(psx_mod_read_word(p+0x224)&0x100));
+            update(2); // surface: the ground start's lift; underwater: hold
+            assert(swim==4 ? (int32_t)psx_mod_read_word(p+0x1f8)<0 : psx_mod_read_word(p+0x1f8)==0);
+            if(swim==4) {ttk::input.held[ttk::crouch]=true;update(2);ttk::input.held[ttk::crouch]=false;update(2);}
+            // Bubbles while the head is under water (native cadence 300-900 dt).
+            {
+                // This fixture has no model; supply a layout with head joint 3.
+                const uint32_t saved_layout=psx_mod_read_word(p+0x40),saved_matrices=psx_mod_read_word(p+0x3c);
+                constexpr uint32_t layout=0x801e8000,matrices=0x801e8100,head=matrices+32*3+0x18;
+                psx_mod_write_byte(layout+0x34,3);
+                psx_mod_write_word(p+0x40,layout);psx_mod_write_word(p+0x3c,matrices);
+                psx_mod_write_word(head,500);bubbles=0;bubble_y=-100000;
+                for(int i=0;i<100;++i)update(2);
+                assert(bubbles>=2 && bubble_y==500); // breathing at the head, trail below it
+                // Duke's update holds his breath (state-5 air branch) and keeps
+                // the pack open; the next hook outside that frame restores both.
+                call(0x800412a4,p,0,0x80041000,0x801fff00);
+                assert(psx_mod_read_word(0x80041fd8)==0 && psx_mod_read_word(0x8004260c)==0x10000003);
+                camera();
+                assert(psx_mod_read_word(0x80041fd8)==0x14620028 && psx_mod_read_word(0x8004260c)==0x10400003);
+                psx_mod_write_word(p+0x268,0x55);surface_sounds.clear();
+                psx_mod_write_word(head,(uint32_t)-500);bubbles=0; // head above the water
+                for(int i=0;i<100;++i)update(2);
+                assert(bubbles==0);
+                // Surfacing: the native splash and breath once, ambience loop stopped.
+                assert((surface_sounds==std::vector<uint32_t>{0x3003,0x200e,0x80000055u}) &&
+                       psx_mod_read_word(p+0x268)==0);
+                call(0x800412a4,p,0,0x80041000,0x801fff00); // head out: Duke breathes
+                assert(psx_mod_read_word(0x80041fd8)==0x14620028 && psx_mod_read_word(0x8004260c)==0x10000003);
+                camera();
+                psx_mod_write_word(p+0x40,saved_layout);psx_mod_write_word(p+0x3c,saved_matrices);
+            }
+            toggle();assert(psx_mod_read_byte(p+0x22c)==5 && psx_mod_read_half(p+0x60)==127);
+        }
+        psx_mod_write_byte(p+0x22c,9);psx_mod_write_byte(p+0x22d,9);psx_mod_write_half(p+0x60,108);
+        // Fuel-out under water swims at once: no 108 fall, so no splash entry.
+        psx_mod_write_half(p+0x358,1);psx_mod_write_word(p+0x224,0);
+        toggle();assert(psx_mod_read_byte(p+0x22c)==10);
+        psx_mod_write_half(p+0x35a,1);
+        for(int i=0;i<20 && psx_mod_read_byte(p+0x22c)==10;++i)update(2);
+        assert(psx_mod_read_byte(p+0x22c)==5 && psx_mod_read_half(p+0x60)==127 &&
+               !(psx_mod_read_half(p+0x358)&2) && psx_mod_read_half(p+0x35a)==0);
+        psx_mod_write_half(p+0x35a,9000);
+        // A native cut-out (Modern fuel-out) inside the handler: the same
+        // update's pre-state step entry swims before its water entry splashes.
+        psx_mod_write_byte(p+0x22c,9);psx_mod_write_byte(p+0x22d,9);psx_mod_write_half(p+0x60,108);
+        psx_mod_write_half(p+0x358,1);toggle();assert(psx_mod_read_byte(p+0x22c)==10);update(2);
+        psx_mod_write_byte(p+0x22c,9);psx_mod_write_half(p+0x60,108);psx_mod_write_half(p+0x358,1);
+        call(0x80055e80,p,0,0x8005a4f8,0x801fff00);
+        assert(psx_mod_read_byte(p+0x22c)==5 && psx_mod_read_half(p+0x60)==127);
+        psx_mod_write_byte(p+0x22c,9);psx_mod_write_byte(p+0x22d,9);psx_mod_write_half(p+0x60,108);
+        psx_mod_write_word(p+0x834,0x40000000);psx_mod_write_half(p+0x32,0);
+        toggle();assert(psx_mod_read_byte(p+0x22c)==9); // death veto
+        psx_mod_write_half(p+0x32,10000);poke(0x4ade0);toggle();assert(psx_mod_read_byte(p+0x22c)==9);poke(0x4ade0);
+        ttk::modern=false;toggle();assert(psx_mod_read_byte(p+0x22c)==9);ttk::modern=true;
+        toggle();assert(psx_mod_read_byte(p+0x22c)==10);
+        psx_mod_write_half(0x800c3cc6,1);const auto god_fuel=psx_mod_read_half(p+0x35a);
+        for(int i=0;i<30;++i)update(2);
+        assert(psx_mod_read_half(p+0x35a)==god_fuel);
+        psx_mod_write_half(0x800c3cc6,0);
+        psx_mod_write_half(p+0x35a,4000);update(2);
+        ttk::input.sequence+=2;camera();call(0x8005a210,p,0x800c2754,0x80041b34,0x801fff00);
+        psx_mod_write_half(p+0x35a,9000);poll();assert(psx_mod_read_half(p+0x35a)==9000); // pickup during native handler
+        psx_mod_write_half(0x800be568,1);ttk::input.sequence+=180;camera();
+        psx_mod_write_half(0x800be568,0);update(2);assert(psx_mod_read_half(p+0x35a)==9000); // no pause debt
+        // A native landing closes the pack without replacing the ground pose.
+        ttk::input.sequence+=2;camera();call(0x8005a210,p,0x800c2754,0x80041b34,0x801fff00);
+        psx_mod_write_byte(p+0x22c,0);psx_mod_write_half(p+0x60,105);poll();
+        assert(psx_mod_read_byte(p+0x22c)==0 && psx_mod_read_half(p+0x60)==105 && !(psx_mod_read_half(p+0x358)&2));
+        // D08Q11: from a kneel (178) Duke stands up into the lift: the root
+        // (pelvis) rises to the standing height over the feet before the
+        // flight envelope is used. No standing room: the pack stays closed.
+        {
+            ttk::input.sequence+=2;camera();
+            psx_mod_write_byte(p+0x22d,0);psx_mod_write_half(p+0x60,178);psx_mod_write_word(p+0x224,0);
+            psx_mod_write_word(p+0x1c8,(uint32_t)-1000);psx_mod_write_word(p+8,(uint32_t)-1282);
+            clearance_result=2048;lookahead_drop=-100000;hull_object=0;
+            bool close=false;auto say=[](const char*){};
+            assert(ttk::crouch_console_command("crouchstand block",say,close));
+            toggle();assert(psx_mod_read_byte(p+0x22c)==0 && psx_mod_read_half(p+0x60)==178 &&
+                            (int32_t)psx_mod_read_word(p+8)==-1282 && !(psx_mod_read_half(p+0x358)&2));
+            assert(ttk::crouch_console_command("crouchstand free",say,close));
+            toggle();assert(psx_mod_read_byte(p+0x22c)==10 && psx_mod_read_half(p+0x60)==163 &&
+                            (int32_t)psx_mod_read_word(p+8)==-1515);
+            update(2);assert((int32_t)psx_mod_read_word(p+0x1f8)<0); // lifts with no Space
+            toggle();assert(psx_mod_read_byte(p+0x22c)==9);
+            // Standing (63): the root is untouched.
+            psx_mod_write_byte(p+0x22c,0);psx_mod_write_byte(p+0x22d,0);psx_mod_write_half(p+0x60,63);
+            psx_mod_write_word(p+0x224,0);psx_mod_write_word(p+8,(uint32_t)-1400);
+            toggle();assert(psx_mod_read_byte(p+0x22c)==10 && (int32_t)psx_mod_read_word(p+8)==-1400);
+            toggle();
+        }
+        std::puts("PASS: D08Q11 kneeling start stands into the lift, refused without standing room; D08S instant ground/air toggles, 61-second fuel, god mode, landing and safety gates; D08Q10 starts under water and from surface/underwater swim (deferred to the update entry, epoch-dropped), surface lifting like the ground, underwater holding until Space, off straight to underwater swimming, bubbles and held breath only with the head under water, native surfacing sounds once, fuel-out and native cut-out under water straight to swimming");return 0;
+    }
+    // D08Q3: actual flight eligibility retains overlay, camera, capture and
+    // alive checks, and never enables ground movement/air-steering writes.
+    {
+        setenv("DNTTK_WEAPON_AIM","view",1);
+        psx_mod_write_half(p+0x358,3);psx_mod_write_byte(p+0x22c,10);
+        psx_mod_write_byte(p+0x3b8,2);psx_mod_write_byte(p+0x3b9,4);
+        for(unsigned anim=163;anim<=170;++anim) {
+            psx_mod_write_half(p+0x60,anim);++ttk::input.sequence;call(0x8003ade4,c,p,0x80025ee8);
+            assert(ttk::jetpack_input_ready() && ttk::view_aim_input_ready());
+            assert(!ttk::movement_ready() && !ttk::locomotion_input_ready() && !ttk::airborne_input_ready());
+        }
+        // D08Q6 Modern flight model: the host writes the flight velocity
+        // (+0x1f4..+0x1fc) before every update with the hover lock off;
+        // WASD eases to a camera-relative speed with zero vertical drift;
+        // D08Q8 resolves live clearance separately from the held altitude;
+        // Space/Ctrl climb/descend; fed pads' thrust (read after the handler)
+        // is cancelled next update; the flame flag is set after the handler;
+        // fuel drains on the host only when no pads are fed.
+        {
+            auto update=[&]{++ttk::input.sequence;call(0x8003ade4,c,p,0x80025ee8);call(0x8005a210,p,0x800c2754,0x80041b34,0x801fff00);};
+            auto post=[&]{call(0x80058120,p,0,0x80041c44,0x801fff00);};
+            auto bv=[&](int axis){return (int32_t)psx_mod_read_word(p+0x1f4+4*axis);};
+            auto y=[&](int32_t v,int32_t clearance){psx_mod_write_word(p+8,(uint32_t)v);psx_mod_write_word(p+0x10,(uint32_t)(v+600));psx_mod_write_word(p+0x1c8,(uint32_t)(v+600+clearance));};
+            const uint32_t saved_flags=psx_mod_read_word(p+0x224);const uint16_t saved_fuel=psx_mod_read_half(p+0x35a);
+            psx_mod_write_half(p+0x60,164);psx_mod_write_word(p+0x224,0x08000000u);
+            const uint16_t saved_selected=psx_mod_read_half(0x800c3f94);
+            for(int axis=0;axis<3;++axis){psx_mod_write_word(p+0x1f4+4*axis,0);psx_mod_write_word(p+0x1e4+4*axis,77);}
+            psx_mod_write_half(0x800c3cc4,0);psx_mod_write_half(p+0x35a,5000);psx_mod_write_half(p+0xfe,0);
+            ttk::input.move_x=0;ttk::input.move_y=0;ttk::input.arrow_y=0;
+            psx_mod_write_word(0x800d21fc,10); // dt
+            y(-10700,900);update();
+            assert(!(psx_mod_read_word(p+0x224)&0x08000000u)); // hover lock off
+            for(int axis=0;axis<3;++axis)assert(psx_mod_read_word(p+0x1e4+4*axis)==0);
+            assert(bv(0)==0 && bv(1)==0 && bv(2)==0 && psx_mod_read_half(p+0x35a)==4990); // held; idle fuel -dt
+            post();assert((psx_mod_read_word(p+0x224)&0x82000000u)==0x82000000u); // both native flame-render bits
+            // W: camera-relative (heading = view), eases in with zero vertical drift.
+            ttk::input.move_y=1;update();
+            const double yaw=psx_mod_read_half(p+0x1c)*6.283185307179586/4096;
+            assert(std::abs(bv(0))+std::abs(bv(2))>200);
+            assert(bv(1)==0); // D08Q8 no artificial vertical nudge
+            const int32_t first_vertical=bv(1);update();assert(bv(1)==-first_vertical);
+            assert(psx_mod_read_half(p+0x35a)==4990); // fed pads: the original drains
+            for(int i=0;i<60;++i)update();
+            assert(std::abs(bv(0)-std::lround(2030*std::sin(yaw)))<=2 && std::abs(bv(2)-std::lround(2030*std::cos(yaw)))<=2);
+            // D08Q9: live run choice, active/held/expired steroids, backwards
+            // and normalized diagonal flight all share the measured land pace.
+            auto pace=[&](bool run,unsigned flags,unsigned dose,float x,float z,double expected) {
+                ttk::running=run;psx_mod_write_half(p+0x364,flags);psx_mod_write_half(p+0x366,dose);
+                ttk::input.move_x=x;ttk::input.move_y=z;
+                for(int i=0;i<80;++i)update();
+                assert(std::abs(std::hypot((double)bv(0),(double)bv(2))-expected)<3);
+                assert(bv(1)==0);
+            };
+            pace(true,0,0,0,1,9520);
+            pace(true,1,9000,0,1,9520); // held is not active
+            pace(true,3,9000,0,1,13238.75);
+            pace(false,2,9000,0,1,2822.96875); // native pickup / dnhyper bit
+            pace(false,3,0,0,1,2030); // expired
+            pace(true,0,0,1,1,9520); // diagonal is not faster
+            pace(false,0,0,0,-1,2030);
+            assert(bv(0)*std::sin(yaw)+bv(2)*std::cos(yaw)<0);
+            pace(false,0,0,0,1,2030);
+            // The handler's thrust (read after it) is cancelled next update.
+            psx_mod_write_word(p+0x1e4,20);psx_mod_write_word(p+0x1e8,(uint32_t)-30);psx_mod_write_word(p+0x1ec,40);post();
+            const int32_t x_before=bv(0);update();
+            assert(std::abs(bv(0)-(x_before-(20*10+20*10/2)))<=2);
+            // Model the handler's applied vertical root as the plan (no thrust).
+            auto applied=[&]{psx_mod_write_half(p+0xfe,(uint16_t)(int16_t)((bv(1)*10)>>10));};
+            ttk::input.move_y=0;for(int i=0;i<60;++i){update();applied();post();}
+            assert(bv(0)==0 && bv(2)==0); // eased to a stop, no creep
+            // Held height steers toward the target independently of cached floor data.
+            psx_mod_write_half(p+0xfe,0);
+            y(-10720,920);update();assert(bv(1)>60 && bv(1)<400); // steer down (plus any learned offset)
+            y(-10600,800);update();assert(bv(1)<-400);
+            y(-10700,300);update();assert(bv(1)==0); // live clearance now owns contact, never a cached floor
+            // Space climbs (eases), release re-captures once settled; Ctrl descends.
+            y(-10700,900);ttk::input.held[ttk::jump]=true;update();assert(bv(1)<0);
+            for(int i=0;i<30;++i)update();assert(std::abs(bv(1)+11800)<=300);
+            ttk::input.held[ttk::jump]=false;y(-11000,1200);for(int i=0;i<40;++i)update();
+            assert(std::abs(bv(1))<=120); // captured at -11000 (plus any learned offset)
+            ttk::input.held[ttk::crouch]=true;for(int i=0;i<30;++i)update();assert(std::abs(bv(1)-6000)<=300);
+            // D08Q8: live geometry tests run the root-apply hook, not the
+            // pre-handler velocity setup. Cached floor cannot veto descent.
+            y(-11000,5000);psx_mod_write_half(p+0xfe,0);
+            update();assert(bv(1)>1000);
+            post();assert((psx_mod_read_word(p+0x224)&0x82000000u)==0x82000000u);
+            // The ordinary draw consumes 0x02000000 before the mirror draw.
+            psx_mod_write_word(p+0x224,psx_mod_read_word(p+0x224)&~0x02000000u);
+            call(0x800348d8,0x801ffe58,p,0x8003816c);
+            assert((psx_mod_read_word(p+0x224)&0x82000000u)==0x82000000u);
+            psx_mod_write_word(p+0x224,psx_mod_read_word(p+0x224)&~0x02000000u);
+            call(0x800348d8,0x801ffe58,0x800d8000,0x8003816c);
+            assert(!(psx_mod_read_word(p+0x224)&0x02000000u));
+            ttk::modern=false;call(0x800348d8,0x801ffe58,p,0x8003816c);
+            assert(!(psx_mod_read_word(p+0x224)&0x02000000u));ttk::modern=true;
+            ttk::input.held[ttk::crouch]=false;
+            for(int i=0;i<40;++i)update();
+            assert(std::abs(bv(1))<=120 && psx_mod_read_byte(p+0x22c)==10);
+            jw_hits=0;
+            ttk::input.held[ttk::jump]=true;update();assert(bv(1)<0);
+            ttk::input.held[ttk::jump]=false;
+            psx_mod_write_half(0x800c3cc4,1);const uint16_t f0=psx_mod_read_half(p+0x35a);update();assert(psx_mod_read_half(p+0x35a)==f0); // original skip
+            psx_mod_write_half(0x800c3cc4,0);
+            // An independent collision oracle models a room and stepped
+            // floor/ceiling. Test path safety and stable repeated contact.
+            const uint32_t old_layout=psx_mod_read_word(p+0x40),old_matrices=psx_mod_read_word(p+0x3c);
+            psx_mod_write_word(p+0x40,0x801d0000);psx_mod_write_word(p+0x3c,0x801d1000);
+            psx_mod_write_byte(0x801d0033,0);psx_mod_write_word(0x801d1018,12345);
+            jet_geometry=true;jet_floor=-10000;jet_ceiling=-12000;
+            auto root=[&](int dx,int dz) {
+                psx_mod_write_half(p+0xfc,dx);psx_mod_write_half(p+0x100,dz);
+                call(0x8004ac08,p,0,0x8004b570,0x801fff00);
+                assert(psx_mod_read_word(0x801d1018)==12345);
+            };
+            // Host horizontal pace must survive arbitrary native thrust roots
+            // and animation dt; collision still owns the resulting travel.
+            y(-11000,1000);ttk::input.move_y=1;
+            for(int i=0;i<80;++i)update();
+            const int px=(int32_t)psx_mod_read_word(p+4),pz=(int32_t)psx_mod_read_word(p+12);
+            psx_mod_write_half(p+0xba,17);root(500,500);
+            assert(std::abs(std::hypot((double)((int32_t)psx_mod_read_word(p+4)-px),
+                                      (double)((int32_t)psx_mod_read_word(p+12)-pz))-2030.0*10/1024)<1);
+            ttk::input.move_y=0;for(int i=0;i<80;++i)update();
+
+            psx_mod_write_word(p+4,0);psx_mod_write_word(p+12,0);
+            y(-11300,1000);ttk::input.held[ttk::jump]=true;
+            for(int i=0;i<80;++i) {update();root(0,0);post();}
+            const int ceiling_y=(int32_t)psx_mod_read_word(p+8);
+            assert(ceiling_y>=-11616 && ceiling_y<=-11550);
+            for(int i=0;i<40;++i) {update();root(30,0);post();assert((int32_t)psx_mod_read_word(p+8)==ceiling_y);}
+            assert((int32_t)psx_mod_read_word(p+4)==1200);
+            ttk::input.held[ttk::jump]=false;ttk::input.held[ttk::crouch]=true;
+            for(int i=0;i<80;++i) {update();root(0,0);post();}
+            const int floor_y=(int32_t)psx_mod_read_word(p+8);
+            assert(floor_y<=-10625 && floor_y>=-10700);
+            for(int i=0;i<40;++i) {update();root(0,0);post();assert((int32_t)psx_mod_read_word(p+8)==floor_y);}
+            ttk::input.held[ttk::crouch]=false;update();root(0,0);post();
+            // Rising floor: approach a 256-unit stair without a teleport or
+            // crossing its face. Once clear, horizontal travel resumes.
+            psx_mod_write_word(p+4,0);jet_step_x=100;jet_step_floor=-10256;jet_step_ceiling=-12000;
+            int previous=(int32_t)psx_mod_read_word(p+8);
+            for(int i=0;i<14;++i) {update();root(30,0);post();
+                const int now=(int32_t)psx_mod_read_word(p+8);
+                assert(std::abs(now-previous)<=64);previous=now;
+                if((int32_t)psx_mod_read_word(p+4)>=100)assert(now+624<jet_step_floor);
+            }
+            assert((int32_t)psx_mod_read_word(p+4)>100);
+            // Descending ceiling: move down smoothly while travelling under
+            // it, without crossing the ceiling or losing horizontal control.
+            psx_mod_write_word(p+4,0);y(-11600,1000);
+            jet_step_floor=-10000;jet_step_ceiling=-11744;
+            previous=(int32_t)psx_mod_read_word(p+8);
+            for(int i=0;i<14;++i) {update();root(30,0);post();
+                const int now=(int32_t)psx_mod_read_word(p+8);
+                assert(std::abs(now-previous)<=64);previous=now;
+                if((int32_t)psx_mod_read_word(p+4)>=100)assert(now-384>=jet_step_ceiling);
+            }
+            assert((int32_t)psx_mod_read_word(p+4)>100);
+            // A continuous rising floor must make horizontal progress each
+            // update, including when the correction exceeds the height cap.
+            jet_step_x=1000000;jet_slope=-2;
+            psx_mod_write_word(p+4,0);y(-10660,1000);
+            for(int i=0;i<12;++i) {
+                const int old_x=(int32_t)psx_mod_read_word(p+4);
+                update();root(160,0);post();
+                assert((int32_t)psx_mod_read_word(p+4)>old_x);
+                assert((int32_t)psx_mod_read_word(p+8)+624<jet_floor+(int32_t)psx_mod_read_word(p+4)*jet_slope/4);
+            }
+            // No vertical buttons: sustained contact follows the slope on
+            // every update instead of alternating zero and correction steps.
+            for(int ceiling_case=0;ceiling_case<2;++ceiling_case) {
+                jet_slope=ceiling_case?0:-2;jet_ceiling_slope=ceiling_case?2:0;
+                jet_floor=ceiling_case?100000:-10000;jet_ceiling=ceiling_case?-12000:-100000;
+                psx_mod_write_word(p+4,0);y(ceiling_case?-11580:-10660,1000);
+                ttk::input.active=false;update();ttk::input.active=true;
+                psx_mod_write_word(p+0x1f8,0);
+                int settled_y=0;
+                for(int i=0;i<18;++i) {
+                    const int old_y=(int32_t)psx_mod_read_word(p+8);
+                    update();root(81,0);post();
+                    const int now=(int32_t)psx_mod_read_word(p+8);
+                    if(i==3)settled_y=now;
+                    if(i>3)assert((ceiling_case?1:-1)*(now-old_y)>=40 &&
+                                  (ceiling_case?1:-1)*(now-old_y)<=41);
+                }
+                // 14 updates at 40.5 units: no accumulated rounding drift.
+                assert((int32_t)psx_mod_read_word(p+8)-settled_y==(ceiling_case?567:-567));
+                // A blocked horizontal route must not keep its vertical
+                // tangent and climb the wall with no vertical button held.
+                const int wall_height=(int32_t)psx_mod_read_word(p+8);
+                jet_route_wall=true;update();root(81,0);post();
+                assert((int32_t)psx_mod_read_word(p+8)==wall_height);jet_route_wall=false;
+                // The surface ends: no invisible continuation across space.
+                jet_floor=100000;jet_ceiling=-100000;
+                const int edge_y=(int32_t)psx_mod_read_word(p+8);
+                update();root(80,0);post();assert((int32_t)psx_mod_read_word(p+8)==edge_y);
+                for(int i=0;i<4;++i) {update();root(80,0);post();assert((int32_t)psx_mod_read_word(p+8)==edge_y);}
+            }
+            jet_floor=-10000;jet_ceiling=-12000;
+            jet_slope=jet_ceiling_slope=0;jet_step_x=100;y(-11600,1000);
+            // Too little headroom: never step through the closed gap.
+            psx_mod_write_word(p+4,0);jet_step_ceiling=-10500;
+            for(int i=0;i<15;++i) {update();root(30,0);post();assert((int32_t)psx_mod_read_word(p+4)<100);}
+            // A zero-root takeoff at ground contact keeps the native rising
+            // departure. The larger steady-flight envelope must not land it.
+            jet_step_x=1000000;y(-10500,500);
+            ttk::input.active=false;update();ttk::input.active=true;
+            for(int axis=0;axis<3;++axis)psx_mod_write_word(p+0x1f4+4*axis,0);
+            update();root(0,0);assert((int16_t)psx_mod_read_half(p+0xfe)==-2);
+            ttk::input.held[ttk::jump]=true;update();applied();
+            const auto departure=psx_mod_read_half(p+0xfe);assert((int16_t)departure<0);
+            psx_mod_write_half(p+0xfe,20);root(0,0);assert((int16_t)psx_mod_read_half(p+0xfe)<0);
+            ttk::input.held[ttk::jump]=false;
+            // A side wall is tangent to ascent, not a ceiling. It must not
+            // pin takeoff; horizontal travel into the same wall still stops.
+            jet_side_wall=true;y(-11300,1000);ttk::input.held[ttk::jump]=true;
+            update();const auto wall_y=(int32_t)psx_mod_read_word(p+8);root(0,0);
+            assert((int32_t)psx_mod_read_word(p+8)<wall_y);
+            const auto wall_z=psx_mod_read_word(p+12);update();root(0,-30);
+            assert(psx_mod_read_word(p+12)==wall_z);
+            jet_side_wall=false;ttk::input.held[ttk::jump]=false;
+            // Vanilla and unrelated native callers retain all root fields.
+            psx_mod_write_half(p+0xfc,30);const auto before_x=psx_mod_read_word(p+4);
+            ttk::modern=false;root(30,0);ttk::modern=true;
+            assert(psx_mod_read_word(p+4)==before_x && psx_mod_read_half(p+0xfc)==30);
+            call(0x8004ac08,p,0,0x80055934,0x801fff00);assert(psx_mod_read_word(p+4)==before_x);
+            poke(0x3964c);root(30,0);assert(psx_mod_read_word(p+4)==before_x);poke(0x3964c);
+            jet_geometry=false;jet_step_x=1000000;
+            psx_mod_write_word(p+0x40,old_layout);psx_mod_write_word(p+0x3c,old_matrices);
+            std::puts("PASS: D08Q8 stable ceiling/floor, horizontal ceiling travel, bounded stair rise, narrow-gap refusal, query restoration and Vanilla/caller gates");
+            for(int axis=0;axis<3;++axis){psx_mod_write_word(p+0x1f4+4*axis,0);psx_mod_write_word(p+0x1e4+4*axis,0);}
+            psx_mod_write_word(p+0x224,saved_flags);psx_mod_write_half(p+0x35a,saved_fuel);
+            psx_mod_write_half(0x800c3f94,saved_selected); // post() ran the flight shortcuts
+            std::puts("PASS: D08Q6/D08Q8 flight model: lock off, eased camera-relative speed, zero vertical drift, thrust cancel, flame, stop without creep, altitude hold, Space/Ctrl, fuel");
+        }
+        ttk::input.active=false;assert(!ttk::jetpack_input_ready());ttk::input.active=true;
+        ttk::modern=false;assert(!ttk::jetpack_input_ready());ttk::modern=true;
+        psx_mod_write_word(p,2);assert(!ttk::jetpack_input_ready());psx_mod_write_word(p,0);
+        psx_mod_write_word(c+0xa4,0);assert(!ttk::jetpack_input_ready());psx_mod_write_word(c+0xa4,p);
+        poke(0x4ade0);assert(!ttk::jetpack_input_ready());poke(0x4ade0);
+        psx_mod_write_half(p+0x358,1);assert(!ttk::jetpack_input_ready());
+        psx_mod_write_half(p+0x358,0);psx_mod_write_byte(p+0x22c,0);psx_mod_write_half(p+0x60,63);
+        psx_mod_write_byte(p+0x3b8,0);psx_mod_write_byte(p+0x3b9,0);
+        ttk::input.sequence=1;call(0x8003ade4,c,p,0x80025ee8);assert(ttk::movement_ready());
+        unsetenv("DNTTK_WEAPON_AIM");
+        std::puts("PASS: D08Q3 flight lease, all flight animations, guards and ground handoff");
+    }
+    // D08T1 0x80051cf0: only Grab's own Cross is kept from climbing a pushable
+    // object; E's Cross climbs it like any climbable. 0x80051890: E's Cross never
+    // reaches the original idle grab of a pushable-only object; Grab's does.
+    // Only this tick's bit, only for Duke from the original callers; never
+    // Vanilla, uncaptured or plain climbables.
+    {
+        const uint32_t table=0x801e8000,object=0x801e9000,word=0x800d147c;
+        const uint32_t saved[]={psx_mod_read_word(0x800d2660),psx_mod_read_word(0x800d1b50),psx_mod_read_word(word)};
+        const unsigned saved_player=psx_mod_read_byte(p+0x233);
+        psx_mod_write_word(0x800d2660,table);psx_mod_write_half(object+0x2c,165);
+        psx_mod_write_word(table+28*165,0x081090e2);
+        psx_mod_write_byte(p+0x233,0);psx_mod_write_word(0x800d1b50,word);
+        psx_mod_write_word(p+0x174,object);
+        auto cross=[&](uint32_t ra,uint32_t actor){psx_mod_write_word(word,3);call(0x80051cf0,actor,0,ra);return psx_mod_read_word(word);};
+        assert(cross(0x8005384c,p)==3); // E's Cross climbs the dumpster
+        ttk::grab_owns=true;
+        assert(cross(0x8005384c,p)==2 && cross(0x80052544,p)==2 && cross(0x8005349c,p)==2);
+        assert(cross(0x80053850,p)==3 && cross(0x8005384c,p+0x8a4)==3);
+        psx_mod_write_word(table+28*165,0xe2);assert(cross(0x8005384c,p)==3); // climbable only
+        psx_mod_write_word(table+28*165,0x081090e2);
+        ttk::input.active=false;assert(cross(0x8005384c,p)==3);ttk::input.active=true;
+        ttk::modern=false;assert(cross(0x8005384c,p)==3);ttk::modern=true;
+        ttk::grab_owns=false;
+        auto idle=[&](uint32_t ra,uint32_t actor){psx_mod_write_word(word,1);call(0x80051890,actor,0,ra);return psx_mod_read_word(word);};
+        assert(idle(0x800467fc,p)==0 && idle(0x80052c1c,p)==0); // E never grabs
+        ttk::grab_owns=true;assert(idle(0x80052c1c,p)==1);ttk::grab_owns=false; // Grab does
+        assert(idle(0x80052c20,p)==1 && idle(0x80052c1c,p+0x8a4)==1);
+        psx_mod_write_word(table+28*165,0x08400000);assert(idle(0x80052c1c,p)==1); // also a switch
+        psx_mod_write_word(table+28*165,0xe2);assert(idle(0x80052c1c,p)==1); // not pushable
+        psx_mod_write_word(table+28*165,0x081090e2);
+        ttk::input.active=false;assert(idle(0x80052c1c,p)==1);ttk::input.active=true;
+        ttk::modern=false;assert(idle(0x80052c1c,p)==1);ttk::modern=true;
+        // D08T2: the table holds 1062 types (0x7428 bytes); the medieval
+        // Duke-symbol block is type 924. 1061 is the last valid type.
+        psx_mod_write_half(object+0x2c,924);psx_mod_write_word(table+28*924,0x081890e2);
+        assert(idle(0x80052c1c,p)==0);ttk::grab_owns=true;assert(idle(0x80052c1c,p)==1);ttk::grab_owns=false;
+        psx_mod_write_half(object+0x2c,1061);psx_mod_write_word(table+28*1061,0x081890e2);
+        assert(idle(0x80052c1c,p)==0);
+        psx_mod_write_half(object+0x2c,1062);assert(idle(0x80052c1c,p)==1); // outside the table
+        psx_mod_write_half(object+0x2c,165);
+        // D08T4: touching is offered only where the original grab can start:
+        // bit 0 of byte 4 of Duke's floor record (*(player+0x48), unaligned).
+        {
+            const uint32_t saved_floor=psx_mod_read_word(p+0x48),floor=0x801ea003;
+            psx_mod_write_half(p+0x60,63);psx_mod_write_word(p+0x48,floor);
+            psx_mod_write_byte(floor+4,0x01);assert(ttk::push_contact_ready());
+            psx_mod_write_byte(floor+4,0x00);assert(!ttk::push_contact_ready()); // level 5 street
+            psx_mod_write_byte(floor+4,0xfe);assert(!ttk::push_contact_ready());
+            psx_mod_write_byte(floor+4,0x01);psx_mod_write_word(p+0x48,0);assert(!ttk::push_contact_ready());
+            psx_mod_write_word(p+0x48,floor);psx_mod_write_word(table+28*165,0xe2);assert(!ttk::push_contact_ready());
+            psx_mod_write_word(table+28*165,0x081090e2);psx_mod_write_word(p+0x48,saved_floor);
+        }
+        // Grab 121 remembering the object: camera-only lease, never locomotion.
+        psx_mod_write_word(p+0x290,object);psx_mod_write_half(p+0x60,121);
+        assert(ttk::push_grab_ready() && !ttk::locomotion_input_ready() && !ttk::movement_ready());
+        // D08T3: arbitrary short movement, neutral hold, support and wall
+        // refusal, release and actor/profile isolation, using real callbacks.
+        {
+            const auto saved_push_epoch=ttk::input.epoch;
+            const uint32_t saved_push_ticks=psx_mod_read_word(0x800d21fc);
+            uint8_t before[0x8a4];for(unsigned i=0;i<sizeof before;++i)before[i]=psx_mod_read_byte(p+i);
+            const uint32_t list=0x801ea100,box=0x801ea120;
+            psx_mod_write_word(object+0x44,list);psx_mod_write_word(list+8,box);
+            const int16_t bounds[]={-512,-512,-512,0,512,512,512,0};
+            for(int i=0;i<8;++i)psx_mod_write_half(box+2*i,uint16_t(bounds[i]));
+            psx_mod_write_word(object+4,2000);psx_mod_write_word(object+8,0);psx_mod_write_word(object+12,2000);
+            psx_mod_write_word(p+0x220,0);psx_mod_write_half(p+0x68,3);
+            psx_mod_write_half(p+0x1c,1024);psx_mod_write_word(0x800d21fc,10);
+            psx_mod_write_word(p+0x1c8,512);psx_mod_write_word(p+0x1c4,77);
+            ttk::grab_owns=true;lookahead_drop=0;clearance_result=2048;
+            auto prepare=[&]{call(0x8005a210,p,0x800c2754,0x80041b34,0x801fff00);};
+            auto move=[&]{call(0x80048410,p,0,0x8004b634,0x801fff00);};
+            // W is already down while grab finishes between the two hooks.
+            psx_mod_write_half(p+0x68,1);ttk::input.move_y=1;prepare();
+            psx_mod_write_half(p+0x68,3);
+            if(!ttk::push_pad(0,1)){ttk::input.move_x=1;ttk::input.move_y=0;}
+            const int x0=int32_t(psx_mod_read_word(object+4));
+            move();const int x1=int32_t(psx_mod_read_word(object+4));assert(std::abs(x1-x0)==30);
+            assert(psx_mod_read_word(p+0x1c4)==77 && psx_mod_read_word(p+0x1c8)==512);
+            const float mx=ttk::input.move_x,my=ttk::input.move_y;
+            ttk::input.move_x=ttk::input.move_y=0;move();assert(int32_t(psx_mod_read_word(object+4))==x1);
+            ttk::input.move_x=mx;ttk::input.move_y=my;lookahead_drop=512;move();assert(int32_t(psx_mod_read_word(object+4))==x1);
+            lookahead_drop=0;hull_ray_hit=1;move();assert(int32_t(psx_mod_read_word(object+4))==x1);hull_ray_hit=0;
+            ttk::input.move_x=-mx;ttk::input.move_y=-my;move();assert(int32_t(psx_mod_read_word(object+4))==x0);
+            // A zero-depth ladder panel, rotated across the travel axis, must
+            // stop the block while allowing it to retreat without regrabbing.
+            const uint32_t ladder=0x801ea200,ladder_list=0x801ea300,ladder_box=0x801ea320,node=0x801ea400;
+            psx_mod_write_half(ladder+0x2c,46);psx_mod_write_word(table+28*46,0x108212);
+            psx_mod_write_word(ladder+0x44,ladder_list);psx_mod_write_word(ladder_list+8,ladder_box);
+            const int16_t panel[]={-189,-1023,0,0,189,1023,0,0};
+            for(int i=0;i<8;++i)psx_mod_write_half(ladder_box+2*i,uint16_t(panel[i]));
+            psx_mod_write_half(ladder+0x1c,1024);psx_mod_write_word(ladder+8,0);psx_mod_write_word(ladder+12,2000);
+            const int direction=x1>x0?1:-1;
+            psx_mod_write_word(ladder+4,x0+direction*(512+24));
+            psx_mod_write_word(node+4,0);psx_mod_write_word(node+8,ladder);
+            const uint32_t saved_rooms=psx_mod_read_word(0x800da454),saved_count=psx_mod_read_word(0x800da47c);
+            psx_mod_write_word(0x800da454,0x801ea500);psx_mod_write_word(0x800da47c,1);
+            psx_mod_write_word(0x801ea548,node);psx_mod_write_word(p+0x220,0);
+            ttk::input.move_x=mx;ttk::input.move_y=my;move();
+            const int stopped=int32_t(psx_mod_read_word(object+4));
+            assert(std::abs(stopped-x0)<30);move();assert(int32_t(psx_mod_read_word(object+4))==stopped);
+            ttk::input.move_x=-mx;ttk::input.move_y=-my;move();
+            assert(int32_t(psx_mod_read_word(object+4))==stopped-direction*30);
+            // D08T13: a gate's bars live in a later box of its list (box 0 is
+            // the lintel above the block). The bars stop the block; a block
+            // already in them (older save) backs out toward Duke only.
+            {
+                const uint32_t gate=0x801ea600,gate_list=0x801ea700,gate_boxes=0x801ea720;
+                const int32_t saved_px=int32_t(psx_mod_read_word(p+4));
+                psx_mod_write_half(gate+0x2c,354);psx_mod_write_word(table+28*354,0x1012);
+                psx_mod_write_word(gate+0x44,gate_list);psx_mod_write_half(gate_list+4,3);psx_mod_write_word(gate_list+8,gate_boxes);
+                const int16_t parts[3][8]={{-64,-1600,-600,0,64,-1000,600,0},{-64,-512,3000,0,64,512,3100,0},{-64,-512,-600,0,64,512,600,0}};
+                for(int k=0;k<3;++k)for(int i=0;i<8;++i)psx_mod_write_half(gate_boxes+16*k+2*i,uint16_t(parts[k][i]));
+                psx_mod_write_half(gate+0x1c,0);psx_mod_write_word(gate+8,0);psx_mod_write_word(gate+12,2000);
+                psx_mod_write_word(node+8,gate);
+                const int start=int32_t(psx_mod_read_word(object+4));
+                psx_mod_write_word(p+4,uint32_t(start-direction*1100));
+                psx_mod_write_word(gate+4,uint32_t(start+direction*(512+64+24)));
+                ttk::input.move_x=mx;ttk::input.move_y=my;move();
+                const int at_bars=int32_t(psx_mod_read_word(object+4));
+                assert(std::abs(at_bars-start)<=30);move();assert(int32_t(psx_mod_read_word(object+4))==at_bars);
+                psx_mod_write_word(gate+4,uint32_t(at_bars+direction*400)); // block already in the bars
+                move();assert(int32_t(psx_mod_read_word(object+4))==at_bars);
+                ttk::input.move_x=-mx;ttk::input.move_y=-my;move();
+                assert(int32_t(psx_mod_read_word(object+4))==at_bars-direction*30);
+                psx_mod_write_half(gate_list+4,1);psx_mod_write_word(gate+4,uint32_t(start+direction*(512+64+24)));
+                psx_mod_write_word(object+4,uint32_t(start));ttk::input.move_x=mx;ttk::input.move_y=my;move();
+                assert(int32_t(psx_mod_read_word(object+4))==start+direction*30); // box 0 alone: no bars
+                psx_mod_write_word(object+4,uint32_t(start));psx_mod_write_word(p+4,uint32_t(saved_px));
+                psx_mod_write_word(node+8,ladder);
+            }
+            psx_mod_write_word(0x800da454,saved_rooms);psx_mod_write_word(0x800da47c,saved_count);
+            // D08T5: slot-7 boundary is exact even for a partial final step.
+            // Old saves beyond it can retreat; another lane/type is unaffected.
+            const uint32_t oy=psx_mod_read_word(object+8),oz=psx_mod_read_word(object+12);
+            const uint16_t angle=psx_mod_read_half(object+0x1c);
+            psx_mod_write_word(p+0x220,0);
+            psx_mod_write_word(object+8,uint32_t(-9728));psx_mod_write_word(object+12,13829);
+            psx_mod_write_half(object+0x1c,2048);
+            ttk::input.move_x=mx*direction;ttk::input.move_y=my*direction;
+            psx_mod_write_word(object+4,7287);move();assert(psx_mod_read_word(object+4)==7292);
+            move();move();assert(psx_mod_read_word(object+4)==7292);
+            ttk::input.move_x=-mx*direction;ttk::input.move_y=-my*direction;
+            move();assert(psx_mod_read_word(object+4)==7262);
+            psx_mod_write_word(object+4,8418);move();assert(psx_mod_read_word(object+4)==8388);
+            ttk::input.move_x=mx*direction;ttk::input.move_y=my*direction;
+            move();assert(psx_mod_read_word(object+4)==8388);
+            psx_mod_write_word(object+12,2000);move();assert(psx_mod_read_word(object+4)==8418);
+            psx_mod_write_word(object+12,13829);psx_mod_write_half(object+0x2c,924);
+            move();assert(psx_mod_read_word(object+4)==8448);psx_mod_write_half(object+0x2c,165);
+            psx_mod_write_word(object+8,oy);psx_mod_write_word(object+12,oz);psx_mod_write_half(object+0x1c,angle);
+            std::puts("PASS: D08T5 exact alley limit, held stop, retreat from old save, other lane/type");
+            // D08T7: a boundary load can acquire without any previous host
+            // grab. Eligibility and original alignment are separate from travel.
+            {
+                uint32_t keep[0x8a4/4];for(unsigned i=0;i<0x8a4/4;++i)keep[i]=psx_mod_read_word(p+4*i);
+                const uint32_t floor=0x801ea003;
+                psx_mod_write_word(p+0x48,floor);psx_mod_write_byte(floor+4,0xfe);
+                psx_mod_write_word(p+0x174,object);psx_mod_write_word(p+0x17c,0);
+                psx_mod_write_word(p+0x224,0);psx_mod_write_byte(p+0x3b8,0);
+                psx_mod_write_half(p+0x60,63);psx_mod_write_half(p+0x24,1024);
+                psx_mod_write_word(p+0x220,0);psx_mod_write_word(0x800da47c,0);
+                psx_mod_write_word(object+4,7292);psx_mod_write_word(object+8,uint32_t(-9728));
+                psx_mod_write_word(object+12,13829);psx_mod_write_half(object+0x1c,2048);
+                assert(ttk::push_contact_ready());
+                auto acquire=[&]{psx_mod_write_word(word,1);call(0x80051890,p,0,0x80052c1c,0x801fff00);};
+                auto refused=[&]{acquire();assert(psx_mod_read_half(p+0x60)==63 && psx_mod_read_byte(floor+4)==0xfe);};
+                lineup_ok=0;refused();lineup_ok=1;
+                hull_ray_hit=1;refused();hull_ray_hit=0;
+                lookahead_drop=512;refused();lookahead_drop=0;
+                psx_mod_write_half(p+0x24,0);refused();psx_mod_write_half(p+0x24,1024);
+                psx_mod_write_word(p+0x17c,object);refused();psx_mod_write_word(p+0x17c,0);
+                psx_mod_write_word(p+0x224,0x40);refused();psx_mod_write_word(p+0x224,0);
+                ttk::modern=false;refused();ttk::modern=true;
+                ttk::input.active=false;refused();ttk::input.active=true;
+                acquire();assert(psx_mod_read_half(p+0x60)==121 && psx_mod_read_word(p+0x290)==object);
+                assert(psx_mod_read_byte(floor+4)==0xfe && psx_mod_read_word(object+4)==7292);
+                psx_mod_write_half(p+0x60,63);psx_mod_write_word(object+4,8418);
+                acquire();assert(psx_mod_read_half(p+0x60)==121); // old beyond-limit save
+                psx_mod_write_half(p+0x60,63);psx_mod_write_word(object+12,13830);
+                assert(!ttk::push_contact_ready());refused();
+                // D08T11: an object away from its authored placement was pushed
+                // there and stays movable along that axis on a no-grab floor.
+                {
+                    const uint32_t rows=0x801ec800,old_table=psx_mod_read_word(0x800de720),old_count=psx_mod_read_word(0x800de724);
+                    psx_mod_write_word(0x800de720,rows);psx_mod_write_word(0x800de724,2);
+                    psx_mod_write_word(rows,0x20);psx_mod_write_word(rows+4,0);
+                    psx_mod_write_word(rows+48,165);psx_mod_write_word(rows+52,object);
+                    psx_mod_write_word(rows+56,6000);psx_mod_write_word(rows+60,uint32_t(-9728));psx_mod_write_word(rows+64,13830);
+                    psx_mod_write_word(object+4,7292);
+                    psx_mod_write_half(p+0x24,1024);assert(ttk::push_contact_ready());
+                    acquire();assert(psx_mod_read_half(p+0x60)==121 && psx_mod_read_word(p+0x290)==object);
+                    assert(psx_mod_read_byte(floor+4)==0xfe && psx_mod_read_word(object+4)==7292);
+                    psx_mod_write_half(p+0x60,63);psx_mod_write_half(p+0x24,3072);
+                    acquire();assert(psx_mod_read_half(p+0x60)==121); // either facing
+                    psx_mod_write_half(p+0x60,63);psx_mod_write_half(p+0x24,0);refused(); // across the axis
+                    psx_mod_write_half(p+0x24,1024);
+                    hull_ray_hit=1;refused();hull_ray_hit=0;
+                    lineup_ok=0;refused();lineup_ok=1;
+                    ttk::modern=false;refused();ttk::modern=true;
+                    psx_mod_write_word(rows+56,7292);assert(!ttk::push_contact_ready());refused(); // at spawn: fixed scenery
+                    psx_mod_write_word(rows+60,0);assert(!ttk::push_contact_ready()); // height alone is not travel
+                    psx_mod_write_word(rows+60,uint32_t(-9728));psx_mod_write_word(rows+64,12000);
+                    psx_mod_write_half(p+0x24,0);assert(ttk::push_contact_ready());
+                    acquire();assert(psx_mod_read_half(p+0x60)==121); // Z displacement allows Z
+                    psx_mod_write_half(p+0x60,63);psx_mod_write_half(p+0x24,1024);refused();
+                    psx_mod_write_word(rows+48,166);assert(!ttk::push_contact_ready()); // row of another type
+                    psx_mod_write_word(rows+48,165);psx_mod_write_word(rows+52,object+0x60);assert(!ttk::push_contact_ready());
+                    psx_mod_write_word(0x800de724,0);assert(!ttk::push_contact_ready());
+                    psx_mod_write_word(0x800de720,old_table);psx_mod_write_word(0x800de724,old_count);
+                    psx_mod_write_half(p+0x60,63);
+                    std::puts("PASS: D08T11 displaced placement acquisition, axis, spawn/height/row/profile refusal, unchanged floor");
+                }
+                // D08T9: a fresh LEVEL05 boundary load can acquire the Z lane,
+                // in either direction, without granting mobility to its scenery.
+                if(argc==5) {
+                    constexpr unsigned span=14148;
+                    std::vector<uint8_t> overlay(ram+0xca968,ram+0xca968+span);
+                    std::ifstream file(std::string(argv[4])+"/LEVEL05.OVR",std::ios::binary);
+                    file.read((char*)ram+0xca968,span);assert(file.gcount()==span);++g_dirty_ram_code_gen;
+                    psx_mod_write_word(object+4,uint32_t(-61959));psx_mod_write_word(object+12,uint32_t(-11454));
+                    psx_mod_write_half(object+0x1c,1023);
+                    assert(ttk::push_contact_ready());
+                    psx_mod_write_half(p+0x24,1024);refused(); // wrong axis
+                    psx_mod_write_half(p+0x24,0);
+                    hull_ray_hit=1;refused();hull_ray_hit=0;
+                    lookahead_drop=512;refused();lookahead_drop=0;
+                    lineup_ok=0;refused();lineup_ok=1;
+                    ttk::modern=false;refused();ttk::modern=true;
+                    acquire();assert(psx_mod_read_half(p+0x60)==121);
+                    psx_mod_write_half(p+0x60,63);psx_mod_write_half(p+0x24,2048);
+                    psx_mod_write_word(object+12,uint32_t(-14000));
+                    acquire();assert(psx_mod_read_half(p+0x60)==121);
+                    assert(psx_mod_read_byte(floor+4)==0xfe);
+                    psx_mod_write_half(p+0x60,63);psx_mod_write_word(object+4,uint32_t(-61958));
+                    assert(!ttk::push_contact_ready());refused();
+                    // D08T10: LEVEL01 box after pulling onto a no-grab floor.
+                    std::ifstream level1(std::string(argv[4])+"/LEVEL01.OVR",std::ios::binary);
+                    level1.read((char*)ram+0xca968,12196);assert(level1.gcount()==12196);++g_dirty_ram_code_gen;
+                    psx_mod_write_half(object+0x2c,271);psx_mod_write_word(table+28*271,0x083090e2);
+                    psx_mod_write_word(object+4,31229);psx_mod_write_word(object+8,uint32_t(-510));
+                    psx_mod_write_half(object+0x1c,0);
+                    for(int z:{-2552,-4202,-6000})for(unsigned yaw:{0u,2048u}) {
+                        psx_mod_write_word(object+12,uint32_t(z));psx_mod_write_half(p+0x24,yaw);
+                        psx_mod_write_half(p+0x60,63);assert(ttk::push_contact_ready());
+                        acquire();assert(psx_mod_read_half(p+0x60)==121);
+                        assert(psx_mod_read_byte(floor+4)==0xfe);
+                    }
+                    psx_mod_write_half(p+0x60,63);psx_mod_write_half(p+0x24,1024);refused();
+                    psx_mod_write_half(p+0x24,0);
+                    hull_ray_hit=1;refused();hull_ray_hit=0;
+                    lookahead_drop=512;refused();lookahead_drop=0;
+                    lineup_ok=0;refused();lineup_ok=1;
+                    ttk::modern=false;refused();ttk::modern=true;
+                    psx_mod_write_word(object+4,31230);assert(!ttk::push_contact_ready());refused();
+                    psx_mod_write_word(object+4,31229);psx_mod_write_word(object+8,uint32_t(-509));assert(!ttk::push_contact_ready());
+                    psx_mod_write_word(object+8,uint32_t(-510));psx_mod_write_half(object+0x1c,1);assert(!ttk::push_contact_ready());
+                    psx_mod_write_half(object+0x2c,165);
+                    std::puts("PASS: D08T10 repeat box acquisition, both facings, support/wall/axis/profile/placement refusal");
+                    std::copy(overlay.begin(),overlay.end(),ram+0xca968);++g_dirty_ram_code_gen;
+                    std::puts("PASS: D08T9 Z-lane boundary/midpoint acquisition, both facings, axis/support/wall/profile/placement refusal");
+                }
+                for(unsigned i=0;i<0x8a4/4;++i)psx_mod_write_word(p+4*i,keep[i]);
+                std::puts("PASS: D08T7 fresh boundary acquisition, old save, line-up/support/wall/axis/state/profile refusal, unchanged floor");
+            }
+
+            psx_mod_write_word(p+0x220,0);psx_mod_write_word(object+4,x0);
+            psx_mod_write_half(p+0x60,120);++ttk::input.epoch;ttk::grab_owns=false;prepare();
+            assert(psx_mod_read_half(p+0x60)==121); // capture/pause epoch must end the old clip
+            ttk::grab_owns=false;prepare();move();assert(int32_t(psx_mod_read_word(object+4))==x0);
+            ttk::modern=false;ttk::grab_owns=true;prepare();move();assert(int32_t(psx_mod_read_word(object+4))==x0);
+            ttk::modern=true;ttk::grab_owns=false;ttk::input.move_x=ttk::input.move_y=0;lookahead_drop=-100000;
+            ttk::input.epoch=saved_push_epoch;psx_mod_write_word(0x800d21fc,saved_push_ticks);
+            for(unsigned i=0;i<sizeof before;++i)psx_mod_write_byte(p+i,before[i]);
+            std::puts("PASS: D08T3 held-direction grab handoff, flat ladder, D08T13 multi-box bars and back-out, stop/reverse, held neutral, support/wall refusal, query restoration and Vanilla");
+        }
+        psx_mod_write_half(p+0x60,63);psx_mod_write_word(p+0x174,0);psx_mod_write_word(p+0x290,0);
+        assert(!ttk::push_grab_ready() && ttk::movement_ready());
+        psx_mod_write_word(0x800d2660,saved[0]);psx_mod_write_word(0x800d1b50,saved[1]);psx_mod_write_word(word,saved[2]);
+        psx_mod_write_byte(p+0x233,saved_player);
+    }
+    // D08T8: only mismatched object support in a settled ledge hang retries
+    // the original clearance probe. A refusal restores all query state.
+    {
+        const auto memory=std::vector<uint8_t>(ram,ram+sizeof ram);
+        const auto input=ttk::input;
+        const uint32_t object=0x801e9000,table=0x801e8000,list=0x801ea100,box=list+32;
+        psx_mod_write_word(0x800d2660,table);psx_mod_write_word(table+28*165,0x081090e2);
+        psx_mod_write_half(object+0x2c,165);psx_mod_write_word(object+8,uint32_t(-9728));
+        psx_mod_write_word(object+0x44,list);psx_mod_write_word(list+8,box);
+        const int16_t bounds[]={-512,-512,-512,0,512,512,512,0};
+        for(unsigned i=0;i<8;++i)psx_mod_write_half(box+2*i,uint16_t(bounds[i]));
+        ttk::input={};ttk::input.active=true;ttk::input.held[ttk::move_forward]=true;
+        psx_mod_write_word(p,0);psx_mod_write_word(p+0x224,0);psx_mod_write_byte(p+0x3b8,0);
+        psx_mod_write_byte(p+0x22c,6);psx_mod_write_byte(p+0x22d,6);
+        psx_mod_write_half(p+0x60,149);psx_mod_write_half(p+0x74,149);
+        psx_mod_write_word(p+0x174,object);psx_mod_write_word(p+0x17c,object);psx_mod_write_half(p+0x180,0);
+        psx_mod_write_word(p+0x1c8,uint32_t(-11264));psx_mod_write_word(p+0x184,777);
+        auto update=[&]{++ttk::input.sequence;call(0x8005a210,p,0x800c2754,0x80041b34,0x801fff00);};
+        ttk::test_pad=0xffef;assert(ttk::ledge_hang_ready());ledge_probe_pass=false;auto n=ledge_probe_calls;update();
+        assert(ledge_probe_calls==n+1 && psx_mod_read_half(p+0x60)==149);
+        assert(psx_mod_read_word(p+0x17c)==object && psx_mod_read_word(p+0x174)==object && psx_mod_read_word(p+0x184)==777);
+        auto refuses=[&]{auto before=ledge_probe_calls;update();assert(ledge_probe_calls==before && psx_mod_read_half(p+0x60)==149);};
+        ttk::test_pad=0xffbf;refuses();ttk::test_pad=0xffef;
+        ttk::input.held[ttk::jump]=true;refuses();ttk::input.held[ttk::jump]=false;
+        ttk::input.held[ttk::move_back]=true;refuses();ttk::input.held[ttk::move_back]=false;
+        ttk::input.held[ttk::move_forward]=false;refuses();ttk::input.held[ttk::move_forward]=true;
+        ttk::input.active=false;refuses();ttk::input.active=true;
+        ttk::modern=false;refuses();ttk::modern=true;
+        psx_mod_write_byte(p+0x22c,3);assert(!ttk::ledge_hang_ready());refuses();
+        psx_mod_write_byte(p+0x22c,7);assert(!ttk::ledge_hang_ready());refuses();psx_mod_write_byte(p+0x22c,6);
+        psx_mod_write_word(p+0x1c8,uint32_t(-10240));refuses();psx_mod_write_word(p+0x1c8,uint32_t(-11264));
+        psx_mod_write_half(p+0x180,1);refuses();psx_mod_write_half(p+0x180,0);
+        psx_mod_write_word(p+0x224,0x40);refuses();psx_mod_write_word(p+0x224,0);
+        poke(0x7d240);assert(!ttk::ledge_hang_ready());refuses();poke(0x7d240);
+        ledge_probe_pass=true;update();assert(psx_mod_read_half(p+0x60)==140 && psx_mod_read_word(p+0x17c)==0);
+        assert(psx_mod_read_half(p+0x68)==0 && psx_mod_read_half(p+0x6a)==0);
+        std::copy(memory.begin(),memory.end(),ram);++g_dirty_ram_code_gen;ttk::input=input;ttk::test_pad=0xffff;
+        std::puts("PASS: D08T8 support mismatch, clearance refusal restoration, original pull-up and input/state/profile/code guards");
+    }
+    // D08U top-of-ladder mount: the slot-12 sewer ladder (type 308, a 378 x 6142
+    // panel at x -4136, yaw 1024, top 507 below the walkway). E's request at the
+    // walkway edge attaches it exactly as the airborne catch does (156, mode 3,
+    // +0x17c/+0x180) and blends Duke onto the far-side climbing line.
+    {
+        const uint32_t table=0x801e8000,object=0x801e9100,list=0x801e9200,box=0x801e9300,node=0x801e9400;
+        const uint32_t saved_table=psx_mod_read_word(0x800d2660);
+        const auto saved_sequence=ttk::input.sequence;
+        psx_mod_write_word(0x800d2660,table);psx_mod_write_word(table+28*308,0x108202);
+        psx_mod_write_half(object+0x2c,308);psx_mod_write_half(object+0x1c,1024);
+        psx_mod_write_word(object+4,uint32_t(-4136));psx_mod_write_word(object+8,uint32_t(-2047));psx_mod_write_word(object+12,76328);
+        psx_mod_write_word(object+0x44,list);psx_mod_write_word(list+8,box);
+        const int16_t panel[]={-189,-3071,0,189,189,3071,0,3076};
+        for(int i=0;i<8;++i)psx_mod_write_half(box+2*i,uint16_t(panel[i]));
+        psx_mod_write_word(node+8,object);psx_mod_write_word(node+4,0);psx_mod_write_word(p+0x220,node);
+        auto place=[&](int x,int y,int z){psx_mod_write_word(p+4,uint32_t(x));psx_mod_write_word(p+8,uint32_t(y));psx_mod_write_word(p+12,uint32_t(z));};
+        auto camera=[&]{++ttk::input.sequence;call(0x8003ade4,c,p,0x80025ee8);};
+        auto update=[&]{call(0x8005a210,p,0x800c2754,0x80041b34,0x801fff00);};
+        auto s32=[](uint32_t a){return int32_t(psx_mod_read_word(a));};
+        place(-3798,-5625,76329);psx_mod_write_half(p+0x1c,3002);psx_mod_write_byte(p+0x3b8,0);
+        camera();assert(ttk::movement_ready() && ttk::ladder_top_available());
+        place(-3798+800,-5625,76329);assert(!ttk::ladder_top_available()); // out of reach
+        place(-3798,-5625,76329+700);assert(!ttk::ladder_top_available()); // past its side
+        place(-3798,-5200,76329);assert(!ttk::ladder_top_available()); // not at its top
+        place(-3798,-5625,76329);
+        psx_mod_write_word(table+28*308,0x8402);assert(!ttk::ladder_top_available()); // climbing wall
+        psx_mod_write_word(table+28*308,0x108202);
+        psx_mod_write_half(p+0x60,108);assert(!ttk::ladder_top_available());psx_mod_write_half(p+0x60,63);
+        // Armed: the request is ignored (E stows first in pc_input).
+        psx_mod_write_byte(p+0x3b8,2);ttk::ladder_top_request();update();
+        assert(psx_mod_read_half(p+0x60)==63 && psx_mod_read_byte(p+0x22c)==0);
+        psx_mod_write_byte(p+0x3b8,0);
+        ttk::ladder_top_request();update();
+        assert(psx_mod_read_half(p+0x60)==156 && psx_mod_read_byte(p+0x22c)==3 && psx_mod_read_byte(p+0x22d)==3);
+        assert(psx_mod_read_word(p+0x17c)==object && psx_mod_read_half(p+0x180)==0 && s32(p+4)==-3798);
+        for(int i=0;i<12;++i) {
+            camera();assert(ttk::traversal_camera_ready() && !ttk::locomotion_input_ready());update();
+        }
+        assert(s32(p+4)==-4336 && s32(p+8)==-5118+320 && s32(p+12)==76328 && psx_mod_read_half(p+0x1c)==1024);
+        psx_mod_write_half(p+0x60,186);update(); // the original transfer ended: attached
+        assert(psx_mod_read_half(p+0x60)==186 && std::strstr(ttk::controls_debug_json(),"\"mounts\":1"));
+        // D08J3: the mouse camera stays on through the attached climb (mode 3).
+        camera();assert(ttk::traversal_camera_ready() && !ttk::locomotion_input_ready() && !ttk::airborne_shot_ready());
+        // D08U1: the original's ladder-end probe while stepping down. Open below
+        // (ladder ends above the floor): the descent flag is cleared so the
+        // original stops at this rung; touch fields survive the probe.
+        psx_mod_write_word(p+0x174,0x801e1234);psx_mod_write_half(p+0x178,7);
+        psx_mod_write_half(p+0x60,188);psx_mod_write_half(p+0x6a,1);ladder_end_result=0;update();
+        assert(ladder_end_calls>0 && psx_mod_read_half(p+0x6a)==1 && !ttk::ladder_end_below());
+        ladder_end_result=1;update();
+        assert(psx_mod_read_half(p+0x6a)==0 && std::strstr(ttk::controls_debug_json(),"\"end_stops\":1"));
+        assert(psx_mod_read_word(p+0x174)==0x801e1234 && psx_mod_read_half(p+0x178)==7);
+        psx_mod_write_half(p+0x60,186);psx_mod_write_half(p+0x6a,1);update(); // resting: no flag write
+        assert(psx_mod_read_half(p+0x6a)==1);
+        const unsigned calls=ladder_end_calls;ttk::modern=false;psx_mod_write_half(p+0x60,188);update();
+        assert(ladder_end_calls==calls && psx_mod_read_half(p+0x6a)==1);ttk::modern=true; // Vanilla untouched
+        ladder_end_result=0;psx_mod_write_half(p+0x60,186);psx_mod_write_half(p+0x6a,0);psx_mod_write_word(p+0x174,0);
+        // Vanilla never mounts.
+        psx_mod_write_half(p+0x60,63);psx_mod_write_byte(p+0x22c,0);psx_mod_write_byte(p+0x22d,0);place(-3798,-5625,76329);
+        ttk::modern=false;ttk::ladder_top_request();update();assert(psx_mod_read_half(p+0x60)==63);ttk::modern=true;
+        ttk::input.sequence+=25;camera();update();assert(psx_mod_read_half(p+0x60)==63); // a stale request expires
+        // D35I1: current slot-7 wall top. Keep the lateral contact, use the
+        // native wall transfer, and finish an early native transition's blend.
+        const uint32_t wall_saved_water=psx_mod_read_word(p+0x834);
+        psx_mod_write_word(p+0x834,0x40000000u);
+        psx_mod_write_word(table+28*308,0x108102);
+        psx_mod_write_half(object+0x1c,0);
+        psx_mod_write_word(object+4,uint32_t(-36352));psx_mod_write_word(object+8,2563);psx_mod_write_word(object+12,34816);
+        const int16_t wall_panel[]={-512,-511,0,512,512,512,0,724};
+        for(int i=0;i<8;++i)psx_mod_write_half(box+2*i,uint16_t(wall_panel[i]));
+        place(-36810,1546,35297);camera();assert(ttk::ladder_top_available());
+        place(-36850,1546,35297);assert(!ttk::ladder_top_available()); // outside hand margin
+        place(-36810,1546,35400);assert(!ttk::ladder_top_available()); // too far from lip
+        place(-36810,2100,35297);assert(!ttk::ladder_top_available()); // below top
+        place(-36810,1546,35297);
+        psx_mod_write_word(table+28*308,0x108002);assert(!ttk::ladder_top_available()); // ordinary wall
+        psx_mod_write_word(table+28*308,0x108102);
+        ttk::modern=false;ttk::ladder_top_request();update();assert(psx_mod_read_half(p+0x60)==63);ttk::modern=true;
+        camera();ttk::ladder_top_request();update();
+        assert(psx_mod_read_half(p+0x60)==155 && psx_mod_read_word(p+0x17c)==object);
+        for(int i=0;i<3;++i){camera();update();}
+        psx_mod_write_half(p+0x60,198);
+        for(int i=0;i<12;++i){camera();update();}
+        assert(s32(p+4)==-36810 && s32(p+8)==2372 && s32(p+12)==34616);
+        assert(psx_mod_read_half(p+0x1c)==0 && psx_mod_read_half(p+0x60)==198);
+        psx_mod_write_half(p+0x60,63);psx_mod_write_byte(p+0x22c,0);psx_mod_write_byte(p+0x22d,0);
+        psx_mod_write_word(p+0x834,wall_saved_water);
+        std::puts("PASS: D35I1 wall-top geometry/family/profile gates, native 155 entry, lateral contact and early 198 handoff");
+        psx_mod_write_word(p+0x220,0);psx_mod_write_word(p+0x17c,0);psx_mod_write_word(0x800d2660,saved_table);
+        place(0,0,0);psx_mod_write_half(p+0x1c,0);psx_mod_write_half(p+0x24,0);
+        ttk::input.sequence=saved_sequence;call(0x8003ade4,c,p,0x80025ee8);assert(ttk::movement_ready());
+        std::puts("PASS: D08U top-of-ladder mount (reach/side/top/family/state gates, armed and Vanilla refusal, catch-equivalent attach, 12-update blend onto the climbing line, camera-only lease, 186 handoff, request expiry, D08U1 ladder-end stop)");
+    }
+    // D08J5 pole/chain top mount: the user's slot-3 chain (type 842, flags
+    // 0x100412, a 138-wide column from Y -3072 to 1024 at (-4049, 31248)),
+    // its top 509 below the platform. E at the edge attaches it as the airborne
+    // catch does (154) and swings Duke half a turn round it while lowering him.
+    {
+        const uint32_t table=0x801e8000,object=0x801e9100,list=0x801e9200,box=0x801e9300,node=0x801e9400;
+        const uint32_t saved_table=psx_mod_read_word(0x800d2660);
+        const auto saved_sequence=ttk::input.sequence;
+        psx_mod_write_word(0x800d2660,table);psx_mod_write_word(table+28*842,0x100412);
+        psx_mod_write_half(object+0x2c,842);psx_mod_write_half(object+0x1c,0);
+        psx_mod_write_word(object+4,uint32_t(-4049));psx_mod_write_word(object+8,uint32_t(-1024));psx_mod_write_word(object+12,31248);
+        psx_mod_write_word(object+0x44,list);psx_mod_write_word(list+8,box);
+        const int16_t column[]={-69,-2048,-69,97,69,2048,69,2050};
+        for(int i=0;i<8;++i)psx_mod_write_half(box+2*i,uint16_t(column[i]));
+        psx_mod_write_word(node+8,object);psx_mod_write_word(node+4,0);psx_mod_write_word(p+0x220,node);
+        auto place=[&](int x,int y,int z){psx_mod_write_word(p+4,uint32_t(x));psx_mod_write_word(p+8,uint32_t(y));psx_mod_write_word(p+12,uint32_t(z));};
+        auto camera=[&]{++ttk::input.sequence;call(0x8003ade4,c,p,0x80025ee8);};
+        auto update=[&]{call(0x8005a210,p,0x800c2754,0x80041b34,0x801fff00);};
+        auto s32=[](uint32_t a){return int32_t(psx_mod_read_word(a));};
+        place(-4386,-3581,31122);psx_mod_write_half(p+0x1c,797);psx_mod_write_byte(p+0x3b8,0);
+        camera();assert(ttk::movement_ready() && ttk::ladder_top_available());
+        place(-4386-400,-3581,31122);assert(!ttk::ladder_top_available()); // out of reach
+        place(-4386,-3200,31122);assert(!ttk::ladder_top_available()); // not at its top
+        place(-4386,-3581,31122);
+        psx_mod_write_word(table+28*842,0x100512);assert(!ttk::ladder_top_available()); // 0x100 family
+        psx_mod_write_word(table+28*842,0x100412);
+        ttk::modern=false;ttk::ladder_top_request();update();assert(psx_mod_read_half(p+0x60)==63);ttk::modern=true; // Vanilla
+        ttk::ladder_top_request();update();
+        assert(psx_mod_read_half(p+0x60)==154 && psx_mod_read_byte(p+0x22c)==3 && psx_mod_read_byte(p+0x22d)==3);
+        assert(psx_mod_read_word(p+0x17c)==object && psx_mod_read_half(p+0x180)==0 && s32(p+0x1c4)==0);
+        const int start=psx_mod_read_half(p+0x1c);
+        assert(std::abs(std::hypot(s32(p+4)+4049.0,s32(p+12)-31248.0)-225)<2); // the original's hang radius
+        for(int i=0;i<12;++i) {
+            camera();assert(ttk::traversal_camera_ready() && !ttk::locomotion_input_ready());update();
+        }
+        // Facing the chain from the edge, then half a turn.
+        const int facing=int(std::lround(std::atan2(-4049+4386.0,31248-31122.0)*4096/(2*M_PI)))&4095;
+        assert(std::abs(start-facing)<64 && psx_mod_read_half(p+0x1c)==((facing+2048)&4095) && s32(p+8)==-3072+400);
+        assert(s32(p+4)>-4049); // the far side, facing the platform
+        psx_mod_write_half(p+0x60,192);update();
+        assert(std::strstr(ttk::controls_debug_json(),"\"pole\":{\"mount_starts\":1,\"mounts\":1"));
+        // Down probe (0x8007d65c from the hang-climb, s3 = 1): a floor above
+        // Duke's feet is replaced by one far below; a floor below is kept.
+        auto probe=[&](uint32_t caller,unsigned dir,int32_t floor){
+            const uint32_t sp=0x801f0000;psx_mod_write_word(sp+0x64,caller);psx_mod_write_word(sp+0x4c,uint32_t(floor));
+            CPUState cpu{};cpu.gpr[4]=p;cpu.gpr[19]=dir;cpu.gpr[29]=sp;cpu.gpr[31]=0x8007d7fc;
+            hooks().at(0x8003964c)(&cpu,0x8003964c);return s32(sp+0x4c);};
+        assert(probe(0x80044340,1,-3072)==-2672+0x8000 && probe(0x80044434,1,-3072)==-2672+0x8000);
+        assert(probe(0x80044434,1,510)==510 && probe(0x80044434,0,-3072)==-3072 && probe(0x80044999,1,-3072)==-3072);
+        ttk::modern=false;assert(probe(0x80044434,1,-3072)==-3072);ttk::modern=true;
+        // S resting at the end (the original does not leave 192): after 8 updates, let go.
+        ttk::input.held[ttk::move_back]=true;
+        for(int i=0;i<7;++i){update();assert(!ttk::pole_let_go_ready());}
+        update();assert(ttk::pole_let_go_ready());
+        psx_mod_write_half(p+0x60,195);update();assert(!ttk::pole_let_go_ready()); // stepping down again
+        ttk::input.held[ttk::move_back]=false;
+        // The original top exit and step-off keep the camera-only lease.
+        psx_mod_write_byte(p+0x22c,8);psx_mod_write_half(p+0x60,191);camera();assert(ttk::traversal_camera_ready() && ttk::ladder_exit_ready());
+        psx_mod_write_half(p+0x60,196);camera();assert(ttk::ladder_exit_ready());
+        psx_mod_write_half(p+0x60,63);psx_mod_write_byte(p+0x22c,0);psx_mod_write_byte(p+0x22d,0);
+        psx_mod_write_word(p+0x220,0);psx_mod_write_word(p+0x17c,0);psx_mod_write_word(0x800d2660,saved_table);
+        place(0,0,0);psx_mod_write_half(p+0x1c,0);psx_mod_write_half(p+0x24,0);
+        ttk::input.sequence=saved_sequence;call(0x8003ade4,c,p,0x80025ee8);assert(ttk::movement_ready());
+        std::puts("PASS: D08J5 pole/chain top mount (reach/top/family gates, Vanilla refusal, catch-equivalent 154 attach, half-turn swing to the far side, down probe ignores floors above, S at the end lets go, exits keep the lease)");
+    }
+    // D08J1 overhead ladder leap: the user's slot-6 ladder (type 46, a 378 x
+    // 2046 panel at z 80918, yaw 0, bottom about 1040 above the floor).
+    {
+        const uint32_t table=0x801e8000,object=0x801e9100,list=0x801e9200,box=0x801e9300,node=0x801e9400;
+        const uint32_t saved_table=psx_mod_read_word(0x800d2660);
+        const auto saved_sequence=ttk::input.sequence;
+        const uint32_t saved_floor=psx_mod_read_word(p+0x1c8);
+        psx_mod_write_word(0x800d2660,table);psx_mod_write_word(table+28*46,0x108212);
+        psx_mod_write_half(object+0x2c,46);psx_mod_write_half(object+0x1c,0);
+        psx_mod_write_word(object+4,24577);psx_mod_write_word(object+8,uint32_t(-8203));psx_mod_write_word(object+12,80918);
+        psx_mod_write_word(object+0x44,list);psx_mod_write_word(list+8,box);
+        const int16_t panel[]={-189,-1023,0,189,189,1023,0,1040};
+        for(int i=0;i<8;++i)psx_mod_write_half(box+2*i,uint16_t(panel[i]));
+        psx_mod_write_word(node+8,object);psx_mod_write_word(node+4,0);psx_mod_write_word(p+0x220,node);
+        auto place=[&](int x,int z){psx_mod_write_word(p+4,uint32_t(x));psx_mod_write_word(p+8,uint32_t(-6650));psx_mod_write_word(p+12,uint32_t(z));};
+        auto camera=[&]{++ttk::input.sequence;call(0x8003ade4,c,p,0x80025ee8);};
+        auto gait=[&](unsigned a){psx_mod_write_half(p+0x60,a);};
+        psx_mod_write_word(p+0x1c8,uint32_t(-6143));psx_mod_write_half(p+0x1c,2048);psx_mod_write_byte(p+0x3b8,0);
+        place(24442,80918+700);gait(63);camera();assert(ttk::movement_ready() && !ttk::ladder_top_available());
+        assert(!ttk::ladder_leap_ready()); // standing: only at the wall
+        gait(76);assert(ttk::ladder_leap_ready());gait(72);assert(ttk::ladder_leap_ready());
+        place(24442,80918+900);gait(76);assert(!ttk::ladder_leap_ready()); // not yet in the window
+        place(24442,80918+245);gait(63);assert(ttk::ladder_leap_ready()); // stopped at the wall
+        psx_mod_write_half(p+0x1c,0);assert(!ttk::ladder_leap_ready()); // facing away
+        psx_mod_write_half(p+0x1c,2048+700);assert(!ttk::ladder_leap_ready()); // beyond 50 degrees
+        psx_mod_write_half(p+0x1c,2048+400);assert(ttk::ladder_leap_ready());psx_mod_write_half(p+0x1c,2048);
+        place(24577+189+200,80918+245);assert(!ttk::ladder_leap_ready()); // past its side (half + 180)
+        place(24577-220,80918+245);assert(ttk::ladder_leap_ready());
+        place(24442,80918+245);
+        psx_mod_write_byte(p+0x3b8,2);assert(!ttk::ladder_leap_ready());psx_mod_write_byte(p+0x3b8,0); // armed: stow first
+        psx_mod_write_word(p+0x1c8,uint32_t(-7000));assert(!ttk::ladder_leap_ready()); // bottom within reach of the floor
+        psx_mod_write_word(p+0x1c8,uint32_t(-5600));assert(!ttk::ladder_leap_ready()); // too high to catch
+        psx_mod_write_word(p+0x1c8,uint32_t(-6143));
+        psx_mod_write_word(table+28*46,0x108412);assert(!ttk::ladder_leap_ready()); // climbing wall family
+        psx_mod_write_word(table+28*46,0x108212);
+        gait(108);assert(!ttk::ladder_leap_ready());gait(63); // airborne
+        // Off-centre leap: 160 beyond the half width starts, and in flight Duke
+        // eases along the panel (70 per update) to 60 inside it, never off it.
+        place(24577-189-160,80918+245);assert(ttk::ladder_leap_ready());
+        place(24577-189-200,80918+245);assert(!ttk::ladder_leap_ready());
+        place(24577-189-160,80918+245);assert(ttk::ladder_leap_ready());ttk::ladder_leap_note();
+        auto update=[&]{call(0x8005a210,p,0x800c2754,0x80041b34,0x801fff00);};
+        gait(97);psx_mod_write_byte(p+0x22c,9);psx_mod_write_byte(p+0x22d,9);
+        const int x0=int32_t(psx_mod_read_word(p+4));
+        update();assert(int32_t(psx_mod_read_word(p+4))==x0+70 && int32_t(psx_mod_read_word(p+12))==80918+245);
+        update();assert(int32_t(psx_mod_read_word(p+4))==x0+140);
+        update();assert(int32_t(psx_mod_read_word(p+4))==x0+210);
+        update();assert(int32_t(psx_mod_read_word(p+4))==24577-129);
+        update();assert(int32_t(psx_mod_read_word(p+4))==24577-129);
+        assert(std::strstr(ttk::controls_debug_json(),"\"leap_nudges\":4"));
+        psx_mod_write_byte(p+0x22c,3);update(); // caught: the assist ends
+        psx_mod_write_byte(p+0x22c,9);place(24577-300,80918+245);update();assert(int32_t(psx_mod_read_word(p+4))==24577-300);
+        psx_mod_write_byte(p+0x22c,0);psx_mod_write_byte(p+0x22d,0);gait(63);place(24442,80918+245);
+        ttk::modern=false;assert(!ttk::ladder_leap_ready());ttk::modern=true;
+        psx_mod_write_word(p+0x220,0);psx_mod_write_word(0x800d2660,saved_table);psx_mod_write_word(p+0x1c8,saved_floor);
+        psx_mod_write_word(p+4,0);psx_mod_write_word(p+8,0);psx_mod_write_word(p+12,0);psx_mod_write_half(p+0x1c,0);psx_mod_write_half(p+0x24,0);
+        ttk::input.sequence=saved_sequence;call(0x8003ade4,c,p,0x80025ee8);assert(ttk::movement_ready());
+        std::puts("PASS: D08J1 overhead ladder leap (gait windows, wall stop, facing, side, armed, rise limits, family, airborne and Vanilla refusal; in-flight side assist to the panel, ends on the catch)");
+    }
+    // D08X: E held through an original jump (98/103/104, mode 9) arms the
+    // original reach at once (+0x224 |= 0x800000); never without E, with
+    // precision aim, over original blocking bits, outside Duke's own ballistic
+    // call, in other animations or in Vanilla.
+    {
+        const auto saved_anim=psx_mod_read_half(p+0x60);
+        const auto saved_flags=psx_mod_read_word(p+0x224);
+        psx_mod_write_byte(p+0x22c,9);psx_mod_write_byte(p+0x22d,9);psx_mod_write_word(p+0x224,0);
+        auto arm=[&](unsigned anim,uint32_t ra=0x80055934){psx_mod_write_half(p+0x60,anim);psx_mod_write_word(p+0x224,0);
+            call(0x8003ebf4,p,0,ra);return psx_mod_read_word(p+0x224)&0x800000u;};
+        ttk::reach_held=false;assert(!arm(98) && !arm(104));
+        ttk::reach_held=true;assert(arm(98) && arm(103) && arm(104));
+        assert(!arm(97) && !arm(108) && !arm(109) && !arm(105));
+        assert(!arm(98,0x80055930));
+        ttk::input.held[ttk::original_aim]=true;assert(!arm(98));ttk::input.held[ttk::original_aim]=false;
+        psx_mod_write_half(p+0x60,98);psx_mod_write_word(p+0x224,0x40);call(0x8003ebf4,p,0,0x80055934);
+        assert(psx_mod_read_word(p+0x224)==0x40);
+        ttk::input.active=false;assert(!arm(98));ttk::input.active=true;
+        ttk::modern=false;assert(!arm(98));ttk::modern=true;
+        ttk::reach_held=false;
+        psx_mod_write_byte(p+0x22c,0);psx_mod_write_byte(p+0x22d,0);psx_mod_write_half(p+0x60,saved_anim);
+        psx_mod_write_word(p+0x224,saved_flags);
+        std::puts("PASS: D08X hold-E reach arm (98/103/104 only, E required, precision aim/blocking bits/caller/capture/Vanilla refusals)");
+    }
+    // D08Z1: before Duke's own ballistic update the host sweeps the flight in
+    // isolation; a wall (result 1) leaves the motion along it plus a small
+    // outward drift, a ceiling while rising (result 3) stops the rise, a corner
+    // still in the way after three passes stops the horizontal travel. Clear
+    // paths, falls into a ceiling, other callers, a short guest stack and
+    // Vanilla are untouched.
+    {
+        const auto saved_anim=psx_mod_read_half(p+0x60);
+        psx_mod_write_byte(p+0x22c,9);psx_mod_write_byte(p+0x22d,9);psx_mod_write_half(p+0x60,107);
+        auto v=[&](unsigned o){return int32_t(psx_mod_read_word(p+o));};
+        auto fly=[&](int32_t vx,int32_t vy,int32_t vz,int result,int hits,int32_t nx,int32_t nz,uint32_t ra=0x80055934,uint32_t sp=0x801fff00){
+            psx_mod_write_word(p+0x1f4,uint32_t(vx));psx_mod_write_word(p+0x1f8,uint32_t(vy));psx_mod_write_word(p+0x1fc,uint32_t(vz));
+            jw_result=result;jw_hits=hits;jw_nx=nx;jw_nz=nz;jw_sweeps=0;
+            call(0x8003ebf4,p,0,ra,sp);};
+        fly(0,-3000,10000,1,1,0,-4096);   // head-on: stops at the wall, keeps the arc
+        assert(v(0x1f4)==0 && v(0x1f8)==-3000 && v(0x1fc)==-128 && jw_sweeps==2);
+        assert(std::strstr(ttk::controls_debug_json(),"\"jump_walls\":{\"slide\":true,\"slides\":1,") &&
+               std::strstr(ttk::controls_debug_json(),"\"age\":0}"));
+        fly(10000,500,10000,1,1,0,-4096);  // 45 degrees: keeps the motion along it
+        assert(v(0x1f4)==10000 && v(0x1f8)==500 && v(0x1fc)==-128);
+        fly(-7000,0,7000,1,1,2896,-2896);  // a diagonal wall
+        assert(std::abs(v(0x1f4)-91)<=2 && std::abs(v(0x1fc)+91)<=2);
+        fly(10000,0,0,1,1,0,-4096);       // along it and still touching: pushed off
+        assert(v(0x1f4)==10000 && v(0x1fc)==-256 && std::strstr(ttk::controls_debug_json(),"\"nudges\":1,"));
+        fly(0,0,10000,1,3,0,-4096);       // a convex corner: turned 15 degrees toward the slide clears it
+        assert(jw_sweeps==4 && std::abs(v(0x1f4)+2500)<=3 && std::abs(v(0x1fc)-9330)<=3 &&
+               std::strstr(ttk::controls_debug_json(),"\"turns\":1,"));
+        fly(0,-500,10000,1,99,0,-4096);   // nothing clears: pushed straight off it, never into it
+        assert(jw_sweeps==17 && v(0x1f4)==0 && v(0x1fc)==-1200 && v(0x1f8)==-500 && std::strstr(ttk::controls_debug_json(),"\"stops\":1,"));
+        // Safety net: the original bounce's rerun of the integration (ra
+        // 0x8003ef68, its caller the wall case 0x800559f8 at sp+0x24) gets the
+        // pre-pass velocity minus the part into the wall, a push off it, the
+        // update's own vertical speed and timer; the 107 it writes is undone
+        // at the contact sound call that follows it.
+        {
+            psx_mod_write_half(p+0x60,103);psx_mod_write_half(p+0x68,7);psx_mod_write_half(p+0x6a,9);
+            psx_mod_write_word(p+0x200,1234);
+            fly(3000,-2000,8000,0,0,0,0);   // clear pre-pass: remembered as this update's velocity
+            psx_mod_write_word(p+0x194,0);psx_mod_write_word(p+0x19c,uint32_t(-4096));
+            psx_mod_write_word(p+0x1f4,uint32_t(-1500));psx_mod_write_word(p+0x1f8,0);psx_mod_write_word(p+0x1fc,uint32_t(-4000));
+            psx_mod_write_word(p+0x200,1300);
+            psx_mod_write_word(0x801ffe00+0x24,0x800559f8);
+            call(0x8003ebf4,p,0,0x8003ef68,0x801ffe00);
+            assert(v(0x1f4)==3000 && v(0x1fc)==-300 && v(0x1f8)==-2000 && v(0x200)==1234);
+            psx_mod_write_half(p+0x60,107);psx_mod_write_half(p+0x68,0);psx_mod_write_half(p+0x6a,0);
+            // D08Z2: not at an animation runner (the update has started 107 on
+            // its tracks by then), only at the contact sound right after the write.
+            call(0x80059db0,p+0x74,p,0x8005a5a8,0x801fff00);assert(psx_mod_read_half(p+0x60)==107);
+            call(0x8006bbd8,0x2008,0,0x80055a2c,0x801fff00);assert(psx_mod_read_half(p+0x60)==107);
+            call(0x8006bbd8,0x2008,0,0x80055a10,0x801fff00);
+            assert(psx_mod_read_half(p+0x60)==103 && psx_mod_read_half(p+0x68)==7 && psx_mod_read_half(p+0x6a)==9);
+            psx_mod_write_half(p+0x60,107);call(0x8006bbd8,0x2008,0,0x80055a10,0x801fff00);
+            assert(psx_mod_read_half(p+0x60)==107);   // once only
+            // Only once per pre-pass, only from the wall case.
+            psx_mod_write_word(p+0x1f4,uint32_t(-1500));call(0x8003ebf4,p,0,0x8003ef68,0x801ffe00);assert(v(0x1f4)==-1500);
+            fly(3000,-2000,8000,0,0,0,0);
+            psx_mod_write_word(p+0x1f4,uint32_t(-1500));psx_mod_write_word(0x801ffe00+0x24,0x80055ae4);   // the steep-ceiling bounce
+            call(0x8003ebf4,p,0,0x8003ef68,0x801ffe00);assert(v(0x1f4)==-1500);
+            assert(std::strstr(ttk::controls_debug_json(),"\"catches\":1,"));
+            psx_mod_write_half(p+0x60,107);
+        }
+        fly(5000,-6000,0,3,1,0,0);         // ceiling while rising
+        assert(v(0x1f4)==5000 && v(0x1f8)==0 && v(0x1fc)==0 && std::strstr(ttk::controls_debug_json(),"\"ceilings\":1,"));
+        fly(5000,6000,0,3,1,0,0);          // falling: the original's own landing/ceiling rules
+        assert(v(0x1f4)==5000 && v(0x1f8)==6000 && jw_sweeps==1);
+        fly(4000,100,4000,0,0,0,0);        // clear
+        assert(v(0x1f4)==4000 && v(0x1fc)==4000 && jw_sweeps==1);
+        fly(0,0,10000,1,1,0,-4096,0x80055930);assert(v(0x1fc)==10000 && jw_sweeps==0);              // other caller
+        fly(0,0,10000,1,1,0,-4096,0x80055934,0x801f0000);assert(v(0x1fc)==10000 && jw_sweeps==0);  // no guest stack
+        psx_mod_write_byte(p+0x22c,0);fly(0,0,10000,1,1,0,-4096);assert(v(0x1fc)==10000 && jw_sweeps==0);
+        psx_mod_write_byte(p+0x22c,9);
+        ttk::modern=false;fly(0,0,10000,1,1,0,-4096);assert(v(0x1fc)==10000 && jw_sweeps==0);ttk::modern=true;
+        for(unsigned o:{0x1f4u,0x1f8u,0x1fcu})psx_mod_write_word(p+o,0);
+        psx_mod_write_byte(p+0x22c,0);psx_mod_write_byte(p+0x22d,0);psx_mod_write_half(p+0x60,saved_anim);
+        std::puts("PASS: D08Z1 jump wall slide (head-on, angled, diagonal, touching push-off, convex corner turn, push-off when nothing clears, bounce safety net and 107 undo, rising ceiling; falls, clear paths, caller, stack, mode and Vanilla untouched)");
+    }
+    // D08X boxes room: an E bounce (107) off a climbable crate whose top is in
+    // mantle range above Duke's feet becomes the matching original mantle.
+    {
+        const uint32_t table=0x801e8000,crate=0x801e9500,list=0x801e9600,box=0x801e9700;
+        const uint32_t saved_table=psx_mod_read_word(0x800d2660);
+        psx_mod_write_word(0x800d2660,table);psx_mod_write_word(table+28*20,0x2090c2);
+        psx_mod_write_half(crate+0x2c,20);psx_mod_write_word(crate+4,uint32_t(15937));psx_mod_write_word(crate+8,uint32_t(-6702));
+        psx_mod_write_word(crate+12,73187);psx_mod_write_word(crate+0x44,list);psx_mod_write_word(list+8,box);
+        const int16_t cube[]={-506,-514,-511,726,514,510,513,889};
+        for(int i=0;i<8;++i)psx_mod_write_half(box+2*i,uint16_t(cube[i]));
+        auto update=[&]{call(0x8005a210,p,0x800c2754,0x80041b34,0x801fff00);};
+        auto bounce=[&](int y,int heading=1024){
+            psx_mod_write_half(p+0x60,107);psx_mod_write_byte(p+0x22c,9);psx_mod_write_byte(p+0x22d,9);
+            psx_mod_write_word(p+4,uint32_t(15100));psx_mod_write_word(p+8,uint32_t(y));psx_mod_write_word(p+12,73748);
+            psx_mod_write_half(p+0x1c,uint16_t(heading));psx_mod_write_word(p+0x174,crate);psx_mod_write_word(p+0x224,0);psx_mod_write_byte(p+0x3b8,0);
+            psx_mod_write_word(p+0x1c8,uint32_t(y+507));psx_mod_write_half(p+0x60,63);psx_mod_write_byte(p+0x22c,0);psx_mod_write_byte(p+0x22d,0);update(); // leave any old bounce
+            psx_mod_write_half(p+0x60,107);psx_mod_write_byte(p+0x22c,9);psx_mod_write_byte(p+0x22d,9);update();
+            return psx_mod_read_half(p+0x60);};
+        ttk::reach_held=true;
+        assert(bounce(-7103)==136 && psx_mod_read_byte(p+0x22c)==0);
+        assert(int32_t(psx_mod_read_word(p+0x1c8))==-7103+507 && int32_t(psx_mod_read_word(p+0x1c4))==-7216-(-7103+507));
+        assert(bounce(-7000)==137);
+        assert(bounce(-6650)==139);  // top 1073 above the feet: the full climb after the line-up
+        lineup_ok=0;assert(bounce(-7103)==107);lineup_ok=1; // the original line-up refuses: no mantle
+        assert(bounce(-7700)==107);  // already level with the top
+        ttk::reach_held=false;assert(bounce(-7103)==107);ttk::reach_held=true;
+        assert(bounce(-7103,3072)==107); // facing away
+        psx_mod_write_word(table+28*20,0x2);assert(bounce(-7103)==107);psx_mod_write_word(table+28*20,0x2090c2);
+        ttk::modern=false;assert(bounce(-7103)==107);ttk::modern=true;
+        ttk::reach_held=false;psx_mod_write_word(p+0x174,0);psx_mod_write_half(p+0x60,63);psx_mod_write_byte(p+0x22c,0);psx_mod_write_byte(p+0x22d,0);
+        psx_mod_write_word(p+0x1c8,0);psx_mod_write_word(p+0x1c4,0);psx_mod_write_word(0x800d2660,saved_table);
+        psx_mod_write_word(p+4,0);psx_mod_write_word(p+8,0);psx_mod_write_word(p+12,0);psx_mod_write_half(p+0x1c,0);psx_mod_write_half(p+0x24,0);
+        call(0x8003ade4,c,p,0x80025ee8);assert(ttk::movement_ready());
+        // The original rewrites bit 0x40 of the upper-body flag entries at run
+        // time (object/ledge hang on 149/152/153, the pole side probe
+        // 0x800439e4 on the current animation: 196 at a chain top exit, D08V1)
+        // and BONUS.OVR the low half of 265: game state, never an identity
+        // loss. Any other bit of the table is still authenticated.
+        const auto seq_before=ttk::input.sequence;
+        for(uint32_t a:{0x800c2a78u,0x800c2a84u,0x800c2a88u,0x800c2b34u,0x800c2a74u,0x800c2824u,0x800c2c80u}) {
+            const uint32_t v=psx_mod_read_word(a);psx_mod_write_word(a,v^0x40);
+            ++ttk::input.sequence;call(0x8003ade4,c,p,0x80025ee8);assert(ttk::movement_ready());
+            psx_mod_write_word(a,v);
+        }
+        {
+            const uint32_t v=psx_mod_read_word(0x800c2c48);psx_mod_write_half(0x800c2c48,1);
+            ++ttk::input.sequence;call(0x8003ade4,c,p,0x80025ee8);assert(ttk::movement_ready());
+            psx_mod_write_half(0x800c2c4a,1);
+            ++ttk::input.sequence;call(0x8003ade4,c,p,0x80025ee8);assert(!ttk::movement_ready());
+            psx_mod_write_word(0x800c2c48,v);
+        }
+        for(uint32_t a:{0x800c2a74u,0x800c2b34u}) for(uint32_t bit:{0x1u,0x20u,0x80u,0x10000u}) {
+            const uint32_t kept=psx_mod_read_word(a);psx_mod_write_word(a,kept^bit);
+            ++ttk::input.sequence;call(0x8003ade4,c,p,0x80025ee8);assert(!ttk::movement_ready());
+            // The verdict is rechecked every frame: restored bytes recover.
+            psx_mod_write_word(a,kept);++ttk::input.sequence;call(0x8003ade4,c,p,0x80025ee8);assert(ttk::movement_ready());
+        }
+        ttk::input.sequence=seq_before;call(0x8003ade4,c,p,0x80025ee8);
+        // Lifted reach retry: misses restore height and probe fields; a catch at
+        // +320 keeps the original hang, starts at the real height and eases up.
+        {
+            auto reach=[&]{psx_mod_write_half(p+0x60,109);psx_mod_write_half(p+0x74,109);psx_mod_write_byte(p+0x22c,9);psx_mod_write_byte(p+0x22d,9);
+                psx_mod_write_word(p+8,uint32_t(-7000));psx_mod_write_word(p+0x174,0);psx_mod_write_word(p+0x1c4,0);
+                psx_mod_write_word(p+0x224,0);psx_mod_write_byte(p+0x3b8,0);lift_calls.clear();};
+            // A reach session restarts the retry schedule; an update without E
+            // ends the session.
+            auto reset=[&]{const bool h=ttk::reach_held;ttk::reach_held=false;call(0x8005a210,p,0x800c2754,0x80041b34,0x801fff00);ttk::reach_held=h;lift_calls.clear();};
+            ttk::reach_held=true;reset();reach();lift_catch_y=-100000;
+            call(0x8005a210,p,0x800c2754,0x80041b34,0x801fff00);
+            // Budgeted: four core tries (turned at the original height, then
+            // lifted 160, 320) and one lifted turned try per update; no vertical
+            // velocity here, so no D08Y lowered tries.
+            assert((lift_calls==std::vector<int32_t>{-7000,-7000,-7160,-7320,-7160}));
+            assert(psx_mod_read_half(p+0x1c)==0 && psx_mod_read_half(p+0x24)==0);
+            assert(int32_t(psx_mod_read_word(p+8))==-7000 && psx_mod_read_word(p+0x174)==0 && psx_mod_read_word(p+0x1c4)==0);
+            // The next updates continue round the schedule: 480 and the wide turns.
+            reach();call(0x8005a210,p,0x800c2754,0x80041b34,0x801fff00);
+            assert((lift_calls==std::vector<int32_t>{-7480,-7000,-7000,-7000,-7160}));
+            reset();reach();lift_catch_y=-7300;call(0x8005a210,p,0x800c2754,0x80041b34,0x801fff00);
+            assert(lift_calls.size()==4 && lift_calls[3]==-7320 && psx_mod_read_half(p+0x60)==148 && psx_mod_read_byte(p+0x22c)==6);
+            assert(int32_t(psx_mod_read_word(p+8))==-7000);
+            // Flush settle: entered from flight (previous mode 9) the hang root
+            // eases to the ledge top (+0x1c8) + 456 and then stays.
+            psx_mod_write_byte(p+0x22d,9);psx_mod_write_word(p+0x1c8,uint32_t(-7500));
+            for(int i=0;i<12;++i)call(0x8005a210,p,0x800c2754,0x80041b34,0x801fff00);
+            assert(int32_t(psx_mod_read_word(p+8))==-7500+456);
+            psx_mod_write_word(p+0x1c8,0);
+            ttk::reach_held=false;reach();call(0x8005a210,p,0x800c2754,0x80041b34,0x801fff00);assert(lift_calls.empty());
+            ttk::reach_held=true;reach();ttk::input.held[ttk::original_aim]=true;call(0x8005a210,p,0x800c2754,0x80041b34,0x801fff00);
+            assert(lift_calls.empty());ttk::input.held[ttk::original_aim]=false;
+            reach();psx_mod_write_byte(p+0x3b8,2);call(0x8005a210,p,0x800c2754,0x80041b34,0x801fff00);assert(lift_calls.empty());
+            ttk::reach_held=false;lift_catch_y=-100000;
+            psx_mod_write_half(p+0x60,63);psx_mod_write_half(p+0x74,63);psx_mod_write_byte(p+0x22c,0);psx_mod_write_byte(p+0x22d,0);
+            psx_mod_write_word(p+8,0);psx_mod_write_byte(p+0x3b8,0);
+            call(0x8003ade4,c,p,0x80025ee8);
+        }
+        // D08Y gap jumps. E reach (109): a lowered catch of a ledge 0x60..0x4c0
+        // above the feet becomes the original height mantle at the real height;
+        // a lower lip, a non-ledge catch and a miss leave Duke untouched.
+        {
+            auto reach=[&]{psx_mod_write_half(p+0x60,109);psx_mod_write_half(p+0x74,109);psx_mod_write_byte(p+0x22c,9);psx_mod_write_byte(p+0x22d,9);
+                psx_mod_write_word(p+4,0);psx_mod_write_word(p+12,0);psx_mod_write_half(p+0x1c,0);psx_mod_write_half(p+0x24,0);
+                psx_mod_write_word(p+8,uint32_t(-7000));psx_mod_write_word(p+0x174,0);psx_mod_write_word(p+0x1c4,0);psx_mod_write_word(p+0x1c8,0);
+                psx_mod_write_word(p+0x17c,0);psx_mod_write_word(p+0x1f8,900);
+                psx_mod_write_word(p+0x224,0);psx_mod_write_byte(p+0x3b8,0);lift_calls.clear();held_seen.clear();};
+            auto update=[&]{call(0x8005a210,p,0x800c2754,0x80041b34,0x801fff00);};
+            auto reset=[&]{const bool h=ttk::reach_held;ttk::reach_held=false;update();ttk::reach_held=h;lift_calls.clear();};
+            ttk::reach_held=true;reset();reach();drop_catch_y=-6760;drop_mode=6;
+            // The test's standing offset is whatever was learned; read it back
+            // from the mantle's floor (+0x1c8 = feet) and check the height band.
+            drop_top=-7000+507-300;update();
+            // Falling: the fourth core try is lowered 240 and catches.
+            assert(lift_calls.size()==4 && lift_calls[3]==-6760 && psx_mod_read_byte(p+0x22c)==0 && psx_mod_read_byte(p+0x22d)==0);
+            const int32_t feet=int32_t(psx_mod_read_word(p+0x1c8)),rel=int32_t(psx_mod_read_word(p+0x1c4));
+            assert(rel==drop_top-feet && rel<-0x60 && rel>=-0x4c0);
+            const unsigned anim=psx_mod_read_half(p+0x60);
+            assert(anim==(rel>=-0x1bf?134u:rel>=-0x23f?135u:rel>=-0x2bf?136u:137u));
+            assert(int32_t(psx_mod_read_word(p+8))==-7000 && psx_mod_read_word(p+0x1f8)==0);
+            // Squared to the wall at once; the mantle starts where he is and
+            // glides to the catch point (111, 222) over its first updates.
+            assert(psx_mod_read_half(p+0x1c)==1024 && psx_mod_read_half(p+0x24)==1024);
+            const double first=std::hypot(int32_t(psx_mod_read_word(p+4)),int32_t(psx_mod_read_word(p+12)));
+            assert(first>0 && first<=100);   // one glide step, not the ~248 snap
+            for(int i=0;i<8;++i)update();
+            assert(std::hypot(int32_t(psx_mod_read_word(p+4))-111.0,int32_t(psx_mod_read_word(p+12))-222.0)<=8);
+            assert(psx_mod_read_half(p+0x60)==anim);
+            assert(psx_mod_read_word(p+0x17c)==0);   // the catch's hang object is not kept
+            // A lip under 0x60: no mantle, everything restored.
+            reset();reach();drop_top=feet-0x40;update();
+            assert(lift_calls.size()==5 && lift_calls[3]==-6760 && psx_mod_read_half(p+0x60)==109 && psx_mod_read_byte(p+0x22c)==9);
+            assert(int32_t(psx_mod_read_word(p+8))==-7000 && psx_mod_read_half(p+0x24)==0 && psx_mod_read_word(p+4)==0 && psx_mod_read_word(p+0x1f8)==900);
+            // A ladder or object catch (mode 3/7) is never turned into a mantle.
+            for(unsigned m:{3u,7u}) {
+                reset();reach();drop_mode=m;drop_top=feet-300;update();
+                assert(psx_mod_read_half(p+0x60)==109 && psx_mod_read_byte(p+0x22c)==9 && psx_mod_read_word(p+0x17c)==0 && psx_mod_read_word(p+12)==0);
+            }
+            drop_mode=6;
+            // Rising (velocity up): only the D08X retries run.
+            reset();reach();psx_mod_write_word(p+0x1f8,uint32_t(-900));drop_top=feet-300;update();
+            assert(lift_calls.size()==5 && psx_mod_read_half(p+0x60)==109);
+            for(int32_t y:lift_calls)assert(y<=-7000);
+            // Falling, three updates cover every core try (all four lowered
+            // heights and all lifts) without a catch.
+            reset();drop_catch_y=100000;std::vector<int32_t> seen;
+            for(int i=0;i<3;++i){reach();update();seen.insert(seen.end(),lift_calls.begin(),lift_calls.end());}
+            for(int32_t y:{-6880,-6760,-6640,-6520,-7160,-7320,-7480})assert(std::count(seen.begin(),seen.end(),y)>=1);
+            assert(seen.size()==15 && psx_mod_read_half(p+0x60)==109);
+            drop_catch_y=-6760;
+            // Armed, precision aim, no E, Vanilla: no lowered retries at all.
+            reach();psx_mod_write_byte(p+0x3b8,2);update();assert(lift_calls.empty());
+            reach();ttk::input.held[ttk::original_aim]=true;update();assert(lift_calls.empty());ttk::input.held[ttk::original_aim]=false;
+            ttk::reach_held=false;reach();update();assert(lift_calls.empty());
+            ttk::modern=false;ttk::reach_held=true;reach();update();assert(lift_calls.empty());ttk::modern=true;ttk::reach_held=false;
+            // Ledge forgiveness, no E, armed: a running jump (104) that bounces
+            // (107) off a lip at most 0x100 above the feet starts mantle 134;
+            // the held bit is presented to the isolated call only.
+            const uint32_t held=0x80100000;psx_mod_write_word(0x800d1b50+4*psx_mod_read_byte(p+0x233),held);psx_mod_write_word(held,0);
+            auto bounce_at=[&](int32_t lip){reach();psx_mod_write_byte(p+0x3b8,2);psx_mod_write_half(p+0x60,104);update();
+                assert(lift_calls.empty());drop_top=feet-lip;drop_catch_y=-6600;psx_mod_write_half(p+0x60,107);update();};
+            bounce_at(0x80);
+            assert(psx_mod_read_half(p+0x60)==134 && psx_mod_read_byte(p+0x22c)==0 && int32_t(psx_mod_read_word(p+0x1c4))==-0x80);
+            assert(psx_mod_read_word(held)==0 && !held_seen.empty() && held_seen.back()==1);
+            assert(psx_mod_read_byte(p+0x3b8)==2 && int32_t(psx_mod_read_word(p+8))==-7000);
+            // D08Z2: a weapon-owned upper pose (20, table bit 8) is handed to
+            // the mantle (upper = 134, restarted) and its whole block put back
+            // once the mantle ends; a full-body upper (109 above) is not touched.
+            assert(psx_mod_read_half(p+0x74)==109);
+            assert(psx_mod_read_word(0x800c2824+4*20)&8);
+            reach();psx_mod_write_byte(p+0x3b8,2);psx_mod_write_half(p+0x60,104);update();
+            const uint16_t upper_block[10]={20,7,3,4,1,0,511,32,238,0};
+            for(int i=0;i<10;++i)psx_mod_write_half(p+0x74+2*i,upper_block[i]);
+            drop_top=feet-0x80;drop_catch_y=-6600;psx_mod_write_half(p+0x60,107);update();
+            assert(psx_mod_read_half(p+0x60)==134 && psx_mod_read_half(p+0x74)==134 && psx_mod_read_half(p+0x7c)==0 && psx_mod_read_half(p+0x7e)==0);
+            update();assert(psx_mod_read_half(p+0x74)==134);   // still mantling
+            psx_mod_write_half(p+0x60,63);psx_mod_write_half(p+0x74,63);update();
+            for(int i=0;i<10;++i)assert(psx_mod_read_half(p+0x74+2*i)==upper_block[i]);
+            // Restored once only.
+            psx_mod_write_half(p+0x74,63);update();assert(psx_mod_read_half(p+0x74)==63);
+            // Taller than 0x100: the original bounce stays.
+            bounce_at(0x180);assert(psx_mod_read_half(p+0x60)==107 && psx_mod_read_byte(p+0x22c)==9 && psx_mod_read_word(held)==0);
+            // Only right after a jump: a bounce without a preceding 98/103/104 is left alone.
+            reach();psx_mod_write_half(p+0x60,63);psx_mod_write_byte(p+0x22c,0);update();
+            psx_mod_write_byte(p+0x22c,9);psx_mod_write_half(p+0x60,107);drop_top=feet-0x80;update();assert(psx_mod_read_half(p+0x60)==107);
+            ttk::modern=false;bounce_at(0x80);assert(psx_mod_read_half(p+0x60)==107);ttk::modern=true;
+            drop_catch_y=100000;psx_mod_write_word(0x800d1b50+4*psx_mod_read_byte(p+0x233),0);
+            psx_mod_write_half(p+0x60,63);psx_mod_write_half(p+0x74,63);psx_mod_write_byte(p+0x22c,0);psx_mod_write_byte(p+0x22d,0);
+            psx_mod_write_word(p+8,0);psx_mod_write_word(p+4,0);psx_mod_write_word(p+12,0);psx_mod_write_word(p+0x1c8,0);psx_mod_write_word(p+0x1c4,0);
+            psx_mod_write_word(p+0x1f8,0);psx_mod_write_half(p+0x1c,0);psx_mod_write_half(p+0x24,0);psx_mod_write_byte(p+0x3b8,0);
+            call(0x8003ade4,c,p,0x80025ee8);
+            std::puts("PASS: D08Y gap jumps (lowered E catch -> height mantle, lip/mode/armed/Vanilla refusals; no-E bounce off a low lip -> 134, held bit restored; D08Z2 armed upper pose handed to the mantle and restored)");
+        }
+        std::puts("PASS: D08X crate mantle (E bounce off a climbable object in mantle range -> original 134..138; height, facing, E, flags and Vanilla refusals)");
+    }
+    // D14: the widescreen activation plugin selects the profile's aspect only in
+    // Modernized; Vanilla, unset and off stay 4:3. auto is adaptive up to 21:9.
+    {
+        assert(activation);
+        auto run=[&](const char* mode,const char* wide){aspect_num=aspect_den=adaptive_num=adaptive_den=0;
+            if(mode)setenv("DNTTK_INPUT_MODE",mode,1);else unsetenv("DNTTK_INPUT_MODE");
+            if(wide)setenv("DNTTK_WIDESCREEN",wide,1);else unsetenv("DNTTK_WIDESCREEN");
+            activation();return aspect_num*100+aspect_den;};
+        assert(run("modernized","16:9")==1609 && run("modernized","21:9")==2109 && run("modernized","16:10")==1610);
+        assert(run("modernized",nullptr)==0 && run("modernized","off")==0 && run("modernized","16:9x")==0 && run("modernized","wide")==0);
+        assert(run("modernized","auto")==1609 && adaptive_num==21 && adaptive_den==9);
+        assert(run("vanilla","16:9")==0 && run("vanilla","auto")==0 && adaptive_num==0 && run(nullptr,"16:9")==0);
+        unsetenv("DNTTK_INPUT_MODE");unsetenv("DNTTK_WIDESCREEN");
+        std::puts("PASS: D14 widescreen activation (Modernized 16:9/16:10/21:9/auto; Vanilla, unset and off stay 4:3)");
+    }
+    // D14: the root view rectangle widens by the margin at the camera render's
+    // projection load only; HUD layout x moves out while the status bar draws
+    // and is restored by the screen-mode call after it (and by the next render).
+    {
+        constexpr uint32_t rect=0x800d2210,hud=0x800dd778;
+        auto set_rect=[&]{psx_mod_write_half(rect,uint16_t(-256));psx_mod_write_half(rect+2,uint16_t(-120));psx_mod_write_half(rect+4,512);psx_mod_write_half(rect+6,240);};
+        auto rx=[&]{return int16_t(psx_mod_read_half(rect));};auto rw=[&]{return int16_t(psx_mod_read_half(rect+4));};
+        const int16_t layout[][2]={{-246,89},{-246,89},{169,89},{169,89},{-165,89},{-165,89},{-246,69},{0,0},{169,69},{169,69},{82,89},{0,0},{169,-105}};
+        for(unsigned i=0;i<16;++i){psx_mod_write_half(hud+4*i,i<13?uint16_t(layout[i][0]):0);psx_mod_write_half(hud+4*i+2,i<13?uint16_t(layout[i][1]):0);}
+        auto hx=[&](unsigned i){return int16_t(psx_mod_read_half(hud+4*i));};
+        auto hud_intact=[&]{for(unsigned i=0;i<13;++i) if(hx(i)!=layout[i][0]) return false;return true;};
+        psx_mod_write_word(0x800c27bc,1);
+        ws_margin=0;set_rect();call(0x800b4d9c,386,0,0x8002e4d0);assert(rx()==-256 && rw()==512);   // 4:3
+        call(0x8008ba30,0,0,0x80026590);assert(hud_intact());
+        ws_margin=85;call(0x800b4d9c,386,0,0x80012345);assert(rx()==-256 && rw()==512);         // other caller
+        ttk::modern=false;call(0x800b4d9c,386,0,0x8002e4d0);assert(rx()==-256);ttk::modern=true; // Vanilla
+        call(0x800b4d9c,386,0,0x8002e4d0);assert(rx()==-341 && rw()==682);
+        call(0x800b4d9c,386,0,0x8002e4d0);assert(rx()==-341 && rw()==682);                       // never twice
+        call(0x8008ba30,0,0,0x80026590);
+        assert(hx(0)==-331 && hx(2)==254 && hx(4)==-250 && hx(6)==-331 && hx(7)==0 && hx(10)==167 && hx(12)==254);
+        assert(int16_t(psx_mod_read_half(hud+2))==89);
+        call(0x8001fc44,2,0,0x800265ac);assert(hud_intact());
+        call(0x8008ba30,0,0,0x80026590);assert(!hud_intact());call(0x800b4d9c,386,0,0x8002e4d0);assert(hud_intact());
+        call(0x8008ba30,0,0,0x80099999);assert(hud_intact());                                    // other caller
+        psx_mod_write_word(0x800c27bc,2);call(0x8008ba30,0,0,0x80026590);assert(hud_intact());   // split screen
+        psx_mod_write_word(0x800c27bc,1);
+        ws_margin=192;set_rect();call(0x800b4d9c,386,0,0x8002e4d0);assert(rx()==-448 && rw()==896); // 21:9
+        call(0x8008ba30,0,0,0x80026590);assert(hx(0)==-438 && hx(2)==361);call(0x8001fc44,2,0,0x800265ac);assert(hud_intact());
+        assert(ttk::widescreen_near_clip_live());ttk::modern=false;assert(!ttk::widescreen_near_clip_live());ttk::modern=true;
+        ws_margin=0;assert(!ttk::widescreen_near_clip_live());set_rect();
+        // D19U1: exact native border record only, scoped through HUD composition.
+        constexpr uint32_t box=0x800c44a4;
+        const uint32_t original_box=psx_mod_read_word(box);
+        psx_mod_write_word(box,0x102e3a3f);
+        ttk_live_env_set("DNTTK_STATUS_BARS","borderless");
+        call(0x8008ba30,0,0,0x80026590);assert(psx_mod_read_word(box)==0x10003a3f);
+        call(0x8001fc44,2,0,0x800265ac);assert(psx_mod_read_word(box)==0x102e3a3f);
+        call(0x8008ba30,0,0,0x80026590);assert(psx_mod_read_word(box)==0x10003a3f);
+        call(0x8002e850,0,0,0x800265d4);assert(psx_mod_read_word(box)==0x102e3a3f);
+        call(0x8008ba30,0,0,0x80099999);assert(psx_mod_read_word(box)==0x102e3a3f);
+        ttk::modern=false;call(0x8008ba30,0,0,0x80026590);assert(psx_mod_read_word(box)==0x102e3a3f);ttk::modern=true;
+        psx_mod_write_word(box,0x112e3a3f);call(0x8008ba30,0,0,0x80026590);assert(psx_mod_read_word(box)==0x112e3a3f);
+        call(0x8001fc44,2,0,0x800265ac);
+        psx_mod_write_word(box,0x102e3a3f);
+        std::vector<uint8_t> hud_state(ttk::render_state_size());ttk::render_state_save(hud_state.data());
+        const pid_t hud_child=fork();assert(hud_child>=0);
+        if(hud_child==0) {
+            ttk_live_env_set("DNTTK_STATUS_BARS","full");
+            ttk::render_state_load(hud_state.data());
+            call(0x8008ba30,0,0,0x80026590);assert(psx_mod_read_word(box)==0x10003a3f);
+            call(0x8001fc44,2,0,0x800265ac);assert(psx_mod_read_word(box)==0x102e3a3f);
+            _exit(0);
+        }
+        int hud_status=0;assert(waitpid(hud_child,&hud_status,0)==hud_child && WIFEXITED(hud_status) && WEXITSTATUS(hud_status)==0);
+        psx_mod_write_word(box,original_box);ttk_live_env_set("DNTTK_STATUS_BARS","full");
+        // D19U2: Borderless icons drawn from keyed copies. The cross cell's
+        // edge-connected opaque black (index 15) becomes its transparent entry
+        // (index 4); black enclosed by the icon stays. Records point at the copy
+        // only while its load is queued in OT slot 1, and are restored after.
+        {
+            constexpr uint32_t cross=0x800c44e4,ring=0x800d67a8;
+            const uint32_t others[]={0x800c44f4,0x800c44b4,0x800c44c4,0x800c4504,0x800c4554};
+            uint32_t kept[5];for(unsigned i=0;i<5;++i){kept[i]=psx_mod_read_word(others[i]);psx_mod_write_word(others[i],0);}
+            const uint32_t kept_cross[3]={psx_mod_read_word(cross),psx_mod_read_word(cross+4),psx_mod_read_word(cross+8)};
+            psx_mod_write_word(cross,0x101039ff);psx_mod_write_word(cross+4,1020);psx_mod_write_word(cross+8,189);
+            psx_mod_write_word(ring,0x80100000);psx_mod_write_word(ring+4,0x80100000);psx_mod_write_word(ring+8,0x80108000);
+            for(unsigned i=0;i<16;++i) test_vram[231*1024+1008+i]=i==4?0:i==15?0x8000:0x001f;
+            auto texel=[](unsigned x,unsigned y)->unsigned{
+                if(x==8 && y==8) return 15;                       // enclosed black
+                return x>=6 && x<=10 && y>=6 && y<=10?1:15;};
+            for(unsigned y=0;y<16;++y) for(unsigned w=0;w<4;++w) {
+                uint16_t v=0;for(unsigned i=0;i<4;++i) v|=uint16_t(texel(4*w+i,y)<<(4*i));
+                test_vram[(189+y)*1024+1020+w]=v;
+            }
+            auto record_at=[&](unsigned x,unsigned y){return psx_mod_read_word(cross)==0x101039ff && psx_mod_read_word(cross+4)==x && psx_mod_read_word(cross+8)==y;};
+            auto slot1=[&]{unsigned n=0;for(auto& a:ot_adds) if(a[0]==1) ++n;return n;};
+            ttk_live_env_set("DNTTK_STATUS_BARS","borderless");
+            ot_adds.clear();
+            call(0x8008ba30,0,0,0x80026590,0x801ff000);
+            assert(record_at(1020,54) && slot1()==1);
+            uint32_t packet=0;for(auto& a:ot_adds) if(a[0]==1) packet=a[1];
+            assert(psx_mod_read_word(packet+4)==0xa0000000u && psx_mod_read_word(packet+8)==(54u<<16|1020u) && psx_mod_read_word(packet+12)==(16u<<16|4u));
+            for(unsigned y=0;y<16;++y) for(unsigned x=0;x<16;++x) {
+                const unsigned got=(psx_mod_read_word(packet+16+4*(2*y+x/8))>>(4*(x%8)))&15;
+                const unsigned t=texel(x,y);
+                assert(got==(t==15 && !(x==8 && y==8)?4u:t));
+            }
+            assert(psx_mod_read_word(packet+16+4*32)==0x01000000u && psx_mod_read_word(packet)>>24==36);
+            call(0x8001fc44,2,0,0x800265ac);assert(record_at(1020,189));
+            call(0x8008ba30,0,0,0x80026590,0x801ff000);assert(record_at(1020,54));
+            call(0x8002e850,0,0,0x800265d4);assert(record_at(1020,189));            // alternate exit
+            ot_adds.clear();
+            call(0x8008ba30,0,0,0x80026590);assert(record_at(1020,189) && !slot1()); // stack outside the guest's
+            call(0x8001fc44,2,0,0x800265ac);
+            ttk_live_env_set("DNTTK_STATUS_BARS","full");
+            call(0x8008ba30,0,0,0x80026590,0x801ff000);assert(record_at(1020,189) && !slot1());
+            call(0x8001fc44,2,0,0x800265ac);
+            ttk_live_env_set("DNTTK_STATUS_BARS","borderless");
+            ttk::modern=false;call(0x8008ba30,0,0,0x80026590,0x801ff000);assert(record_at(1020,189) && !slot1());ttk::modern=true;
+            call(0x8001fc44,2,0,0x800265ac);
+            psx_mod_write_word(cross+8,190);                                           // changed record
+            call(0x8008ba30,0,0,0x80026590,0x801ff000);assert(record_at(1020,190) && !slot1());
+            call(0x8001fc44,2,0,0x800265ac);
+            psx_mod_write_word(cross+8,189);test_vram[231*1024+1008+4]=0x0421;      // no transparent entry
+            call(0x8008ba30,0,0,0x80026590,0x801ff000);assert(record_at(1020,189) && !slot1());
+            call(0x8001fc44,2,0,0x800265ac);
+            for(uint32_t a:{ring,ring+4,ring+8}) psx_mod_write_word(a,0);
+            for(unsigned i=0;i<3;++i) psx_mod_write_word(cross+4*i,kept_cross[i]);
+            for(unsigned i=0;i<5;++i) psx_mod_write_word(others[i],kept[i]);
+            std::fill(std::begin(test_vram),std::end(test_vram),uint16_t(0));
+            ttk_live_env_set("DNTTK_STATUS_BARS","full");
+            std::puts("PASS: D19U2 Borderless keyed icons (edge black keyed, enclosed kept, slot-1 load, restored; Full/Vanilla/changed record untouched)");
+        }
+        std::puts("PASS: D14 view rectangle and HUD corners (margin-sized, render/status-bar callers only, restored, 4:3/Vanilla/split screen untouched)");
+    }
+    // D23A identity memo: the verdict is reused within one host frame and
+    // RAM-code generation; either changing forces the full compare. The
+    // patched apartment pair passes the exact path (memcmp misses it).
+    {
+        assert(ttk::movement_ready());
+        const uint32_t kept=psx_mod_read_word(0x80048410);
+        ram[0x48410]^=0x40; // bypass the mock's generation bump
+        assert(ttk::movement_ready()); // memo: same frame, same generation
+        ++g_dirty_ram_code_gen;assert(!ttk::movement_ready()); // generation moved
+        ram[0x48410]^=0x40;assert(psx_mod_read_word(0x80048410)==kept);
+        assert(!ttk::movement_ready()); // negative verdict memoised too
+        ++ttk::input.sequence;assert(ttk::movement_ready()); // new frame re-verifies
+        ram[0x48410]^=0x40;assert(ttk::movement_ready());
+        ++ttk::input.sequence;assert(!ttk::movement_ready()); // new frame catches it
+        ram[0x48410]^=0x40;++ttk::input.sequence;assert(ttk::movement_ready());
+        assert(psx_mod_read_word(0x800cc57c)==0x24020000); // patch still present: fast path fell back
+        ttk::input.sequence=1;assert(ttk::movement_ready());
+    }
+    psx_mod_write_word(0x800cc580,0x30a30408); // half-patched pair fails identity
+    assert(!ttk::movement_ready());
+    call(0x8003ade4,c,p,0x80025ee8);assert(code_writes==2);
+    psx_mod_write_word(0x800cc57c,0x24020008); // original overlay reloaded
+    call(0x8003ade4,c,p,0x80025ee8);assert(code_writes==4 && ttk::movement_ready());
+    // The LEVEL00 zone script writes a hit position into the overlay's trailing
+    // scratch vector (0x800ccf1c..0x800ccf2b) on the flooded-corridor ledge.
+    // That is level state, not code: identity must survive it. The last code
+    // or table word before it must still be guarded.
+    psx_mod_write_word(0x800ccf1c,0x000075a3);psx_mod_write_word(0x800ccf20,0xffffe687);
+    psx_mod_write_word(0x800ccf24,0x0001a87e);psx_mod_write_word(0x800ccf28,0x12345678);
+    call(0x8003ade4,c,p,0x80025ee8);assert(ttk::movement_ready());
+    const auto last_table_word=psx_mod_read_word(0x800ccf18);
+    psx_mod_write_word(0x800ccf18,last_table_word^1);assert(!ttk::movement_ready());
+    psx_mod_write_word(0x800ccf18,last_table_word);
+    call(0x8003ade4,c,p,0x80025ee8);assert(ttk::movement_ready());
+    // D22A: the first map's portal loads LEVEL01.OVR over the same base. An
+    // authenticated LEVEL01 keeps the leases; its own scratch tail is level
+    // state; an unknown tag or changed body fails closed; the LEVEL00 apartment
+    // patch never touches it. Optional fourth argument: the owned LEVEL01.OVR.
+    if(argc>=4) {
+        std::vector<uint8_t> first(ram+0xca968,ram+0xca968+12196);
+        std::ifstream level01(argv[3],std::ios::binary);
+        level01.read((char*)ram+0xca968,12196);assert(level01.gcount()==12196);++g_dirty_ram_code_gen;
+        assert(psx_mod_read_word(0x800ca968)==4);
+        // D38: observe only the native piano animation initialization. No
+        // guest writes, and unrelated class-2 vending/NPC uses stay silent.
+        {
+            std::vector<uint8_t> saved(ram+(p&0x1fffff),ram+(p&0x1fffff)+0x8a4);
+            constexpr uint32_t piano=0x801f8000;
+            std::array<uint8_t,128> object{};
+            std::copy_n(ram+(piano&0x1fffff),128,object.begin());
+            for(int reject=0;reject<14;++reject) {
+                psx_mod_write_half(p+0x60,277);psx_mod_write_half(p+0x68,0);
+                psx_mod_write_byte(p+0x22c,0);psx_mod_write_byte(p+0x22d,0);
+                psx_mod_write_byte(p+0x3b8,0);psx_mod_write_word(p+0x224,0x40);
+                psx_mod_write_word(p+0x290,piano);
+                psx_mod_write_half(piano+0x2c,102);psx_mod_write_byte(piano+0x19,16);
+                uint32_t actor=p,caller=0x8005a3a0;
+                if(reject==1)actor=piano;
+                if(reject==2)caller=0x8005a490;
+                if(reject==3)psx_mod_write_half(p+0x60,275);
+                if(reject==4)psx_mod_write_half(p+0x68,1);
+                if(reject==5)psx_mod_write_word(p+0x224,0);
+                if(reject==6)psx_mod_write_word(p+0x290,0);
+                if(reject==7)psx_mod_write_half(piano+0x2c,103);
+                if(reject==8)psx_mod_write_byte(piano+0x19,15);
+                if(reject==9)ttk::modern=false;
+                if(reject==10)psx_mod_write_byte(p+0x3b8,2);
+                if(reject==11)psx_mod_write_byte(p+0x22c,3);
+                if(reject==12)psx_mod_write_byte(p+0x22d,3);
+                if(reject==13)psx_mod_write_half(0x800be568,1);
+                const auto before=piano_sounds;writes=0;
+                call(0x800493a4,actor,0,caller);
+                assert(writes==0 && piano_sounds==before+(reject==0));
+                if(reject==0) {
+                    ttk::input.held[ttk::interact]=true;
+                    call(0x800493a4,actor,0,caller);assert(piano_sounds==before+2);
+                    call(0x800493a4,actor,0,caller);assert(piano_sounds==before+2);
+                    ttk::input.held[ttk::interact]=false;
+                    call(0x800493a4,actor,0,caller);assert(piano_sounds==before+3);
+                }
+                ttk::modern=true;psx_mod_write_half(0x800be568,0);
+            }
+            std::copy(saved.begin(),saved.end(),ram+(p&0x1fffff));
+            std::copy(object.begin(),object.end(),ram+(piano&0x1fffff));++g_dirty_ram_code_gen;
+            std::puts("PASS: D38 piano native-use hook, actor/caller/pose/phase/object/equipment/mode/pause/Vanilla refusal; no guest writes");
+        }
+        const unsigned patches=code_writes;
+        call(0x8003ade4,c,p,0x80025ee8);assert(ttk::movement_ready() && code_writes==patches);
+        psx_mod_write_word(0x800cd8fc,0x000075a3);psx_mod_write_word(0x800cd908,0x12345678);
+        assert(ttk::movement_ready());
+        const auto level01_last=psx_mod_read_word(0x800cd8f8);
+        psx_mod_write_word(0x800cd8f8,level01_last^1);assert(!ttk::movement_ready());
+        psx_mod_write_word(0x800cd8f8,level01_last);assert(ttk::movement_ready());
+        psx_mod_write_word(0x800ca968,5);assert(!ttk::movement_ready()); // LEVEL02 tag, LEVEL01 body
+        psx_mod_write_word(0x800ca968,3);assert(!ttk::movement_ready()); // LEVEL00 tag, LEVEL01 body
+        psx_mod_write_word(0x800ca968,0x12);assert(!ttk::movement_ready()); // no such level
+        psx_mod_write_word(0x800ca968,4);assert(ttk::movement_ready());
+        call(0x8003ade4,c,p,0x80025ee8);assert(code_writes==patches);
+        std::copy(first.begin(),first.end(),ram+0xca968);++g_dirty_ram_code_gen;
+        call(0x8003ade4,c,p,0x80025ee8);assert(ttk::movement_ready());
+        std::puts("PASS: D22A LEVEL01 overlay identity, scratch tail, unknown/mismatched tags, no apartment patch, LEVEL00 restore");
+    }
+    // D22B: every level the original level select offers. Optional fifth
+    // argument: a directory of the owned LEVELxx.OVR files. Each authenticates
+    // by its own tag, tolerates writes to its scratch tail (the bytes after
+    // `body`), refuses a change to its last authenticated word and never gets
+    // the LEVEL00 apartment patch. Unlisted overlays (LEVEL04/13/14/30) and a
+    // level's tag over another level's body fail closed.
+    if(argc==5) {
+        struct Level {unsigned number;uint32_t size,body;};
+        static const Level levels[]={{0,9668,9652},{1,12196,12180},{2,10780,10780},{3,8808,8792},{5,14148,14144},
+            {6,8504,8504},{7,8660,8660},{8,3700,3700},{9,12832,12812},{10,8266,8264},{11,7704,7704},{12,13496,13496},
+            {21,720,720},{22,720,720},{23,4012,4012},{24,724,724},{25,2336,2336},{26,4784,4784},{27,5712,5708},
+            {28,4416,4416},{29,6356,6356}};
+        constexpr uint32_t span=14148; // LEVEL05, the largest
+        std::vector<uint8_t> first(ram+0xca968,ram+0xca968+span);
+        auto load=[&](unsigned number,uint32_t size) {
+            char path[512];std::snprintf(path,sizeof path,"%s/LEVEL%02u.OVR",argv[4],number);
+            std::ifstream file(path,std::ios::binary);
+            std::fill(ram+0xca968,ram+0xca968+span,0);
+            file.read((char*)ram+0xca968,size);assert(uint32_t(file.gcount())==size);++g_dirty_ram_code_gen;
+        };
+        // The lease needs a camera update within four host frames.
+        auto tick=[&]{++ttk::input.sequence;call(0x8003ade4,c,p,0x80025ee8);};
+        uint32_t previous_tag=0;
+        for(const auto& level:levels) {
+            load(level.number,level.size);
+            const uint32_t tag=psx_mod_read_word(0x800ca968);
+            const unsigned patches=code_writes;
+            tick();
+            assert(ttk::movement_ready() && ttk::locomotion_input_ready());
+            if(level.number==0)assert(code_writes==patches+2); // LEVEL00 alone: apartment pair
+            else assert(code_writes==patches);
+            for(uint32_t a=level.body;a<level.size;++a)ram[0xca968+a]^=0x5a;
+            tick();assert(ttk::movement_ready());
+            const uint32_t last=0x800ca968+level.body-4;
+            if(level.number!=0) { // LEVEL00's last body word follows its own test above
+                psx_mod_write_word(last,psx_mod_read_word(last)^1);tick();assert(!ttk::movement_ready());
+                psx_mod_write_word(last,psx_mod_read_word(last)^1);tick();assert(ttk::movement_ready());
+            }
+            if(previous_tag) {
+                psx_mod_write_word(0x800ca968,previous_tag);tick();assert(!ttk::movement_ready());
+                psx_mod_write_word(0x800ca968,tag);tick();assert(ttk::movement_ready());
+            }
+            // D08T7 mobility is level/placement data, not just a type flag.
+            // In particular LEVEL05's type-165 scenery remains fixed.
+            {
+                const uint32_t object=0x801e9000,table=0x801e8000,floor=0x801ea003;
+                const uint32_t old_table=psx_mod_read_word(0x800d2660),old_contact=psx_mod_read_word(p+0x174),old_floor=psx_mod_read_word(p+0x48);
+                psx_mod_write_word(0x800d2660,table);psx_mod_write_word(p+0x174,object);psx_mod_write_word(p+0x48,floor);
+                psx_mod_write_byte(floor+4,0);psx_mod_write_word(table+28*165,0x081090e2);psx_mod_write_word(table+28*924,0x081890e2);
+                psx_mod_write_half(object+0x2c,165);psx_mod_write_word(object+8,uint32_t(-9728));
+                psx_mod_write_word(object+12,13829);psx_mod_write_half(object+0x1c,2048);
+                assert(ttk::push_contact_ready()==(level.number==0));
+                psx_mod_write_half(object+0x2c,924);psx_mod_write_word(object+8,5632);psx_mod_write_half(object+0x1c,3072);
+                for(int z:{33268,32244,30196}) {psx_mod_write_word(object+12,z);assert(ttk::push_contact_ready()==(level.number==6));}
+                psx_mod_write_word(object+12,30197);assert(!ttk::push_contact_ready());
+                psx_mod_write_half(object+0x2c,165);psx_mod_write_word(object+8,uint32_t(-9728));
+                psx_mod_write_word(object+4,uint32_t(-61959));psx_mod_write_half(object+0x1c,1023);
+                for(int z:{-15864,-14000,-11454}) {
+                    psx_mod_write_word(object+12,uint32_t(z));assert(ttk::push_contact_ready()==(level.number==5));
+                }
+                psx_mod_write_word(object+4,uint32_t(-61958));assert(!ttk::push_contact_ready());
+                psx_mod_write_word(table+28*271,0x083090e2);psx_mod_write_half(object+0x2c,271);
+                psx_mod_write_word(object+4,31229);psx_mod_write_word(object+8,uint32_t(-510));psx_mod_write_half(object+0x1c,0);
+                for(int z:{-2552,-4202,-6000}) {
+                    psx_mod_write_word(object+12,uint32_t(z));assert(ttk::push_contact_ready()==(level.number==1));
+                }
+                psx_mod_write_word(0x800d2660,old_table);psx_mod_write_word(p+0x174,old_contact);psx_mod_write_word(p+0x48,old_floor);
+            }
+            previous_tag=tag;
+            if(level.number==0) { // restore the original pair for the next level
+                psx_mod_write_word(0x800cc57c,0x24020008);psx_mod_write_word(0x800cc580,0x30a30408);
+            }
+        }
+        for(unsigned number:{4u,13u,14u,30u}) {
+            char path[512];std::snprintf(path,sizeof path,"%s/LEVEL%02u.OVR",argv[4],number);
+            std::ifstream sized(path,std::ios::binary|std::ios::ate);const auto size=uint32_t(sized.tellg());
+            load(number,size);tick();assert(!ttk::movement_ready());
+        }
+        std::copy(first.begin(),first.end(),ram+0xca968);++g_dirty_ram_code_gen;
+        tick();assert(ttk::movement_ready());
+        std::puts("PASS: D22B all 21 selectable level overlays: own tag and body, scratch tails, last body word, cross-level tags, unlisted levels refused, apartment patch LEVEL00 only");
+    }
+    // D22B dodge rolls (PIG FACTORY trace): each observed animation/mode pair
+    // keeps the camera-only lease; the original owns the motion (no locomotion
+    // lease); other modes and Vanilla stay out. (The live route checks that
+    // first person stays active.)
+    {
+        auto camera=[&]{++ttk::input.sequence;call(0x8003ade4,c,p,0x80025ee8);};
+        camera();assert(ttk::movement_ready());
+        static const unsigned rolls[][3]={{157,9,9},{157,0,0},{158,0,9},{158,0,0},{159,0,0},{160,9,0},{161,0,0},{161,0,9},{162,0,0}};
+        for(const auto& r:rolls) {
+            psx_mod_write_half(p+0x60,r[0]);psx_mod_write_byte(p+0x22c,r[1]);psx_mod_write_byte(p+0x22d,r[2]);
+            camera();
+            assert(ttk::traversal_camera_ready() && !ttk::locomotion_input_ready() && !ttk::movement_ready());
+        }
+        psx_mod_write_byte(p+0x22c,4);psx_mod_write_byte(p+0x22d,4);camera();assert(!ttk::traversal_camera_ready());
+        psx_mod_write_half(p+0x60,163);psx_mod_write_byte(p+0x22c,0);psx_mod_write_byte(p+0x22d,0);camera();
+        assert(!ttk::traversal_camera_ready());
+        psx_mod_write_half(p+0x60,158);ttk::modern=false;camera();assert(!ttk::traversal_camera_ready());ttk::modern=true;
+        psx_mod_write_half(p+0x60,63);camera();assert(ttk::movement_ready());
+        // Steep-slope slide (FAMILY JEWELS trace): 145 (2/9), 99 (9/9), the
+        // 105 landing it leads to, then idle; a plain 105 without a slide is not.
+        static const unsigned slide[][3]={{145,2,9},{143,2,2},{99,9,2},{99,9,9},{105,0,9},{105,0,0}};
+        for(const auto& r:slide) {
+            psx_mod_write_half(p+0x60,r[0]);psx_mod_write_byte(p+0x22c,r[1]);psx_mod_write_byte(p+0x22d,r[2]);
+            camera();assert(ttk::traversal_camera_ready() && !ttk::locomotion_input_ready() && !ttk::movement_ready());
+        }
+        psx_mod_write_half(p+0x60,63);psx_mod_write_byte(p+0x22c,0);psx_mod_write_byte(p+0x22d,0);camera();
+        assert(ttk::movement_ready() && !ttk::traversal_camera_ready());
+        psx_mod_write_half(p+0x60,105);camera();assert(!ttk::traversal_camera_ready()); // latch cleared
+        psx_mod_write_half(p+0x60,108);psx_mod_write_byte(p+0x22c,9);psx_mod_write_byte(p+0x22d,2);camera();
+        assert(ttk::traversal_camera_ready()); // leaving the slope as 108
+        // The original's own back-steps and strafes are taken over by the full
+        // lease; their landing frames keep the camera; mid-water forms only in water.
+        for(unsigned a:{82u,83u,84u,85u,88u,89u,90u,91u}) {
+            psx_mod_write_half(p+0x60,a);psx_mod_write_byte(p+0x22c,0);psx_mod_write_byte(p+0x22d,0);camera();
+            assert(ttk::movement_ready());
+            psx_mod_write_byte(p+0x22d,9);camera();assert(!ttk::movement_ready() && ttk::locomotion_input_ready());
+        }
+        for(unsigned a:{94u,95u,106u}) { // landing poses straight after a fall keep the camera
+            psx_mod_write_half(p+0x60,a);psx_mod_write_byte(p+0x22c,0);psx_mod_write_byte(p+0x22d,9);camera();
+            assert(ttk::locomotion_input_ready() && !ttk::movement_ready());
+            psx_mod_write_byte(p+0x22d,0);camera();assert(ttk::locomotion_input_ready() && !ttk::movement_ready());
+        }
+        for(unsigned a:{86u,87u,92u,93u}) {
+            psx_mod_write_half(p+0x60,a);psx_mod_write_byte(p+0x22d,0);camera();assert(!ttk::movement_ready());
+        }
+        psx_mod_write_half(p+0x60,63);psx_mod_write_byte(p+0x22c,0);psx_mod_write_byte(p+0x22d,0);camera();assert(ttk::movement_ready());
+        // Third person: a Space-only (unowned) jump keeps the camera-only lease
+        // from a live lease through takeoff, flight and landing, never after a gap.
+        assert(!ttk::input.first_person);
+        uint32_t saved_cam[5];
+        for(int i=0;i<5;++i)saved_cam[i]=psx_mod_read_word(c+(i<2?0x4c+4*i:0x64+4*(i-2)));
+        psx_mod_write_word(c+0x50,p+0x7bc);psx_mod_write_word(c+0x4c,p+0x7bc); // a valid orbit
+        psx_mod_write_word(c+0x64,0);psx_mod_write_word(c+0x68,0);psx_mod_write_word(c+0x6c,-3000);
+        camera();assert(ttk::movement_ready());
+        static const unsigned jump[][3]={{96,0,0},{97,9,0},{97,9,9},{105,0,9},{105,0,0}};
+        for(const auto& r:jump) {
+            psx_mod_write_half(p+0x60,r[0]);psx_mod_write_byte(p+0x22c,r[1]);psx_mod_write_byte(p+0x22d,r[2]);
+            camera();assert(ttk::locomotion_input_ready() && !ttk::movement_ready());
+            assert(ttk::airborne_shot_ready()==(r[1]==9 || r[2]==9 || r[0]==96)); // D07F: view-aimed air shots
+        }
+        psx_mod_write_half(p+0x60,63);psx_mod_write_byte(p+0x22c,0);psx_mod_write_byte(p+0x22d,0);camera();
+        assert(ttk::movement_ready() && !ttk::airborne_shot_ready());
+        ttk::input.sequence+=8;psx_mod_write_half(p+0x60,97);psx_mod_write_byte(p+0x22c,9);psx_mod_write_byte(p+0x22d,9);
+        call(0x8003ade4,c,p,0x80025ee8);assert(!ttk::locomotion_input_ready() && !ttk::airborne_shot_ready());
+        for(int i=0;i<5;++i)psx_mod_write_word(c+(i<2?0x4c+4*i:0x64+4*(i-2)),saved_cam[i]);
+        psx_mod_write_half(p+0x60,63);psx_mod_write_byte(p+0x22c,0);psx_mod_write_byte(p+0x22d,0);camera();camera();assert(ttk::movement_ready());
+        std::puts("PASS: D22B third-person unowned jump camera and D07F air shots; dodge rolls 157..162 and slope slides (mode 2, 99/108, landing) keep the camera lease; original back-steps/strafes taken over; swim/other/Vanilla excluded");
+    }
+    for(unsigned flags : {0u,8u,0x400u,0x408u,0x10008u,0x10400u}) {
+        const bool original=(flags&0x408)==8;
+        const bool modernized=(flags&(psx_mod_read_word(0x800cc580)&65535))==
+                              (psx_mod_read_word(0x800cc57c)&65535);
+        assert(modernized==!(flags&0x400));
+        if(flags&8)assert(modernized==original);
+    }
+    std::puts("PASS: apartment code identity, Vanilla exclusion, exact patch pair, reload, one-shot condition and untouched dialogue flags");
+    psx_mod_write_half(0x800bcbb0,0);assert(!ttk::movement_ready() && !ttk::player_identity_ready());
+    psx_mod_write_half(0x800bcbb0,1);psx_mod_write_half(0x800be568,1);assert(!ttk::movement_ready());
+    psx_mod_write_half(0x800be568,0);psx_mod_write_half(0x800d2540,1);assert(!ttk::movement_ready());
+    psx_mod_write_half(0x800d2540,0);
+    // Fire draw excludes Boot, active interaction, menus and traversal.
+    psx_mod_write_half(p+0x74,63);psx_mod_write_byte(p+0x3ba,4);
+    assert(ttk::fire_draw_ready());
+    psx_mod_write_byte(p+0x3ba,0);assert(!ttk::fire_draw_ready());
+    psx_mod_write_byte(p+0x3ba,4);psx_mod_write_word(p+0x224,4);assert(!ttk::fire_draw_ready());
+    psx_mod_write_word(p+0x224,0);
+    // Transition speed advances only the upper equip/stow delta once; never fire.
+    CPUState transition{};transition.gpr[29]=0x801effc0;transition.gpr[31]=0x8005a5a8;
+    transition.gpr[4]=p+0x74;transition.gpr[5]=p;transition.gpr[6]=0x801effd2;transition.gpr[7]=1;
+    for(unsigned upper : {6u,7u,13u,21u,22u,30u,31u,36u,40u}) {
+        call(0x8005a210,p,0x800c2754,0x80041b34);
+        psx_mod_write_half(p+0x74,upper);psx_mod_write_half(0x801effd2,1024);
+        hooks().at(0x80059db0)(&transition,0x80059db0);assert(psx_mod_read_half(0x801effd2)==1536);
+        hooks().at(0x80059db0)(&transition,0x80059db0);assert(psx_mod_read_half(0x801effd2)==1536);
+    }
+    call(0x8005a210,p,0x800c2754,0x80041b34);
+    psx_mod_write_half(p+0x74,8);psx_mod_write_half(0x801effd2,1024);
+    hooks().at(0x80059db0)(&transition,0x80059db0);assert(psx_mod_read_half(0x801effd2)==1024);
+    psx_mod_write_half(p+0x74,6);transition.gpr[31]=0x8005a3d4;
+    hooks().at(0x80059db0)(&transition,0x80059db0);assert(psx_mod_read_half(0x801effd2)==1024);
+    psx_mod_write_half(p+0x74,63);psx_mod_write_byte(p+0x3ba,0);
+    // D08Z: the manual jump style plays the lower-body preparation 96 three
+    // times faster, once per player update; assisted and other tracks unchanged.
+    {
+        CPUState lower{};lower.gpr[29]=0x801effc0;lower.gpr[31]=0x8005a3d4;
+        lower.gpr[4]=p+0x60;lower.gpr[5]=p;lower.gpr[6]=0x801effd0;lower.gpr[7]=0;
+        auto run=[&](unsigned animation){call(0x8005a210,p,0x800c2754,0x80041b34);psx_mod_write_half(p+0x60,animation);
+            psx_mod_write_half(0x801effd0,400);hooks().at(0x80059db0)(&lower,0x80059db0);return psx_mod_read_half(0x801effd0);};
+        assert(run(96)==400);
+        setenv("DNTTK_JUMP","manual",1);
+        assert(run(96)==1200);
+        hooks().at(0x80059db0)(&lower,0x80059db0);assert(psx_mod_read_half(0x801effd0)==1200);
+        assert(run(63)==400 && run(97)==400);
+        lower.gpr[7]=1;assert(run(96)==400);lower.gpr[7]=0;
+        lower.gpr[31]=0x8005a5a8;assert(run(96)==400);lower.gpr[31]=0x8005a3d4;
+        psx_mod_write_byte(p+0x22c,9);assert(run(96)==400);psx_mod_write_byte(p+0x22c,0);
+        ttk::modern=false;assert(run(96)==400);ttk::modern=true;
+        unsetenv("DNTTK_JUMP");psx_mod_write_half(p+0x60,63);
+        std::puts("PASS: D08Z quick takeoff (manual only, 96 lower-body delta x3 once per update)");
+    }
+    // Idle clearance must use requested backpedal, before a walk/run callback.
+    uint32_t idle_sp=0x801ef000;
+    ttk::input.move_x=0;ttk::input.move_y=-1;
+    psx_mod_write_word(idle_sp+0x54,0x80052228);
+    psx_mod_write_word(idle_sp+0x10,0);psx_mod_write_word(idle_sp+0x18,275);
+    call(0x800780b4,p,idle_sp+0x10,0x800794b8,idle_sp);
+    assert((int32_t)psx_mod_read_word(idle_sp+0x18)==-275);
+    assert((int32_t)psx_mod_read_word(idle_sp+0x38)==-275);
+    psx_mod_write_word(idle_sp+0x54,0x8005222c);writes=0;
+    call(0x800780b4,p,idle_sp+0x10,0x800794b8,idle_sp);assert(writes==0);
+    psx_mod_write_word(idle_sp+0x54,0x80052228);
+    ttk::input.held[ttk::original_aim]=true;writes=0;
+    call(0x800780b4,p,idle_sp+0x10,0x800794b8,idle_sp);assert(writes==0);
+    ttk::input.held[ttk::original_aim]=false;
+    poke(0x52220);call(0x800780b4,p,idle_sp+0x10,0x800794b8,idle_sp);assert(writes==0);poke(0x52220);
+    ttk::input.move_x=1;ttk::input.move_y=0;
+    psx_mod_write_half(p+0xfc,0);psx_mod_write_half(p+0x100,100);
+    writes=0;call(0x80053500,p+0x8a4,0,0x80048664);assert(writes==0); // other actor
+    call(0x80053500,p,0,0x80048664,0x20);assert(writes==0); // malformed stack
+    call(0x80053500,p,0,0x80048660);assert(writes==0); // wrong caller
+    call(0x80053500,p,0,0x80048664);
+    assert(psx_mod_read_half(p+0xfc)==100 && psx_mod_read_half(p+0x100)==0);
+    assert(psx_mod_read_half(p+0x1c)==0); // movement never changes facing
+    // Backpedal/strafe momentum is latched once for the verified running jump.
+    psx_mod_write_half(p+0x60,104);psx_mod_write_byte(p+0x22c,9);psx_mod_write_byte(p+0x22d,0);
+    psx_mod_write_word(p+0x1f4,0);psx_mod_write_word(p+0x1fc,1000);psx_mod_write_word(p+0x1f8,-500);
+    writes=0;call(0x8003ebf4,p,0,0x80055930);assert(writes==0);
+    call(0x8003ebf4,p,0,0x80055934);
+    assert(psx_mod_read_word(p+0x1f4)==1000 && psx_mod_read_word(p+0x1fc)==0);
+    assert((int32_t)psx_mod_read_word(p+0x1f8)==-500); // vertical velocity untouched
+    psx_mod_write_word(p+0x1f4,-300);writes=0;call(0x8003ebf4,p,0,0x80055934);
+    assert(writes==0 && (int32_t)psx_mod_read_word(p+0x1f4)==-300); // collision response retained
+    psx_mod_write_half(p+0x60,63);psx_mod_write_byte(p+0x22c,0);psx_mod_write_byte(p+0x22d,0);
+    call(0x8003ade4,c,p,0x80025ee8);
+    // Opposite run-cycle takeoff (103) must receive exactly the same correction.
+    psx_mod_write_half(p+0xfc,0);psx_mod_write_half(p+0x100,100);
+    call(0x80053500,p,0,0x80048664);
+    psx_mod_write_half(p+0x60,103);psx_mod_write_byte(p+0x22c,9);psx_mod_write_byte(p+0x22d,9);
+    psx_mod_write_word(p+0x1f4,0);psx_mod_write_word(p+0x1fc,1000);
+    call(0x8003ebf4,p,0,0x80055934);call(0x8003ade4,c,p,0x80025ee8);
+    assert(psx_mod_read_word(p+0x1f4)==1000 && psx_mod_read_word(p+0x1fc)==0);
+    assert(ttk::locomotion_input_ready() && !ttk::movement_ready());
+    ++ttk::input.epoch;assert(!ttk::locomotion_input_ready());--ttk::input.epoch;
+    psx_mod_write_half(p+0x60,63);psx_mod_write_byte(p+0x22c,0);psx_mod_write_byte(p+0x22d,0);
+    call(0x8003ade4,c,p,0x80025ee8);
+    // Numbered selection requests original equipment transition, never grants a weapon.
+    psx_mod_write_half(p+0x74,5);ttk::input.command_serial=1;ttk::input.command_count=1;ttk::input.commands[0]=ttk::weapon_group_3;
+    psx_mod_write_byte(p+0x3b8,2);psx_mod_write_byte(p+0x3b9,4);psx_mod_write_word(p+0x224,0);
+    psx_mod_write_half(p+0x2c4+5*4,0);writes=0;call(0x80058120,p,0,0x80041c44);assert(writes==0);
+    ttk::input.command_serial=2;psx_mod_write_half(p+0x2c4+5*4,1);psx_mod_write_half(p+0x2c6+5*4,20);
+    call(0x80058120,p,0,0x80041c44);
+    assert(psx_mod_read_byte(p+0x3ba)==5 && psx_mod_read_byte(p+0x3b9)==4 && (psx_mod_read_word(p+0x224)&4));
+    psx_mod_write_word(p+0x224,0);psx_mod_write_byte(p+0x3b8,0);ttk::input.command_count=0;
+    // Redraw requires settled normal ownership and matching holstered upper pose.
+    psx_mod_write_half(p+0x74,63);assert(ttk::interaction_restore_ready());
+    psx_mod_write_half(p+0x74,190);assert(!ttk::interaction_restore_ready());
+    psx_mod_write_half(p+0x74,63);psx_mod_write_word(p+0x224,4);assert(!ttk::interaction_restore_ready());
+    psx_mod_write_word(p+0x224,0);psx_mod_write_word(p,2);assert(!ttk::interaction_alive() && !ttk::interaction_restore_ready());psx_mod_write_word(p,0);
+    // Original attached traversal gets input only; movement/camera hooks stay out.
+    for(auto mode : {3,6,7,8}) {
+        unsigned animation=mode==8?140:149;
+        psx_mod_write_half(p+0x60,animation);
+        psx_mod_write_byte(p+0x22c,mode);psx_mod_write_byte(p+0x22d,mode);
+        assert(ttk::traversal_input_ready() && ttk::interaction_ready() && !ttk::movement_ready() && !ttk::interaction_restore_ready());
+        writes=0;call(0x80048410,p,0,0x8004b634);assert(writes==0);
+        ttk::want_capture=true;ttk::input.active=false;
+        const auto offered=ttk::capture_offers;
+        call(0x8005a210,p,0x800c2754,0x80041b30);assert(ttk::capture_offers==offered);
+        psx_mod_write_half(0x800be568,1);
+        call(0x8005a210,p,0x800c2754,0x80041b34);assert(ttk::capture_offers==offered);
+        psx_mod_write_half(0x800be568,0);writes=0;
+        call(0x8005a210,p,0x800c2754,0x80041b34);assert(ttk::capture_offers==offered+1);
+        assert(!ttk::traversal_input_ready() && writes==0); // offer is not permission to write
+        ttk::want_capture=false;
+        call(0x8005a210,p,0x800c2754,0x80041b34);assert(ttk::capture_offers==offered+1);
+        ttk::input.active=true;
+        psx_mod_write_byte(p+0x3b8,2);assert(!ttk::traversal_input_ready());psx_mod_write_byte(p+0x3b8,0);
+        psx_mod_write_half(p+0x60,213);assert(!ttk::traversal_input_ready());
+    }
+    psx_mod_write_half(p+0x60,149);psx_mod_write_byte(p+0x22c,3);psx_mod_write_byte(p+0x22d,3);
+    // Attached animation bytes can remain present while menus/scripts suspend
+    // gameplay. They do not authorize WASD/E input outside live player control.
+    for (uint32_t gate : {0x800bcbb0u,0x800be568u,0x800d2540u}) {
+        const auto original=psx_mod_read_half(gate);
+        psx_mod_write_half(gate,gate==0x800bcbb0u?0:1);
+        assert(!ttk::traversal_input_ready() && !ttk::interaction_ready());
+        assert(ttk::interaction_alive()==(gate!=0x800bcbb0u));
+        assert(!ttk::interaction_restore_ready());
+        psx_mod_write_half(gate,original);
+        assert(ttk::traversal_input_ready());
+    }
+    poke(0x43eb8);assert(!ttk::traversal_input_ready());poke(0x43eb8);
+    psx_mod_write_word(p,2);assert(!ttk::traversal_input_ready());psx_mod_write_word(p,0);
+    psx_mod_write_half(p+0x60,63);psx_mod_write_byte(p+0x22c,0);psx_mod_write_byte(p+0x22d,0);
+    call(0x8003ade4,c,p,0x80025ee8);
+    // Ordinary gait changes use original paired animations, never stop/traversal.
+    psx_mod_write_half(p+0x60,72);ttk::running=true;
+    call(0x80048410,p,0,0x8004b634);assert(psx_mod_read_half(p+0x60)==76);
+    ttk::running=false;call(0x80048410,p,0,0x8004b634);assert(psx_mod_read_half(p+0x60)==72);
+    psx_mod_write_half(p+0x60,73);ttk::running=true;writes=0;
+    call(0x80048410,p,0,0x8004b634);assert(writes==0);ttk::running=false;
+    // D08Z3: a held direction ends the landing recovery 105 into walk/run
+    // (frame 0) at the ground dispatcher; a jump press with no direction
+    // ends it into the stance 63. Nothing pressed, the first landing update
+    // (previous mode 9), the hard landing 106, another caller, crouch,
+    // precision aim, landing=original and Vanilla leave it alone.
+    {
+        auto landing=[&](unsigned anim,unsigned previous){
+            psx_mod_write_half(p+0x60,anim);psx_mod_write_half(p+0x68,3);psx_mod_write_half(p+0x6a,40);
+            psx_mod_write_byte(p+0x22c,0);psx_mod_write_byte(p+0x22d,previous);writes=0;
+        };
+        const float mx=ttk::input.move_x,my=ttk::input.move_y;
+        ttk::input.move_x=0;ttk::input.move_y=1;
+        landing(105,0);call(0x80048410,p,0,0x8004b634);
+        assert(psx_mod_read_half(p+0x60)==72 && psx_mod_read_half(p+0x68)==0 && psx_mod_read_half(p+0x6a)==0);
+        ttk::running=true;landing(105,0);call(0x80048410,p,0,0x8004b634);assert(psx_mod_read_half(p+0x60)==76);ttk::running=false;
+        ttk::input.move_x=-1;ttk::input.move_y=0;landing(105,0);call(0x80048410,p,0,0x8004b634);assert(psx_mod_read_half(p+0x60)==72);
+        ttk::input.move_x=0;ttk::input.move_y=0;
+        landing(105,0);call(0x80048410,p,0,0x8004b634);assert(writes==0 && psx_mod_read_half(p+0x60)==105);
+        ttk::jump_pending=true;landing(105,0);call(0x80048410,p,0,0x8004b634);
+        assert(psx_mod_read_half(p+0x60)==63 && psx_mod_read_half(p+0x6a)==0 && ttk::jump_pending);ttk::jump_pending=false;
+        ttk::input.move_y=1;
+        landing(105,9);call(0x80048410,p,0,0x8004b634);assert(writes==0);
+        landing(106,0);call(0x80048410,p,0,0x8004b634);assert(writes==0);
+        landing(105,0);call(0x80048410,p,0,0x8004b630);assert(writes==0);
+        ttk::input.held[ttk::crouch]=true;landing(105,0);call(0x80048410,p,0,0x8004b634);assert(writes==0);ttk::input.held[ttk::crouch]=false;
+        ttk::input.held[ttk::original_aim]=true;landing(105,0);call(0x80048410,p,0,0x8004b634);assert(writes==0);ttk::input.held[ttk::original_aim]=false;
+        setenv("DNTTK_LANDING","original",1);landing(105,0);call(0x80048410,p,0,0x8004b634);assert(writes==0);unsetenv("DNTTK_LANDING");
+        ttk::modern=false;landing(105,0);call(0x80048410,p,0,0x8004b634);assert(writes==0);ttk::modern=true;
+        landing(105,0);call(0x80048410,p,0,0x8004b634);assert(psx_mod_read_half(p+0x60)==72);
+        ttk::input.move_x=mx;ttk::input.move_y=my;
+        psx_mod_write_half(p+0x68,0);psx_mod_write_half(p+0x6a,0);psx_mod_write_byte(p+0x22d,0);
+        std::puts("PASS: D08Z3 landing recovery (direction to walk/run, jump to stance; idle, first update, 106, caller, crouch, aim, original and Vanilla untouched)");
+    }
+    // D08K9: the real initializer hook changes only a soft landing reached
+    // from held crouch in this same authenticated player update. Damage and
+    // water have already been decided by the original selector.
+    {
+        const auto saved=ttk::input;
+        landing_clips=true;
+        auto land=[&](unsigned next,int reject=0) {
+            ttk::modern=true;ttk::input=saved;ttk::input.active=true;
+            ttk::input.held[ttk::crouch]=true;ttk::input.held[ttk::original_aim]=false;
+            ttk::input.held[ttk::interact]=false;
+            psx_mod_write_word(p,0);psx_mod_write_word(p+0x224,2);
+            psx_mod_write_word(p+0x834,0x40000000);
+            psx_mod_write_half(p+0x60,104);psx_mod_write_byte(p+0x22c,9);psx_mod_write_byte(p+0x22d,9);
+            if(reject==1)ttk::input.held[ttk::crouch]=false; // only pressed after landing
+            if(reject==2)psx_mod_write_byte(p+0x22c,8);    // traversal, not a flight
+            if(reject==3)setenv("DNTTK_CROUCH","original",1);
+            if(reject==4)setenv("DNTTK_LANDING","original",1);
+            if(reject==5)landing_clips=false;
+            call(0x8005a210,p,0x800c2754,0x80041b34,0x801ff000);
+            psx_mod_write_half(p+0x60,next);psx_mod_write_half(p+0x68,0);
+            psx_mod_write_byte(p+0x22c,next==127?5:0);psx_mod_write_byte(p+0x22d,9);
+            ttk::input.held[ttk::crouch]=reject!=6;        // released before landing
+            if(reject==7)++ttk::input.epoch;             // load/focus invalidates request
+            if(reject==8)ttk::modern=false;
+            if(reject==9)psx_mod_write_word(p+0x834,psx_mod_read_word(p+0x1c8)-800); // deep water
+            if(reject==14 || reject==15) {
+                psx_mod_write_word(p+0x834,psx_mod_read_word(p+0x1c8)-128);
+                if(reject==15)setenv("DNTTK_SWIMMING","original",1);
+            }
+            if(reject==10)ttk::input.held[ttk::original_aim]=true;
+            if(reject==11)poke(0x54c04);
+            call(0x800493a4,p,0,reject==12?0x8005a3a0:0x8005a4d0,
+                 reject==13?0x801fefb0:0x801fefc0);
+            const unsigned result=psx_mod_read_half(p+0x60);
+            if(reject==11)poke(0x54c04);
+            unsetenv("DNTTK_SWIMMING");unsetenv("DNTTK_CROUCH");unsetenv("DNTTK_LANDING");landing_clips=true;ttk::modern=true;
+            return result;
+        };
+        for(unsigned a:{105u,78u,84u,85u,96u})assert(land(a)==178);
+        for(unsigned a:{106u,127u,227u,158u,161u,134u})assert(land(a)==a);
+        for(int reject=1;reject<=15;++reject) {const unsigned result=land(105,reject);const unsigned expected=(reject==4 || reject==14)?178u:105u;if(result!=expected)std::fprintf(stderr,"D08K9 rejection %d returned %u\n",reject,result);assert(result==expected);}
+        landing_clips=false;ttk::input=saved;
+        psx_mod_write_word(p+0x834,0x40000000);psx_mod_write_word(p+0x224,0);
+        psx_mod_write_half(p+0x60,63);psx_mod_write_byte(p+0x22c,0);psx_mod_write_byte(p+0x22d,0);
+        std::puts("PASS: D08K9 same-update soft crouch landing; hard landing/death/water/traversal, release/late press, epoch, Original crouch, missing clips, code/caller/stack and Vanilla exclusions; crouch landing independent of legacy landing option");
+    }
+    // D08Z5: a fall started from the slope slide handler (0x8003f060, ra
+    // 0x800546c4/dc/ec, mode 2) gets no launch: the table vector its flight
+    // start rotates (0x80066e34, ra 0x8003e488, a1 = +0x1f4) is zeroed.
+    // Other fall callers, other rotations, other modes, wall_backflip=original
+    // and Vanilla keep the launch; one fall start arms one rotation only.
+    {
+        const uint8_t mode=psx_mod_read_byte(p+0x22c);
+        auto launch=[&](uint32_t fall_ra,uint32_t rotate_ra=0x8003e488,uint32_t vector=0){
+            if(!vector)vector=p+0x1f4;
+            psx_mod_write_byte(p+0x22c,2);psx_mod_write_half(p+0x60,145);
+            call(0x8003f060,p,0,fall_ra);
+            psx_mod_write_word(p+0x1f4,0);psx_mod_write_word(p+0x1f8,0);psx_mod_write_word(p+0x1fc,uint32_t(-3040));
+            call(0x80066e34,0x801effe0,vector,rotate_ra);
+            return int32_t(psx_mod_read_word(p+0x1fc));
+        };
+        for(uint32_t ra:{0x800546c4u,0x800546dcu,0x800546ecu}) assert(launch(ra)==0 && psx_mod_read_word(p+0x1f4)==0);
+        assert(std::strstr(ttk::controls_debug_json(),"\"wall_backflip\":{\"modern\":true,\"slides\":0,\"stops\":3,\"jumps\":0,\"climbs\":0,\"redirects\":0,\"lifts\":0}"));
+        assert(launch(0x80043f44)==-3040);                    // another fall start
+        assert(launch(0x800546dc,0x8007f2e0)==-3040);         // another rotation (0x8007f224's own)
+        call(0x80066e34,0x801effe0,p+0x1f4,0x8003e488);assert(psx_mod_read_word(p+0x1fc)==0); // then this fall's flight start
+        psx_mod_write_word(p+0x1fc,uint32_t(-3040));
+        call(0x80066e34,0x801effe0,p+0x1f4,0x8003e488);assert(int32_t(psx_mod_read_word(p+0x1fc))==-3040); // armed once
+        assert(launch(0x800546dc,0x8003e488,p+0x200)==-3040); // another vector
+        psx_mod_write_byte(p+0x22c,9);call(0x8003f060,p,0,0x800546dc);
+        psx_mod_write_word(p+0x1fc,uint32_t(-3040));call(0x80066e34,0x801effe0,p+0x1f4,0x8003e488);
+        assert(int32_t(psx_mod_read_word(p+0x1fc))==-3040);  // not from mode 2
+        setenv("DNTTK_WALL_BACKFLIP","original",1);assert(launch(0x800546dc)==-3040);unsetenv("DNTTK_WALL_BACKFLIP");
+        ttk::modern=false;assert(launch(0x800546dc)==-3040);ttk::modern=true;
+        // The slide start after the mode 2 store is counted (diagnostics only).
+        writes=0;call(0x8005446c,p,0,0x80055fc0);call(0x8005446c,p,0,0x800547fc);assert(writes==0);
+        // The slide's jump branch (its facing test, ra 0x800547fc) picked 99/100,
+        // the backflip: Modern starts 98 instead, in mode 2 or after the fall
+        // start's 9. Only that branch's next initialization (0x800493a4 from the
+        // lower-body update), only 99/100; a standing jump's 99, original and
+        // Vanilla keep it.
+        const float held_x=ttk::input.move_x,held_y=ttk::input.move_y;
+        ttk::input.move_x=ttk::input.move_y=0; // no direction: Duke's facing decides (D08Z7)
+        auto start=[&](unsigned anim,uint8_t m,bool armed,uint32_t ra=0x8005a3a0){
+            if(armed)call(0x8005446c,p,0,0x800547fc);
+            psx_mod_write_byte(p+0x22c,m);psx_mod_write_half(p+0x60,anim);psx_mod_write_half(p+0x68,0);psx_mod_write_half(p+0x23e,anim);
+            call(0x800493a4,p,0,ra);
+            return unsigned(psx_mod_read_half(p+0x60));
+        };
+        assert(start(99,2,false)==98 && psx_mod_read_half(p+0x23e)==98); // armed by the call above
+        assert(start(100,9,true,0x8005a4d0)==98);
+        assert(start(99,9,false)==99);                          // a standing jump (Down at 0x8005492c)
+        assert(start(98,2,true)==98 && start(99,2,false)==99);  // facing down the slope: 98, then disarmed
+        assert(start(99,2,true,0x8004b5bc)==99);                // another initializer caller
+        assert(start(99,2,false)==98);                          // ... leaves it armed for the update's own
+        setenv("DNTTK_WALL_BACKFLIP","original",1);assert(start(99,2,true)==99);unsetenv("DNTTK_WALL_BACKFLIP");
+        ttk::modern=false;assert(start(100,2,true)==100);ttk::modern=true;
+        call(0x800493a4,p,0,0x8005a3a0);
+        // The 98 it starts rises and drifts up the slope only as fast as the arc
+        // still leaves the face (k 0.25: uphill * tan(face) = rise / 4), on its
+        // first airborne update (0x8003ebf4 from 0x80055934). From the bottom of
+        // the face (mode 9, the fall's velocity) it gets the slope jump's rise.
+        auto climb=[&](int32_t vy,uint32_t ra=0x80055934){
+            assert(start(99,2,true)==98);
+            psx_mod_write_byte(p+0x22c,9);psx_mod_write_half(p+0x2bc,64453);psx_mod_write_half(p+0x2be,uint16_t(-586));
+            psx_mod_write_word(p+0x1f4,5952);psx_mod_write_word(p+0x1f8,uint32_t(vy));psx_mod_write_word(p+0x1fc,808);
+            call(0x8003ebf4,p,0,ra);
+        };
+        auto near=[&](uint32_t at,int32_t want){return std::abs(int32_t(psx_mod_read_word(p+at))-want)<=2;};
+        climb(-6917);assert(near(0x1f4,1370) && near(0x1f8,-6917) && near(0x1fc,124));
+        climb(0);assert(near(0x1f4,1370) && near(0x1f8,-6917) && near(0x1fc,124));
+        climb(-6917,0x80055a00);assert(near(0x1f4,5952) && near(0x1fc,808));   // another caller
+        call(0x8003ebf4,p,0,0x80055934);assert(near(0x1f4,1370));               // ... the jump's own update still does
+        psx_mod_write_word(p+0x1f4,5952);call(0x8003ebf4,p,0,0x80055934);
+        psx_mod_write_word(p+0x1f8,uint32_t(-6917));psx_mod_write_word(p+0x1f4,5952);
+        call(0x8003ebf4,p,0,0x80055934);assert(near(0x1f4,5952));               // once per jump
+        psx_mod_write_word(p+0x1f8,0);psx_mod_write_byte(p+0x22c,mode);psx_mod_write_half(p+0x60,63);
+        assert(std::strstr(ttk::controls_debug_json(),"\"wall_backflip\":{\"modern\":true,\"slides\":1,\"stops\":4,\"jumps\":6,\"climbs\":3,"));
+        // D08Z7: a held direction decides instead of Duke's facing. Toward
+        // the face (uphill is +0x2bc + 2048) a facing-down 98 climbs; away from
+        // it a facing-up 99 leaves the pressed way at its own speed (the
+        // fall's rise when it had none). Aim held keeps the facing rule.
+        {
+            const double yaw=std::atan2((int16_t)psx_mod_read_half(c+12),(int16_t)psx_mod_read_half(c+16)); // view_yaw(), no free look
+            auto toward=[&](double angle){ // camera-relative keys for a world direction
+                ttk::input.move_x=float(std::sin(angle-yaw));ttk::input.move_y=float(std::cos(angle-yaw));
+                const auto e=ttk::movement(yaw,ttk::input.move_x,ttk::input.move_y);
+                assert(std::abs(e.x-std::sin(angle))<1e-3 && std::abs(e.z-std::cos(angle))<1e-3);
+            };
+            constexpr double turn=6.283185307179586/4096;
+            psx_mod_write_half(p+0x2bc,64453);
+            const double uphill=((int16_t)64453+2048)*turn,downhill=uphill+3.141592653589793;
+            toward(uphill);
+            assert(start(98,2,true)==98);
+            psx_mod_write_byte(p+0x22c,9);psx_mod_write_half(p+0x2bc,64453);psx_mod_write_half(p+0x2be,uint16_t(-586));
+            psx_mod_write_word(p+0x1f4,uint32_t(-5952));psx_mod_write_word(p+0x1f8,uint32_t(-6917));psx_mod_write_word(p+0x1fc,uint32_t(-808));
+            call(0x8003ebf4,p,0,0x80055934);assert(near(0x1f4,1370) && near(0x1fc,124));  // the climb, not off the slope
+            toward(downhill);
+            assert(start(99,2,true)==98);
+            psx_mod_write_byte(p+0x22c,9);
+            psx_mod_write_word(p+0x1f4,5952);psx_mod_write_word(p+0x1f8,0);psx_mod_write_word(p+0x1fc,808);
+            call(0x8003ebf4,p,0,0x80055934);
+            const double speed=std::hypot(5952.0,808.0);
+            assert(near(0x1f4,int32_t(std::lround(speed*std::sin(downhill)))) && near(0x1fc,int32_t(std::lround(speed*std::cos(downhill)))));
+            assert(near(0x1f8,-6917));
+            ttk::input.held[ttk::original_aim]=true;
+            assert(start(98,2,true)==98);psx_mod_write_byte(p+0x22c,9);
+            psx_mod_write_word(p+0x1f4,5952);psx_mod_write_word(p+0x1fc,808);psx_mod_write_word(p+0x1f8,uint32_t(-6917));
+            writes=0;call(0x8003ebf4,p,0,0x80055934);assert(near(0x1f4,5952) && near(0x1fc,808)); // facing rule
+            ttk::input.held[ttk::original_aim]=false;
+            assert(std::strstr(ttk::controls_debug_json(),"\"climbs\":4,\"redirects\":1,"));
+        }
+        ttk::input.move_x=held_x;ttk::input.move_y=held_y;
+        psx_mod_write_word(p+0x1f8,0);psx_mod_write_word(p+0x1fc,0);psx_mod_write_byte(p+0x22c,mode);psx_mod_write_half(p+0x60,63);
+        std::puts("PASS: D08Z5 wall backflip (no launch off a slope slide, its jump starts 98 not 99/100 and climbs the slope; other falls, rotations, jumps, original and Vanilla keep theirs); D08Z7 a held direction picks climb or a jump the pressed way, aim keeps the facing rule");
+    }
+    psx_mod_write_half(p+0x60,63);
+    uint32_t sp=0x801f0000-0x30-0x58;
+    psx_mod_write_word(sp+0x54,0x80053548);psx_mod_write_word(sp+0x10,0);psx_mod_write_word(sp+0x18,275);
+    call(0x800780b4,p,sp+0x10,0x800794b8,sp);
+    assert(psx_mod_read_word(sp+0x10)==275 && psx_mod_read_word(sp+0x18)==0);
+    assert(psx_mod_read_word(sp+0x30)==275 && psx_mod_read_word(sp+0x38)==0);
+    psx_mod_write_half(p+0xfc,0);psx_mod_write_half(p+0x100,25);
+    call(0x80053404,p,0,0x80048620);
+    assert(psx_mod_read_half(p+0xfc)==25 && psx_mod_read_half(p+0x100)==0);
+    sp=0x801f0000-0x20-0x58;
+    psx_mod_write_word(sp+0x54,0x80053424);psx_mod_write_word(sp+0x10,0);psx_mod_write_word(sp+0x18,275);
+    call(0x800780b4,p,sp+0x10,0x800794b8,sp);
+    assert(psx_mod_read_word(sp+0x10)==275 && psx_mod_read_word(sp+0x18)==0);
+    ttk::input.move_x=0;
+    psx_mod_write_half(p+0xfc,0);psx_mod_write_half(p+0x100,20);
+    call(0x80054218,p,63,0x800487c4,0x801f0000,4);
+    assert(psx_mod_read_half(p+0xfc)==7 && psx_mod_read_half(p+0x100)==0);
+    sp=0x801f0000-0x20-0x58;
+    psx_mod_write_word(sp+0x54,0x80054240);psx_mod_write_word(sp+0x10,0);psx_mod_write_word(sp+0x18,275);
+    call(0x800780b4,p,sp+0x10,0x800794b8,sp);
+    assert(psx_mod_read_word(sp+0x10)==275 && psx_mod_read_word(sp+0x18)==0);
+    ttk::input.move_x=1;
+    poke(0xca968);writes=0;call(0x80053500,p,0,0x80048664);assert(writes==0);poke(0xca968);
+    poke(0x53500);writes=0;call(0x80053500,p,0,0x80048664);assert(writes==0);poke(0x53500);
+    ram[(p+0x22c)&0x1fffff]=9;writes=0;call(0x80053500,p,0,0x80048664);assert(writes==0);
+    ram[(p+0x22c)&0x1fffff]=0;psx_mod_write_word(p+0x224,0x20000000);writes=0;
+    call(0x8003ade4,c,p,0x80025ee8);assert(writes==0 && !ttk::movement_ready());
+    psx_mod_write_word(p+0x224,0);
+    psx_mod_write_word(c+0x50,p+0x7bc);psx_mod_write_word(c+0x4c,p+0x7bc);
+    psx_mod_write_word(c+0x64,0);psx_mod_write_word(c+0x68,0);psx_mod_write_word(c+0x6c,-3000);
+    call(0x8003ade4,c,p,0x80025ee8);
+    ttk::input.total_x=100;ttk::input.total_y=-50;++ttk::input.sequence;
+    call(0x8003ade4,c,p,0x80025ee8);
+    sp=0x801f0000-0xb8;
+    writes=0;call(0x8003aa48,c,sp+0x18,0x8003aeb0,sp+4);assert(writes==0);
+    call(0x8003aa48,c,sp+0x18,0x8003aeb0,sp);
+    assert(writes>0 && (int16_t)psx_mod_read_half(c+12)>0 && (int16_t)psx_mod_read_half(c+14)<0);
+    assert(psx_mod_read_word(p+4)==0 && psx_mod_read_word(p+12)==0); // no position commits
+    // Final look-at conversion follows requested view even when the original
+    // collision-derived matrix points elsewhere. No camera position writes.
+    CPUState orientation{};orientation.gpr[29]=0x801f0000-0xb8-0xa8;
+    orientation.gpr[18]=c;orientation.gpr[31]=0x80029220;
+    orientation.gpr[4]=orientation.gpr[29]+0x18;orientation.gpr[5]=orientation.gpr[29]+0x68;
+    const auto requested_x=psx_mod_read_half(c+12);
+    writes=0;hooks().at(0x8002a7fc)(&orientation,0x8002a7fc);
+    assert(writes==(tight_enabled?11:9) && psx_mod_read_half(orientation.gpr[4]+12)==requested_x);
+    assert(psx_mod_read_word(0x800c3c48)==768); // D10B temporary minimum restored
+    assert(psx_mod_read_word(c+0x64)==0 && (int32_t)psx_mod_read_word(c+0x6c)==-3000);
+    orientation.gpr[31]=0x80029218;writes=0;
+    hooks().at(0x8002a7fc)(&orientation,0x8002a7fc);assert(writes==0);
+    orientation.gpr[31]=0x80029220;orientation.gpr[18]=p;
+    hooks().at(0x8002a7fc)(&orientation,0x8002a7fc);assert(writes==0);
+    orientation.gpr[18]=c;poke(0x28f2c);
+    hooks().at(0x8002a7fc)(&orientation,0x8002a7fc);assert(writes==0);poke(0x28f2c);
+    orientation.gpr[31]=0x8002920c;orientation.gpr[4]=c;orientation.gpr[5]=c+0x54;
+    hooks().at(0x8002a7fc)(&orientation,0x8002a7fc);assert(writes==9);
+    // Wall bump keeps camera responsive but cannot move or rotate the actor pose.
+    for (int animation: {94,95}) {
+        psx_mod_write_half(p+0x60,animation);ttk::input.total_x+=20;++ttk::input.sequence;
+        call(0x8003ade4,c,p,0x80025ee8);assert(!ttk::movement_ready());
+        auto before=psx_mod_read_half(c+12);writes=0;
+        call(0x8003aa48,c,sp+0x18,0x8003aeb0,sp);
+        assert(writes>0 && psx_mod_read_half(c+12)!=before);
+        writes=0;call(0x80053500,p,0,0x80048664);assert(writes==0);
+    }
+    psx_mod_write_half(p+0x60,63);
+    auto yaw_component=psx_mod_read_half(c+12);
+    call(0x8003ade4,c,p,0x80025ee8);call(0x8003aa48,c,sp+0x18,0x8003aeb0,sp);
+    assert(psx_mod_read_half(c+12)==yaw_component); // same mouse sample once
+    // D17B: expensive scenes can take more than four guest fields. Keep
+    // accumulated mouse rotation even if the game's stored camera is older.
+    for(unsigned gap:{5u,8u,12u}) {
+        const double before=std::atan2((int16_t)psx_mod_read_half(c+12),
+                                      (int16_t)psx_mod_read_half(c+16));
+        psx_mod_write_half(c+12,0);psx_mod_write_half(c+16,4096);
+        ttk::input.total_x+=20;ttk::input.sequence+=gap;
+        call(0x8003ade4,c,p,0x80025ee8);
+        call(0x8003aa48,c,sp+0x18,0x8003aeb0,sp);
+        const double after=std::atan2((int16_t)psx_mod_read_half(c+12),
+                                     (int16_t)psx_mod_read_half(c+16));
+        assert(std::abs(after-before-2.4*3.141592653589793/180)<0.002);
+    }
+    std::puts("PASS: camera preserves mouse rotation across slow game updates");
+    ttk::input.active=false;writes=0;call(0x8003aa48,c,sp+0x18,0x8003aeb0,sp);
+    assert(writes>0 && !ttk::movement_ready()); // presentation survives input release
+    ttk::input.active=true;
+    call(0x8002a038,0,1,0x8003af40,sp); // complete the preceding camera solve
+    psx_mod_write_word(p,2);writes=0;call(0x8003ade4,c,p,0x80025ee8);call(0x8003aa48,c,sp+0x18,0x8003aeb0,sp);assert(writes==0);
+    psx_mod_write_word(p,0);psx_mod_write_half(p+0x60,218);writes=0;call(0x8003ade4,c,p,0x80025ee8);assert(writes==0 && !ttk::movement_ready());
+    psx_mod_write_half(p+0x60,63);
+    setenv("DNTTK_CAMERA_MODE","original",1);
+    call(0x8003ade4,c,p,0x80025ee8);writes=0;call(0x8003aa48,c,sp+0x18,0x8003aeb0,sp);assert(writes==0);
+    setenv("DNTTK_CAMERA_MODE","independent",1);setenv("DNTTK_MOUSE_INVERT_Y","1",1);setenv("DNTTK_MOUSE_SENSITIVITY","0.24",1);
+    psx_mod_write_half(c+12,0);psx_mod_write_half(c+14,0);psx_mod_write_half(c+16,4096);
+    ++ttk::input.epoch;ttk::input.total_x=ttk::input.total_y=0;
+    call(0x8003ade4,c,p,0x80025ee8);
+    ttk::input.total_y=-50;++ttk::input.sequence;
+    call(0x8003ade4,c,p,0x80025ee8);call(0x8003aa48,c,sp+0x18,0x8003aeb0,sp);
+    assert((int16_t)psx_mod_read_half(c+14)>800); // inverted 12 degree pitch
+    // A loaded world with a wall-displaced boom seeds visible +X, not anchor's +Z.
+    ++save_loads;
+    psx_mod_write_half(c+12,4096);psx_mod_write_half(c+14,0);psx_mod_write_half(c+16,0);
+    ++ttk::input.epoch;ttk::input.total_x=ttk::input.total_y=0;
+    call(0x8003ade4,c,p,0x80025ee8);call(0x8003aa48,c,sp+0x18,0x8003aeb0,sp);
+    assert(psx_mod_read_half(c+12)==4096 && psx_mod_read_half(c+16)==0);
+    setenv("DNTTK_WEAPON_AIM","view",1);
+    psx_mod_write_half(c+12,4096);psx_mod_write_half(c+14,0);psx_mod_write_half(c+16,0);
+    psx_mod_write_half(p+0x1e,123);psx_mod_write_half(p+0x26,456);
+    call(0x80058120,p,0,0x80041c44);
+    assert(psx_mod_read_half(p+0x1c)==1024 && psx_mod_read_half(p+0x24)==1024);
+    assert(psx_mod_read_half(p+0x1e)==123 && psx_mod_read_half(p+0x26)==456);
+    // Holstered and supported armed follow view even with backwards/sideways intent.
+    ttk::input.move_y=-1;ttk::input.move_x=1;
+    ram[(p+0x3b8)&0x1fffff]=2;psx_mod_write_word(p+0x224,2);ram[(p+0x3b9)&0x1fffff]=4;
+    psx_mod_write_half(c+12,-4096);
+    call(0x80058120,p,0,0x80041c44);assert(psx_mod_read_half(p+0x1c)==3072);
+    auto refuse=[&](){writes=0;call(0x80058120,p,0,0x80041c44);assert(writes==0);};
+    ttk::modern=false;refuse();ttk::modern=true;
+    ttk::input.active=false;refuse();ttk::input.active=true;
+    ttk::input.held[ttk::original_aim]=true;refuse();ttk::input.held[ttk::original_aim]=false;
+    // D07E: original weapon aiming faces the view too; the arm stays original.
+    setenv("DNTTK_WEAPON_AIM","original",1);psx_mod_write_half(c+12,4096);
+    call(0x80058120,p,0,0x80041c44);assert(psx_mod_read_half(p+0x1c)==1024 && psx_mod_read_half(p+0x24)==1024);
+    {
+        CPUState arm{};arm.gpr[29]=0x801f0000;arm.gpr[31]=0x80097f28;
+        arm.gpr[4]=0x1f800060;arm.gpr[5]=p+0x124;arm.gpr[18]=p;writes=0;
+        hooks().at(0x80097a44)(&arm,0x80097a44);assert(writes==0 && arm.gpr[5]==p+0x124);
+    }
+    ttk::input.held[ttk::original_aim]=true;refuse();ttk::input.held[ttk::original_aim]=false;
+    setenv("DNTTK_WEAPON_AIM","off",1);refuse();
+    setenv("DNTTK_WEAPON_AIM","view",1);psx_mod_write_half(c+12,-4096);
+    call(0x80058120,p,0,0x80041c44);assert(psx_mod_read_half(p+0x1c)==3072);
+    setenv("DNTTK_CAMERA_MODE","original",1);refuse();setenv("DNTTK_CAMERA_MODE","independent",1);
+    ram[(p+0x3b9)&0x1fffff]=30;refuse();ram[(p+0x3b9)&0x1fffff]=4;
+    poke(0xca968);refuse();poke(0xca968);
+    poke(0x58120);refuse();poke(0x58120);
+    psx_mod_write_word(p,2);refuse();psx_mod_write_word(p,0);
+    psx_mod_write_word(p+0x224,0x82);refuse();psx_mod_write_word(p+0x224,2);
+    writes=0;call(0x80058120,p+0x8a4,0,0x80041c44);assert(writes==0);
+    call(0x80058120,p,0,0x80041c40);assert(writes==0);
+    CPUState arm{};arm.gpr[29]=0x801f0000;arm.gpr[31]=0x80097f28;
+    arm.gpr[4]=0x1f800060;arm.gpr[5]=p+0x124;arm.gpr[18]=p;
+    psx_mod_write_half(c+14,-2048);psx_mod_write_word(p+0x124,12345);
+    hooks().at(0x80097a44)(&arm,0x80097a44);
+    assert(arm.gpr[5]>=0x801e0000 && arm.gpr[5]<0x801e1000 && (int32_t)psx_mod_read_word(arm.gpr[5]+4)==-2048);
+    assert(psx_mod_read_word(p+0x124)==12345); // persistent aiming untouched
+    arm.gpr[5]=p+0x124;arm.gpr[18]=p+0x8a4;writes=0;
+    hooks().at(0x80097a44)(&arm,0x80097a44);assert(writes==0 && arm.gpr[5]==p+0x124);
+    arm.gpr[18]=p;ttk::input.held[ttk::original_aim]=true;
+    hooks().at(0x80097a44)(&arm,0x80097a44);assert(writes==0);
+    ttk::input.held[ttk::original_aim]=false;ram[(p+0x3b8)&0x1fffff]=0;psx_mod_write_word(p+0x224,0);writes=0;
+    hooks().at(0x80097a44)(&arm,0x80097a44);assert(writes==0);
+    std::puts("PASS: view facing, holstered/armed, independent pitch, presentation argument and fallback guards");
+    // Respawn/temporary original ownership must not ratchet the boom inward.
+    psx_mod_write_half(p+0x60,63);psx_mod_write_byte(p+0x22c,0);psx_mod_write_byte(p+0x22d,0);
+    psx_mod_write_word(p+0x224,0);ttk::input.active=true;
+    psx_mod_write_word(p,2);call(0x8003ade4,c,p,0x80025ee8);
+    psx_mod_write_word(c+0x64,0);psx_mod_write_word(c+0x68,0);psx_mod_write_word(c+0x6c,-300);
+    psx_mod_write_word(p,0);++ttk::input.sequence;call(0x8003ade4,c,p,0x80025ee8);
+    sp=0x801f0000-0xb8;call(0x8003aa48,c,sp+0x18,0x8003aeb0,sp);
+    double bx=(int32_t)psx_mod_read_word(sp+0x18),by=(int32_t)psx_mod_read_word(sp+0x1c),bz=(int32_t)psx_mod_read_word(sp+0x20)-300;
+    assert(std::abs(std::sqrt(bx*bx+by*by+bz*bz)-3000)<2);
+    // Preserve input across the state-first landing seam, without gait-write permission.
+    ttk::input.move_x=1;ttk::input.move_y=0;ttk::input.sequence+=10;call(0x8003ade4,c,p,0x80025ee8);
+    psx_mod_write_half(p+0xfc,0);psx_mod_write_half(p+0x100,160);call(0x80053500,p,0,0x80048664);
+    ++ttk::input.sequence;call(0x8003ade4,c,p,0x80025ee8);
+    psx_mod_write_half(p+0xfc,0);psx_mod_write_half(p+0x100,20);psx_mod_write_half(p+0xfe,123);
+    call(0x80053500,p,0,0x80048664);
+    double smoothed=std::hypot((int16_t)psx_mod_read_half(p+0xfc),(int16_t)psx_mod_read_half(p+0x100));
+    assert(smoothed>85 && smoothed<95 && psx_mod_read_half(p+0xfe)==123);
+    psx_mod_write_half(p+0x60,103);psx_mod_write_byte(p+0x22c,9);psx_mod_write_byte(p+0x22d,9);
+    psx_mod_write_word(p+0x1f4,0);psx_mod_write_word(p+0x1fc,1000);call(0x8003ebf4,p,0,0x80055934);
+    call(0x8003ade4,c,p,0x80025ee8);psx_mod_write_byte(p+0x22c,0);
+    assert(ttk::locomotion_input_ready() && !ttk::movement_ready());
+    // Fresh normal-camera intent is enough for a short-run-up jump, even when
+    // the gait has not produced a movement callback. Never redirect twice.
+    psx_mod_write_half(p+0x60,63);psx_mod_write_byte(p+0x22c,0);psx_mod_write_byte(p+0x22d,0);
+    ++ttk::input.epoch;++ttk::input.sequence;ttk::input.move_x=1;ttk::input.move_y=0;
+    psx_mod_write_half(c+12,0);psx_mod_write_half(c+16,4096);
+    call(0x8003ade4,c,p,0x80025ee8);
+    psx_mod_write_half(p+0x60,104);psx_mod_write_byte(p+0x22c,9);psx_mod_write_byte(p+0x22d,0);
+    psx_mod_write_word(p+0x1f4,0);psx_mod_write_word(p+0x1fc,2500);psx_mod_write_word(p+0x1f8,-1000);
+    call(0x8003ebf4,p,0,0x80055934);
+    assert((int32_t)psx_mod_read_word(p+0x1f4)==2500 && psx_mod_read_word(p+0x1fc)==0 && (int32_t)psx_mod_read_word(p+0x1f8)==-1000);
+    writes=0;call(0x8003ebf4,p,0,0x80055934);assert(writes==0);
+    // The original reach animation keeps the already-owned flight lease and E.
+    psx_mod_write_byte(p+0x3b8,0);psx_mod_write_half(p+0x60,109);
+    ++ttk::input.sequence;call(0x8003ade4,c,p,0x80025ee8);
+    assert(ttk::airborne_input_ready() && ttk::interaction_ready() && !ttk::movement_ready());
+    writes=0;call(0x8003ebf4,p,0,0x80055934);assert(writes==0); // never reinject velocity
+    ++ttk::input.epoch;assert(!ttk::airborne_input_ready());
+    psx_mod_write_half(p+0x60,78);psx_mod_write_byte(p+0x22c,0);psx_mod_write_byte(p+0x22d,0);
+    ++ttk::input.sequence;call(0x8003ade4,c,p,0x80025ee8);ttk::running=true;
+    uint32_t js=0x801ee000;
+    psx_mod_write_word(js+0x44,0x8005398c);
+    for(int i=0;i<3;++i) {psx_mod_write_word(js+0x10+4*i,1024);psx_mod_write_word(js+0x20+4*i,999);}
+    std::vector<uint8_t> player_before(ram+(p&0x1fffff),ram+(p&0x1fffff)+0x840);
+    call(0x800780b4,p,js+0x10,0x80078c78,js);
+    assert(!std::memcmp(player_before.data(),ram+(p&0x1fffff),player_before.size()));
+    for(int i=0;i<3;++i) {assert(psx_mod_read_word(js+0x10+4*i)==0);assert(psx_mod_read_word(js+0x20+4*i)==psx_mod_read_word(p+4+4*i));}
+    writes=0;ttk::running=false;call(0x800780b4,p,js+0x10,0x80078c78,js);assert(writes==0);
+    ttk::running=true;psx_mod_write_word(js+0x44,0x80053990);writes=0;
+    call(0x800780b4,p,js+0x10,0x80078c78,js);assert(writes==0);
+    psx_mod_write_word(js+0x44,0x8005398c);poke(0x78c0c);writes=0;
+    call(0x800780b4,p,js+0x10,0x80078c78,js);assert(writes==0);poke(0x78c0c);
+    // D08Y: a large drop at the 1024-ahead endpoint (sp+0x20) leaves the
+    // original look-ahead alone (it queues the jump for the edge); the probe's
+    // player fields are restored. A small drop still jumps now.
+    // (original_call needs a stack inside the guest's, so use one here)
+    const uint32_t ks=0x801fe000;psx_mod_write_word(ks+0x44,0x8005398c);
+    for(int i=0;i<3;++i) {psx_mod_write_word(ks+0x10+4*i,1024);psx_mod_write_word(ks+0x20+4*i,999);}
+    psx_mod_write_word(p+0x174,0);psx_mod_write_word(p+0x1c4,77);lookahead_drop=2048;writes=0;
+    call(0x800780b4,p,ks+0x10,0x80078c78,ks);
+    for(int i=0;i<3;++i) {assert(psx_mod_read_word(ks+0x10+4*i)==1024);assert(psx_mod_read_word(ks+0x20+4*i)==999);}
+    assert(psx_mod_read_word(p+0x1c4)==77);
+    lookahead_drop=700;call(0x800780b4,p,ks+0x10,0x80078c78,ks);
+    for(int i=0;i<3;++i) assert(psx_mod_read_word(ks+0x10+4*i)==0);
+    assert(psx_mod_read_word(p+0x1c4)==77);lookahead_drop=-100000;
+    // D08Z: the manual style jumps now before a large drop as well.
+    setenv("DNTTK_JUMP","manual",1);
+    for(int i=0;i<3;++i) {psx_mod_write_word(ks+0x10+4*i,1024);psx_mod_write_word(ks+0x20+4*i,999);}
+    lookahead_drop=2048;call(0x800780b4,p,ks+0x10,0x80078c78,ks);
+    for(int i=0;i<3;++i) {assert(psx_mod_read_word(ks+0x10+4*i)==0);assert(psx_mod_read_word(ks+0x20+4*i)==psx_mod_read_word(p+4+4*i));}
+    lookahead_drop=-100000;
+    // D08Z air steering: an owned flight bends toward camera-relative WASD at
+    // up to the takeoff speed; no input, precision aim or assisted: no writes.
+    {
+        psx_mod_write_half(p+0x60,63);psx_mod_write_byte(p+0x22c,0);psx_mod_write_byte(p+0x22d,0);
+        ++ttk::input.epoch;++ttk::input.sequence;ttk::input.move_x=1;ttk::input.move_y=0;
+        psx_mod_write_half(c+12,0);psx_mod_write_half(c+16,4096);
+        call(0x8003ade4,c,p,0x80025ee8);
+        psx_mod_write_half(p+0x60,104);psx_mod_write_byte(p+0x22c,9);psx_mod_write_byte(p+0x22d,0);psx_mod_write_half(p+0xba,11);
+        psx_mod_write_word(p+0x1f4,0);psx_mod_write_word(p+0x1fc,10000);psx_mod_write_word(p+0x1f8,-1000);
+        call(0x8003ebf4,p,0,0x80055934);
+        assert((int32_t)psx_mod_read_word(p+0x1f4)==10000 && psx_mod_read_word(p+0x1fc)==0);
+        ttk::input.move_x=0;ttk::input.move_y=1;
+        call(0x8003ebf4,p,0,0x80055934);
+        const int32_t vx=psx_mod_read_word(p+0x1f4),vz=psx_mod_read_word(p+0x1fc);
+        assert(vz>900 && vx<10000 && std::hypot((double)vx,(double)vz)<=10001 && (int32_t)psx_mod_read_word(p+0x1f8)==-1000);
+        // Repeated steering converges on the request without exceeding the cap.
+        for(int i=0;i<40;++i) call(0x8003ebf4,p,0,0x80055934);
+        assert(std::abs((int32_t)psx_mod_read_word(p+0x1f4))<50 && std::abs((int32_t)psx_mod_read_word(p+0x1fc)-10000)<50);
+        ttk::input.move_y=0;writes=0;call(0x8003ebf4,p,0,0x80055934);assert(writes==0);
+        ttk::input.move_x=-1;ttk::input.held[ttk::original_aim]=true;writes=0;call(0x8003ebf4,p,0,0x80055934);assert(writes==0);
+        ttk::input.held[ttk::original_aim]=false;
+        // The E reach 109 keeps steering in manual only.
+        psx_mod_write_half(p+0x60,109);++ttk::input.sequence;call(0x8003ade4,c,p,0x80025ee8);
+        writes=0;call(0x8003ebf4,p,0,0x80055934);assert(writes>0);
+        unsetenv("DNTTK_JUMP");
+        writes=0;call(0x8003ebf4,p,0,0x80055934);assert(writes==0);
+        psx_mod_write_half(p+0x60,104);writes=0;call(0x8003ebf4,p,0,0x80055934);assert(writes==0);
+        // Pure step: a reversal at the cap never gains speed.
+        auto v=ttk::air_steer({3000,0},{-1,0},3000,420);assert(v.x==2580 && v.z==0);
+        v=ttk::air_steer({3000,0},{0,1},3000,420);assert(std::hypot(v.x,v.z)<3000 && v.z>0 && v.x<3000);
+        v=ttk::air_steer({0,2900},{0,1},3000,420);assert(v.x==0 && v.z==3000);
+        psx_mod_write_half(p+0x60,78);psx_mod_write_byte(p+0x22c,0);psx_mod_write_byte(p+0x22d,0);
+        ++ttk::input.sequence;call(0x8003ade4,c,p,0x80025ee8);
+        std::puts("PASS: D08Z manual jump (look-ahead jumps now before gaps, bounded air steering incl. reach, assisted unchanged)");
+    }
+    // D08A: all role groups, availability, upgraded ammo, remote and success history.
+    ttk::input={};ttk::input.active=true;ttk::input.sequence=10000;ttk::input.epoch=100;
+    psx_mod_write_word(p,0);psx_mod_write_word(p+0x224,0);
+    psx_mod_write_half(p+0x60,63);psx_mod_write_half(p+0x74,5);
+    psx_mod_write_byte(p+0x22c,0);psx_mod_write_byte(p+0x22d,0);
+    psx_mod_write_byte(p+0x3b8,2);psx_mod_write_byte(p+0x3b9,4);
+    call(0x8003ade4,c,p,0x80025ee8);
+    for(unsigned i=0;i<30;++i){psx_mod_write_half(p+0x2c4+4*i,1);psx_mod_write_half(p+0x2c6+4*i,20);}
+    auto request=[&](int action){psx_mod_write_word(p+0x224,0);ttk::input.commands[0]=action;
+        ttk::input.command_count=1;++ttk::input.command_serial;call(0x80058120,p,0,0x80041c44);};
+    const unsigned expected[]={0,4,5,7,8,12,10,9,6,11};
+    for(unsigned i=0;i<10;++i) {psx_mod_write_byte(p+0x3b9,i==1?5:4);request(ttk::weapon_group_1+i);
+        assert(psx_mod_read_byte(p+0x3ba)==expected[i]);}
+    psx_mod_write_byte(p+0x3b9,12);request(ttk::weapon_group_6);assert(psx_mod_read_byte(p+0x3ba)==14);
+    psx_mod_write_byte(p+0x3b9,14);request(ttk::weapon_group_6);assert(psx_mod_read_byte(p+0x3ba)==13);
+    psx_mod_write_byte(p+0x3b9,4);psx_mod_write_half(p+0x2c6+12*4,0);psx_mod_write_word(p+0x254,1);
+    request(ttk::weapon_group_6);assert(psx_mod_read_byte(p+0x3ba)==12);
+    psx_mod_write_byte(p+0x3b8,1);psx_mod_write_byte(p+0x3b9,0);psx_mod_write_half(p+0x74,39);
+    request(ttk::weapon_group_2);assert(psx_mod_read_byte(p+0x3ba)==4); // leave the original detonator equipment state
+    psx_mod_write_byte(p+0x3b8,2);psx_mod_write_byte(p+0x3b9,4);psx_mod_write_half(p+0x74,5);
+
+    psx_mod_write_word(p+0x254,0);request(ttk::weapon_group_6);assert(psx_mod_read_byte(p+0x3ba)==14);
+    psx_mod_write_half(p+0x2c4+7*4,9);psx_mod_write_half(p+0x2c6+7*4,0);
+    request(ttk::weapon_group_4);assert(psx_mod_read_byte(p+0x3ba)==7);
+    psx_mod_write_half(p+0x2c6+28*4,0);psx_mod_write_byte(p+0x3ba,4);
+    request(ttk::weapon_group_4);assert(psx_mod_read_byte(p+0x3ba)==4 && !(psx_mod_read_word(p+0x224)&4));
+    psx_mod_write_byte(p+0x3b9,5);request(ttk::weapon_last);assert(psx_mod_read_byte(p+0x3ba)==4);
+    psx_mod_write_byte(p+0x3b9,7);psx_mod_write_half(p+0x74,30);request(ttk::weapon_group_2);
+    psx_mod_write_byte(p+0x3b9,5);psx_mod_write_half(p+0x74,5);request(ttk::weapon_last);
+    assert(psx_mod_read_byte(p+0x3ba)==4); // interrupted draw must not become history
+
+    psx_mod_write_half(p+0x74,42);psx_mod_write_byte(p+0x3ba,5);
+    request(ttk::weapon_group_2);assert(psx_mod_read_byte(p+0x3ba)==5); // charged throw refused
+    // D08A37: held fire queues the choice and releases the game's fire input;
+    // the request is written once the game has seen the release (2 updates).
+    psx_mod_write_half(p+0x74,5);ttk::input.held[ttk::fire]=true;
+    request(ttk::weapon_group_2);assert(psx_mod_read_byte(p+0x3ba)==5 && ttk::switch_fire_masked());
+    call(0x80058120,p,0,0x80041c44);
+    assert(psx_mod_read_byte(p+0x3ba)==4 && (psx_mod_read_word(p+0x224)&4) && ttk::switch_fire_masked());
+    ttk::input.held[ttk::fire]=false;
+    psx_mod_write_word(p+0x224,0);psx_mod_write_byte(p+0x3b9,4);call(0x80058120,p,0,0x80041c44);
+    assert(!ttk::switch_fire_masked()); // ready loop of the new weapon: fire passes again
+    // D08A29: each half of the two-handed running loop accepts a fresh
+    // wheel/number request, tracks the actual weapon, and keeps native gait.
+    psx_mod_write_half(p+0x2c6+28*4,20);
+    const unsigned running_weapons[][3]={{3,11,6},{5,7,4},{6,3,9},{7,8,5},
+        {9,6,10},{10,9,13},{11,0,3},{27,6,10},{28,8,5}};
+    for(unsigned upper:{18u,19u})for(const auto& row:running_weapons) {
+        const unsigned weapon=row[0];
+        psx_mod_write_half(p+0x60,upper==18?76:78);
+        psx_mod_write_half(p+0x74,upper);psx_mod_write_byte(p+0x3b8,2);
+        psx_mod_write_byte(p+0x3b9,weapon);psx_mod_write_byte(p+0x3ba,weapon);
+        request(ttk::weapon_next);
+        assert((psx_mod_read_word(p+0x224)&4) && psx_mod_read_byte(p+0x3ba)==row[1]);
+        assert(psx_mod_read_half(p+0x60)==(upper==18?76:78));
+        assert(psx_mod_read_half(p+0x74)==upper);
+        request(ttk::weapon_previous);assert((psx_mod_read_word(p+0x224)&4) && psx_mod_read_byte(p+0x3ba)==row[2]);
+        request(ttk::weapon_group_2);assert(psx_mod_read_byte(p+0x3ba)==4);
+        ttk::input.held[ttk::fire]=true;psx_mod_write_byte(p+0x3ba,weapon);
+        request(ttk::weapon_next);assert(!(psx_mod_read_word(p+0x224)&4) && ttk::switch_fire_masked());
+        ttk::input.held[ttk::fire]=false;
+        call(0x80058120,p,0,0x80041c44); // D08A37: the notch waited, now served
+        assert((psx_mod_read_word(p+0x224)&4) && psx_mod_read_byte(p+0x3ba)==row[1]);
+        psx_mod_write_word(p+0x224,0);call(0x80058120,p,0,0x80041c44);assert(!ttk::switch_fire_masked());
+    }
+    for(unsigned upper:{6u,7u,21u,22u,24u,27u,30u,31u,33u,40u,42u}) {
+        psx_mod_write_half(p+0x74,upper);psx_mod_write_byte(p+0x3ba,5);
+        request(ttk::weapon_next);assert(psx_mod_read_byte(p+0x3ba)==5 && !(psx_mod_read_word(p+0x224)&4));
+    }
+    psx_mod_write_half(p+0x60,63);psx_mod_write_half(p+0x74,5);
+    psx_mod_write_byte(p+0x3b9,5);
+    // D08A37: the notches waited through the draw/attack poses; at rest the
+    // last one is served (not lost), then the queue is empty.
+    assert(ttk::switch_fire_masked());
+    psx_mod_write_word(p+0x224,0);call(0x80058120,p,0,0x80041c44);
+    assert((psx_mod_read_word(p+0x224)&4) && psx_mod_read_byte(p+0x3ba)!=5);
+    psx_mod_write_word(p+0x224,0);psx_mod_write_byte(p+0x3ba,5);call(0x80058120,p,0,0x80041c44);
+    assert(!ttk::switch_fire_masked());
+    {
+        // D08A37: finish the shot, not the lowering. Desert Eagle gun-up 14 with
+        // a queued choice is cut to rest 5 and the request written; the
+        // original fire request bits 0x110 go with it. Not the fire track 16.
+        psx_mod_write_byte(p+0x3b9,4);psx_mod_write_byte(p+0x3ba,4);psx_mod_write_half(p+0x74,16);
+        ttk::input.held[ttk::fire]=true;request(ttk::weapon_group_3);
+        psx_mod_write_word(p+0x224,0x110);call(0x80058120,p,0,0x80041c44);
+        assert(psx_mod_read_half(p+0x74)==16 && psx_mod_read_byte(p+0x3ba)==4); // shot not out yet
+        psx_mod_write_half(p+0x74,14);psx_mod_write_half(p+0x7c,7);call(0x80058120,p,0,0x80041c44);
+        assert(psx_mod_read_half(p+0x74)==5 && psx_mod_read_half(p+0x7c)==0);
+        assert(psx_mod_read_byte(p+0x3ba)==5 && (psx_mod_read_word(p+0x224)&0x114)==4);
+        // Drawing: fire stays released until the new weapon's ready loop.
+        psx_mod_write_word(p+0x224,0);psx_mod_write_byte(p+0x3b8,0);psx_mod_write_half(p+0x74,1);
+        call(0x80058120,p,0,0x80041c44);assert(ttk::switch_fire_masked());
+        psx_mod_write_byte(p+0x3b8,2);psx_mod_write_byte(p+0x3b9,5);psx_mod_write_half(p+0x74,21);
+        call(0x80058120,p,0,0x80041c44);assert(ttk::switch_fire_masked());
+        psx_mod_write_half(p+0x74,20);call(0x80058120,p,0,0x80041c44);assert(!ttk::switch_fire_masked());
+        // The weapon already out: no mask, the burst goes on.
+        psx_mod_write_half(p+0x74,25);request(ttk::weapon_group_3);
+        assert(!ttk::switch_fire_masked() && !(psx_mod_read_word(p+0x224)&4));
+        // A savestate load drops a waiting choice.
+        request(ttk::weapon_group_2);assert(ttk::switch_fire_masked());
+        ++save_loads;psx_mod_write_word(p+0x224,0);call(0x80058120,p,0,0x80041c44);--save_loads;
+        assert(!ttk::switch_fire_masked());
+        call(0x80058120,p,0,0x80041c44);assert(!ttk::switch_fire_masked() && !(psx_mod_read_word(p+0x224)&4));
+        // Vanilla: nothing is queued or masked.
+        ttk::modern=false;request(ttk::weapon_group_2);call(0x80058120,p,0,0x80041c44);
+        assert(!ttk::switch_fire_masked() && !(psx_mod_read_word(p+0x224)&4));ttk::modern=true;
+        ttk::input.held[ttk::fire]=false;call(0x8003ade4,c,p,0x80025ee8); // Modernized lease again
+        psx_mod_write_word(p+0x224,0);psx_mod_write_half(p+0x74,5);psx_mod_write_byte(p+0x3ba,5);
+        call(0x80058120,p,0,0x80041c44);
+        std::puts("PASS: D08A37 weapon switching while firing (queue, fire release, shot cut, draw mask, savestate, Vanilla)");
+    }
+    std::puts("PASS: D08A29 running weapon selection and attack/draw safety");
+    // No medkit ownership means no request. An owned dose uses original item equipment.
+    psx_mod_write_half(p+0x368,0);request(ttk::medkit);assert(!(psx_mod_read_word(p+0x224)&12));
+    psx_mod_write_half(p+0x368,1);psx_mod_write_half(p+0x36a,100);
+    // D08A34: with its live capacity the medkit heals in every live state (here
+    // with fire held, which the ground lease refuses), never at zero health.
+    {
+        const uint16_t capacity=psx_mod_read_half(0x800c2712+4*5),health=psx_mod_read_half(p+0x32);
+        auto use_at=[&](int action){psx_mod_write_word(p+0x224,0);ttk::input.commands[0]=action;
+            ttk::input.command_count=1;++ttk::input.command_serial;call(0x80058120,p,0,0x80041c44,0x801fe000);};
+        psx_mod_write_half(0x800c2712+4*5,10000);ttk::input.held[ttk::fire]=true;
+        psx_mod_write_half(p+0x32,0);use_at(ttk::medkit);assert(medkit_heals==0 && !(psx_mod_read_word(p+0x224)&12));
+        psx_mod_write_half(p+0x32,5000);use_at(ttk::medkit);
+        assert(medkit_heals==1 && !(psx_mod_read_word(p+0x224)&12) && !(psx_mod_read_half(p+0x368)&0x8000));
+        ttk::input.held[ttk::fire]=false;psx_mod_write_half(0x800c2712+4*5,capacity);psx_mod_write_half(p+0x32,health);
+        std::puts("PASS: D08A34 medkit heals outside the ground lease, never at zero health");
+    }
+    request(ttk::medkit);assert(psx_mod_read_byte(p+0x3bb)==5 && (psx_mod_read_word(p+0x224)&12)==12);
+    // Shared original menu selection, cycle-only immutability, zero/one/many,
+    // active empty toggles, and depletion. No synthetic animation acceptance.
+    assert(psx_mod_read_half(0x800c3f94)==5);
+    for(unsigned id:{1u,2u,3u}){psx_mod_write_half(p+0x354+4*id,1);psx_mod_write_half(p+0x356+4*id,40);}
+    uint8_t items_before[24];std::memcpy(items_before,ram+(p&0x1fffff)+0x354,24);
+    for(unsigned id:{1u,2u,3u,5u,1u}) {request(ttk::item_next);assert(psx_mod_read_half(0x800c3f94)==id);}
+    request(ttk::item_previous);assert(psx_mod_read_half(0x800c3f94)==5);
+    assert(!std::memcmp(items_before,ram+(p&0x1fffff)+0x354,24));
+    // D19Q4: restore another selected gadget with a stale bracket command.
+    // Preserve the restored selection, announce nothing, then accept a fresh key.
+    const unsigned announcements=ttk::inventory_announcements;
+    psx_mod_write_half(0x800c3f94,2);++save_loads;
+    ++ttk::input.command_serial;ttk::input.commands[0]=ttk::item_next;
+    call(0x80058120,p,0,0x80041c44);
+    assert(psx_mod_read_half(0x800c3f94)==2 && ttk::inventory_announcements==announcements);
+    call(0x80058120,p,0,0x80041c44);
+    assert(ttk::inventory_announcements==announcements);
+    call(0x8003ade4,c,p,0x80025ee8); // normal post-load camera update renews the gameplay lease
+    request(ttk::item_next);
+    assert(psx_mod_read_half(0x800c3f94)==3 && ttk::inventory_announcements==announcements+1);
+    std::puts("PASS: D19Q4 restored selection is silent, old command discarded, new bracket works");
+    psx_mod_write_half(0x800c3f94,3);request(ttk::item_previous);assert(psx_mod_read_half(0x800c3f94)==2);
+    psx_mod_write_half(p+0x35e,0);request(ttk::item_next);assert(psx_mod_read_half(0x800c3f94)==1); // depletion first falls back to medkit, then cycles
+    for(unsigned id:{1u,2u,3u})psx_mod_write_half(p+0x354+4*id,0);
+    request(ttk::item_next);assert(psx_mod_read_half(0x800c3f94)==5);
+    request(ttk::item_previous);assert(psx_mod_read_half(0x800c3f94)==5);
+    psx_mod_write_half(p+0x368,0);request(ttk::item_use);assert(psx_mod_read_half(0x800c3f94)==0 && !(psx_mod_read_word(p+0x224)&12));
+    psx_mod_write_half(p+0x358,3);psx_mod_write_half(p+0x35a,0);
+    request(ttk::item_next);assert(psx_mod_read_half(0x800c3f94)==1); // active can be switched off
+    psx_mod_write_half(p+0x358,0);
+    {
+        // D08A23: real input dispatcher, busy weapon + held fire. Only the
+        // goggles endpoints may change; no holster, shot or pose request.
+        const uint32_t old_model=psx_mod_read_word(p+0x40),old_items=psx_mod_read_word(0x800ddb18),old_models=psx_mod_read_word(0x800ddb14);
+        const unsigned old_health=psx_mod_read_half(p+0x32),old_upper=psx_mod_read_half(p+0x74),old_face=psx_mod_read_half(p+0x854);
+        psx_mod_write_word(p+0x40,0x801d0000);psx_mod_write_byte(0x801d0034,1);
+        psx_mod_write_word(0x800ddb18,0x801d1000);psx_mod_write_word(0x801d20c4,0x801d4000);
+        psx_mod_write_word(0x800ddb14,0x801d3000);psx_mod_write_word(0x801d3004,0x801d5000);
+        psx_mod_write_word(0x801d5090,0x801d6000);psx_mod_write_word(0x801d0090,0x801d6000);
+        psx_mod_write_half(p+0x360,1);psx_mod_write_half(p+0x362,60);psx_mod_write_half(p+0x32,100);
+        psx_mod_write_half(p+0x854,0);psx_mod_write_half(p+0x74,42);ttk::input.held[ttk::fire]=true;
+        const uint32_t equipment=psx_mod_read_word(p+0x3b8);
+        const unsigned sounds_before=night_vision_sounds;
+        request(ttk::goggles);
+        assert(night_vision_sounds==sounds_before+1);
+        assert(psx_mod_read_half(p+0x360)==3 && psx_mod_read_half(p+0x854)==3);
+        assert(psx_mod_read_word(p+0x224)==0x80000 && psx_mod_read_word(0x801d0090)==0x801d4000);
+        assert(psx_mod_read_word(p+0x3b8)==equipment && psx_mod_read_half(p+0x74)==42 && psx_mod_read_half(p+0x362)==60);
+        request(ttk::item_use);
+        assert(psx_mod_read_half(p+0x360)==1 && psx_mod_read_half(p+0x854)==0 && psx_mod_read_word(0x801d0090)==0x801d6000);
+        assert(psx_mod_read_word(p+0x224)==0 && psx_mod_read_word(p+0x3b8)==equipment);
+        assert(night_vision_sounds==sounds_before+2); // removal also plays A
+        // A pending weapon switch and attack retain their exact bits and
+        // selected equipment, including when N is handled in that snapshot.
+        psx_mod_write_word(p+0x224,0x104);ttk::input.commands[0]=ttk::goggles;++ttk::input.command_serial;
+        call(0x80058120,p,0,0x80041c44);
+        assert(psx_mod_read_word(p+0x224)==0x80104 && psx_mod_read_word(p+0x3b8)==equipment && psx_mod_read_half(p+0x74)==42);
+        ++ttk::input.command_serial;call(0x80058120,p,0,0x80041c44);
+        assert(psx_mod_read_word(p+0x224)==0x104 && psx_mod_read_word(p+0x3b8)==equipment);
+        assert(night_vision_sounds==sounds_before+4);
+        // Empty, absent, dead, invalid model and native transition refuse.
+        psx_mod_write_half(p+0x362,0);request(ttk::goggles);assert(psx_mod_read_half(p+0x360)==1);
+        psx_mod_write_half(p+0x362,60);psx_mod_write_half(p+0x360,0);request(ttk::goggles);assert(psx_mod_read_half(p+0x360)==0);
+        psx_mod_write_half(p+0x360,1);psx_mod_write_half(p+0x32,0);request(ttk::goggles);assert(psx_mod_read_half(p+0x360)==1);
+        psx_mod_write_half(p+0x32,100);psx_mod_write_word(p+0x40,0);request(ttk::goggles);assert(psx_mod_read_half(p+0x360)==1);
+        psx_mod_write_word(p+0x40,0x801d0000);psx_mod_write_half(p+0x360,0x8001);request(ttk::goggles);assert(psx_mod_read_half(p+0x360)==0x8001);
+        psx_mod_write_half(p+0x360,1);setenv("DNTTK_NIGHT_VISION","original",1);request(ttk::goggles);assert(psx_mod_read_half(p+0x360)==1);unsetenv("DNTTK_NIGHT_VISION");
+        ttk::modern=false;request(ttk::goggles);assert(psx_mod_read_half(p+0x360)==1);ttk::modern=true;
+        assert(night_vision_sounds==sounds_before+4);
+        // Replacement follows TTK's one-face-item rule, preserving mask charge.
+        psx_mod_write_half(p+0x854,2);psx_mod_write_half(p+0x35c,3);psx_mod_write_half(p+0x35e,50);
+        request(ttk::goggles);assert(psx_mod_read_half(p+0x35c)==1 && psx_mod_read_half(p+0x35e)==50);
+        request(ttk::goggles);
+        assert(night_vision_sounds==sounds_before+6);
+        request(ttk::item_use);assert(night_vision_sounds==sounds_before+7);
+        request(ttk::item_use);assert(night_vision_sounds==sounds_before+8);
+        // D08A24: instant manual use and real damage-entry plugin. The
+        // native damage handler, not the adapter, remains the protection rule.
+        const uint32_t old_gas=psx_mod_read_word(p+0x88c);
+        psx_mod_write_word(0x801d2030,0x801d7000);
+        psx_mod_write_half(p+0x35c,1);psx_mod_write_half(p+0x35e,50);
+        psx_mod_write_word(p+0x88c,0);
+        const unsigned mask_sounds_before=bio_mask_sounds;
+        request(ttk::biomask);assert(bio_mask_sounds==mask_sounds_before+1);
+        assert(psx_mod_read_half(p+0x35c)==3 && psx_mod_read_half(p+0x854)==2);
+        assert(psx_mod_read_word(0x801d0090)==0x801d7000 && psx_mod_read_half(p+0x35e)==50);
+        assert(psx_mod_read_word(p+0x3b8)==equipment && psx_mod_read_half(p+0x74)==42);
+        request(ttk::item_use);assert(psx_mod_read_half(p+0x35c)==1 && psx_mod_read_half(p+0x854)==0);
+        auto gas_hit=[&](unsigned type=12,uint32_t victim=0x800d7198,uint32_t caller=0x80040ad0) {
+            CPUState cpu{};cpu.gpr[4]=victim;cpu.gpr[7]=type;cpu.gpr[29]=0x801fff00;cpu.gpr[31]=caller;
+            hooks().at(0x800a40a8)(&cpu,0x800a40a8);
+        };
+        gas_hit(1);gas_hit(12,p+0x1000);gas_hit();assert(psx_mod_read_half(p+0x35c)==1);
+        psx_mod_write_word(p+0x88c,2);gas_hit(12,p,0x80092a44);assert(psx_mod_read_half(p+0x35c)==1);gas_hit();
+        assert(psx_mod_read_half(p+0x35c)==3 && psx_mod_read_half(p+0x854)==2);
+        assert(psx_mod_read_word(p+0x3b8)==equipment && psx_mod_read_half(p+0x74)==42);
+        const unsigned auto_sounds=bio_mask_sounds;
+        gas_hit();assert(psx_mod_read_half(p+0x35c)==3 && bio_mask_sounds==auto_sounds); // no repeated cue
+        // Gas exit removes instantly after three clear native updates, with
+        // one sound, unchanged weapon/pose, and no removal on a brief boundary dip.
+        psx_mod_write_word(p+0x88c,0);request(ttk::item_next);request(ttk::item_next);
+        assert(psx_mod_read_half(p+0x35c)==3 && bio_mask_sounds==auto_sounds);
+        psx_mod_write_word(p+0x88c,2);gas_hit(); // exposure resets exit grace
+        psx_mod_write_word(p+0x88c,0);request(ttk::item_next);request(ttk::item_next);
+        assert(psx_mod_read_half(p+0x35c)==3);
+        request(ttk::item_next);assert(psx_mod_read_half(p+0x35c)==1 && psx_mod_read_half(p+0x854)==0);
+        assert(bio_mask_sounds==auto_sounds+1 && psx_mod_read_half(p+0x35e)==50);
+        assert(psx_mod_read_word(p+0x3b8)==equipment && psx_mod_read_half(p+0x74)==42);
+        request(ttk::item_next);assert(bio_mask_sounds==auto_sounds+1);
+        psx_mod_write_word(p+0x88c,2);gas_hit();assert(psx_mod_read_half(p+0x35c)==3);
+        request(ttk::biomask);gas_hit();assert(psx_mod_read_half(p+0x35c)==1); // manual off wins in gas
+        psx_mod_write_word(p+0x88c,0);request(ttk::item_next); // exit rearms
+        psx_mod_write_word(p+0x88c,2);gas_hit();assert(psx_mod_read_half(p+0x35c)==3);
+        request(ttk::goggles);gas_hit();assert(psx_mod_read_half(p+0x35c)==1 && psx_mod_read_half(p+0x854)==3);
+        psx_mod_write_word(p+0x88c,0);request(ttk::goggles);request(ttk::item_next);
+        psx_mod_write_word(p+0x88c,2);psx_mod_write_half(p+0x35e,0);gas_hit();assert(psx_mod_read_half(p+0x35c)==1);
+        psx_mod_write_half(p+0x35e,50);psx_mod_write_half(p+0x35c,0);gas_hit();assert(psx_mod_read_half(p+0x35c)==0);
+        psx_mod_write_half(p+0x35c,1);psx_mod_write_half(p+0x32,0);gas_hit();assert(psx_mod_read_half(p+0x35c)==1);
+        psx_mod_write_half(p+0x32,100);psx_mod_write_word(p+0x40,0);gas_hit();assert(psx_mod_read_half(p+0x35c)==1);
+        psx_mod_write_word(p+0x40,0x801d0000);psx_mod_write_half(p+0x360,0x8001);gas_hit();assert(psx_mod_read_half(p+0x35c)==1);
+        psx_mod_write_half(p+0x360,1);setenv("DNTTK_AUTO_BIO_MASK","off",1);gas_hit();request(ttk::biomask);assert(psx_mod_read_half(p+0x35c)==1);unsetenv("DNTTK_AUTO_BIO_MASK");
+        ttk::modern=false;gas_hit();assert(psx_mod_read_half(p+0x35c)==1);ttk::modern=true;
+        // Loading an unprotected gas save starts a new exposure check.
+        ++save_loads;gas_hit();assert(psx_mod_read_half(p+0x35c)==3);--save_loads; // restore fixture generation
+        psx_mod_write_word(p+0x88c,old_gas);
+        std::puts("PASS: D08A24 instant B/inventory, gas activation, manual suppression/re-entry, empty/dead/pending/invalid/Off/Vanilla guards");
+        ttk::input.held[ttk::fire]=false;psx_mod_write_half(p+0x360,0);psx_mod_write_half(p+0x362,0);psx_mod_write_half(p+0x35c,0);psx_mod_write_half(p+0x35e,0);
+        psx_mod_write_word(p+0x40,old_model);psx_mod_write_word(0x800ddb18,old_items);psx_mod_write_word(0x800ddb14,old_models);
+        psx_mod_write_half(p+0x32,old_health);psx_mod_write_half(p+0x74,old_upper);psx_mod_write_half(p+0x854,old_face);
+        std::puts("PASS: D08A23 instant N/U while firing, equipment preserved, charge/refusal/Original/Vanilla and face ownership");
+    }
+    {
+        // D08A4: held steroids (bit 0 with an amount, the original's own owned
+        // item) join the cycle after the medkit; R, and U on them, set the
+        // running bit (the original menu's toggle) and play the pickup sound,
+        // with no equipment request. Running or none held: R does nothing.
+        psx_mod_write_half(p+0x368,1);psx_mod_write_half(p+0x36a,100);psx_mod_write_half(0x800c3f94,5);
+        psx_mod_write_half(p+0x364,1);psx_mod_write_half(p+0x366,9000);
+        const uint16_t health=psx_mod_read_half(p+0x32);psx_mod_write_half(p+0x32,10000);
+        // A stack in range for the original sound call.
+        auto press=[&](int action){psx_mod_write_word(p+0x224,0);ttk::input.commands[0]=action;
+            ttk::input.command_count=1;++ttk::input.command_serial;call(0x80058120,p,0,0x80041c44,0x801ff000);};
+        request(ttk::item_next);assert(psx_mod_read_half(0x800c3f94)==4 && psx_mod_read_half(p+0x364)==1);
+        request(ttk::item_previous);assert(psx_mod_read_half(0x800c3f94)==5);
+        steroid_sounds.clear();
+        press(ttk::steroids);assert(psx_mod_read_half(p+0x364)==3 && psx_mod_read_half(p+0x366)==9000);
+        assert(!(psx_mod_read_word(p+0x224)&12) && steroid_sounds.size()==1 && steroid_sounds[0][0]==0x100f &&
+               steroid_sounds[0][1]==p+4 && steroid_sounds[0][2]==0x800 && steroid_sounds[0][3]==uint32_t(-10));
+        press(ttk::steroids);assert(psx_mod_read_half(p+0x364)==3 && steroid_sounds.size()==1); // running
+        psx_mod_write_half(p+0x364,1);psx_mod_write_half(0x800c3f94,4);
+        press(ttk::item_use);assert(psx_mod_read_half(p+0x364)==3 && !(psx_mod_read_word(p+0x224)&12));
+        psx_mod_write_half(p+0x364,0);psx_mod_write_half(p+0x366,0);
+        press(ttk::steroids);assert(psx_mod_read_half(p+0x364)==0 && steroid_sounds.size()==2);
+        psx_mod_write_half(p+0x364,1);psx_mod_write_half(p+0x366,0);  // owned but empty
+        press(ttk::steroids);assert(psx_mod_read_half(p+0x364)==1);
+        psx_mod_write_half(p+0x366,9000);psx_mod_write_half(p+0x32,0);  // dead
+        press(ttk::steroids);assert(psx_mod_read_half(p+0x364)==1);psx_mod_write_half(p+0x32,10000);
+        ttk::modern=false;press(ttk::steroids);assert(psx_mod_read_half(p+0x364)==1);ttk::modern=true;
+        psx_mod_write_half(p+0x364,0);psx_mod_write_half(p+0x366,0);psx_mod_write_half(p+0x368,0);psx_mod_write_half(p+0x32,health);
+        std::puts("PASS: D08A4 held steroids: cycle, R and U use (running bit, sound, no request), running/none/empty/dead/Vanilla refused");
+    }
+    request(ttk::quick_kick);assert(!(psx_mod_read_word(p+0x224)&12));
+    assert(kicks==0);psx_mod_write_half(p+0x74,63);psx_mod_write_byte(p+0x3b8,0);psx_mod_write_byte(p+0x3ba,0);
+    ttk::input.commands[0]=ttk::quick_kick;++ttk::input.command_serial;
+    call(0x80058120,p,0,0x80041c44,0x801ff000);assert(kicks==1);
+    psx_mod_write_half(p+0x74,42);++ttk::input.command_serial;
+    call(0x80058120,p,0,0x80041c44,0x801ff000);assert(kicks==1);
+    psx_mod_write_half(p+0x74,63);
+    psx_mod_write_byte(p+0x3ba,4);++ttk::input.command_serial;
+    call(0x80058120,p,0,0x80041c44,0x801ff000);assert(kicks==1);
+    psx_mod_write_byte(p+0x3b8,2);psx_mod_write_half(p+0x74,5);
+    {
+        // D08O5: in the native swim states held fire draws a settled holstered
+        // weapon through the original request (+0x3ba, flag 4) at the swim
+        // handler entry, never Circle; unarmed Cross is masked meanwhile.
+        const uint32_t saved_water=psx_mod_read_word(p+0x834),saved_flag=psx_mod_read_word(p+0x20c);
+        psx_mod_write_word(p+0x834,psx_mod_read_word(p+0x1c8)-800);psx_mod_write_word(p+0x20c,1);
+        psx_mod_write_byte(p+0x22c,5);psx_mod_write_byte(p+0x22d,5);
+        psx_mod_write_half(p+0x60,127);psx_mod_write_half(p+0x74,127);
+        psx_mod_write_byte(p+0x3b8,0);psx_mod_write_byte(p+0x3b9,4);psx_mod_write_byte(p+0x3ba,4);psx_mod_write_word(p+0x224,0);
+        ++ttk::input.sequence;call(0x8003ade4,c,p,0x80025ee8);
+        assert(ttk::swim_weapon_ready() && !ttk::movement_ready());
+        assert(ttk::swim_fire_draw_ready() && ttk::swim_fire_cross_masked() && !ttk::fire_draw_ready());
+        call(0x800455bc,p,0,0x8004b5bc);assert(!(psx_mod_read_word(p+0x224)&4)); // fire not held
+        ttk::input.held[ttk::fire]=true;
+        for(unsigned blocked : {(unsigned)ttk::holster,(unsigned)ttk::interact}) {
+            ttk::input.held[blocked]=true;call(0x800455bc,p,0,0x8004b5bc);
+            assert(!(psx_mod_read_word(p+0x224)&4));ttk::input.held[blocked]=false;
+        }
+        call(0x800455bc,p,0,0x8004b5bc);
+        assert(psx_mod_read_byte(p+0x3ba)==4 && (psx_mod_read_word(p+0x224)&4) && !ttk::swim_fire_draw_ready());
+        psx_mod_write_word(p+0x224,0);
+        // Surface states too; a weapon the swim states refuse takes the
+        // original remap (2 -> 3), Boot or a refused unowned remap never.
+        psx_mod_write_byte(p+0x22c,4);psx_mod_write_byte(p+0x22d,4);psx_mod_write_half(p+0x60,122);psx_mod_write_half(p+0x74,122);
+        psx_mod_write_byte(p+0x3ba,2);call(0x800455bc,p,0,0x8004b5bc);
+        assert(psx_mod_read_byte(p+0x3ba)==3 && (psx_mod_read_word(p+0x224)&4));
+        psx_mod_write_word(p+0x224,0);psx_mod_write_byte(p+0x3ba,0);
+        assert(!ttk::swim_fire_draw_ready() && !ttk::swim_fire_cross_masked());
+        const uint16_t crossbow=psx_mod_read_half(p+0x2c4+3*4);psx_mod_write_half(p+0x2c4+3*4,0);psx_mod_write_byte(p+0x3ba,2);
+        assert(!ttk::swim_fire_draw_ready() && !ttk::swim_fire_cross_masked());
+        psx_mod_write_half(p+0x2c4+3*4,crossbow);psx_mod_write_byte(p+0x3ba,4);
+        // Unsettled, transitions, drawn or detonator equipment, Vanilla.
+        psx_mod_write_half(p+0x74,6);assert(!ttk::swim_fire_draw_ready());psx_mod_write_half(p+0x74,122);
+        for(unsigned flag : {1u,4u,8u,0x40u,0x80u,0x200u}) {
+            psx_mod_write_word(p+0x224,flag);assert(!ttk::swim_fire_draw_ready());
+        }
+        psx_mod_write_word(p+0x224,0);
+        for(unsigned equipment : {1u,2u}) {
+            psx_mod_write_byte(p+0x3b8,equipment);assert(!ttk::swim_fire_draw_ready() && !ttk::swim_fire_cross_masked());
+        }
+        psx_mod_write_byte(p+0x3b8,0);
+        ttk::modern=false;assert(!ttk::swim_fire_draw_ready() && !ttk::swim_fire_cross_masked());ttk::modern=true;
+        ttk::input.held[ttk::fire]=false;
+        psx_mod_write_word(p+0x834,saved_water);psx_mod_write_word(p+0x20c,saved_flag);
+        psx_mod_write_byte(p+0x22c,0);psx_mod_write_byte(p+0x22d,0);psx_mod_write_half(p+0x60,63);
+        psx_mod_write_byte(p+0x3b8,2);psx_mod_write_half(p+0x74,5);psx_mod_write_word(p+0x224,0);
+        ++ttk::input.sequence;call(0x8003ade4,c,p,0x80025ee8);
+        std::puts("PASS: D08O5 swim fire-draw, remap and state/Vanilla guards");
+    }
+    {
+        // D08J6A: on a ladder, chain, pole or climbing wall held fire draws the
+        // sidearm (4) through the original request at the climb dispatcher,
+        // swapping out another selection; holstered again it gets it back.
+        // Armed, climbing input may stow from the idle or the aim hold (8);
+        // shots are view-adapted there. Never outside the climb clips or in Vanilla.
+        const uint32_t attached=psx_mod_read_word(p+0x17c);
+        const uint16_t sidearm_ammo=psx_mod_read_half(p+0x2c6+4*4),sidearm_owned=psx_mod_read_half(p+0x2c4+4*4);
+        psx_mod_write_half(p+0x2c4+4*4,sidearm_owned|1);psx_mod_write_half(p+0x2c6+4*4,20);
+        psx_mod_write_word(p+0x17c,0x801d9fe4);
+        psx_mod_write_byte(p+0x22c,3);psx_mod_write_byte(p+0x22d,3);
+        psx_mod_write_half(p+0x60,187);psx_mod_write_half(p+0x74,187);
+        psx_mod_write_byte(p+0x3b8,0);psx_mod_write_byte(p+0x3b9,4);psx_mod_write_byte(p+0x3ba,5);psx_mod_write_word(p+0x224,0);
+        ++ttk::input.sequence;call(0x8003ade4,c,p,0x80025ee8);
+        assert(ttk::climb_weapon_ready() && ttk::climb_fire_hold_ready() && !ttk::climb_stow_ready() && !ttk::climb_shot_ready());
+        assert(!ttk::fire_draw_ready() && !ttk::movement_ready());
+        call(0x80043eb8,p,0,0x8004b60c,0x801ff000);assert(!(psx_mod_read_word(p+0x224)&4)); // fire not held
+        ttk::input.held[ttk::fire]=true;
+        for(unsigned blocked : {(unsigned)ttk::holster,(unsigned)ttk::interact}) {
+            ttk::input.held[blocked]=true;call(0x80043eb8,p,0,0x8004b60c,0x801ff000);
+            assert(!(psx_mod_read_word(p+0x224)&4));ttk::input.held[blocked]=false;
+        }
+        call(0x80043eb8,p,0,0x8004b5bc,0x801ff000);assert(!(psx_mod_read_word(p+0x224)&4)); // foreign caller
+        call(0x80043eb8,p,0,0x8004b60c,0x801ff000);
+        assert(psx_mod_read_byte(p+0x3ba)==4 && (psx_mod_read_word(p+0x224)&4));
+        assert(std::strstr(ttk::controls_debug_json(),"\"climb_fire\":{\"ready\":true,") && std::strstr(ttk::controls_debug_json(),"\"swap_from\":5,"));
+        // The request pending (flag 4) and the draw in progress refuse a second one.
+        call(0x80043eb8,p,0,0x8004b60c,0x801ff000);assert(std::strstr(ttk::controls_debug_json(),"\"draws\":1,"));
+        psx_mod_write_word(p+0x224,0);psx_mod_write_half(p+0x74,6);
+        call(0x80043eb8,p,0,0x8004b60c,0x801ff000);assert(!(psx_mod_read_word(p+0x224)&4) && psx_mod_read_byte(p+0x3ba)==4);
+        // Holstered and settled again on the climb: the selection returns.
+        ttk::input.held[ttk::fire]=false;psx_mod_write_half(p+0x74,187);
+        call(0x80043eb8,p,0,0x8004b60c,0x801ff000);
+        assert(psx_mod_read_byte(p+0x3ba)==5 && std::strstr(ttk::controls_debug_json(),"\"swap_from\":-1,"));
+        // Every climb clip, mid-step too; mounts, catches, exits and hangs never.
+        for(unsigned anim : {186u,187u,188u,189u,192u,193u,194u,195u,198u,199u,202u,205u}) {
+            psx_mod_write_half(p+0x60,anim);psx_mod_write_half(p+0x74,anim);assert(ttk::climb_fire_hold_ready());
+        }
+        for(unsigned anim : {147u,148u,156u,185u,190u,191u,196u,197u,206u,207u,210u,63u}) {
+            psx_mod_write_half(p+0x60,anim);psx_mod_write_half(p+0x74,anim);assert(!ttk::climb_weapon_ready());
+        }
+        psx_mod_write_half(p+0x60,187);psx_mod_write_half(p+0x74,187);
+        psx_mod_write_byte(p+0x22d,8);assert(!ttk::climb_weapon_ready());psx_mod_write_byte(p+0x22d,3);
+        psx_mod_write_word(p+0x17c,0);assert(!ttk::climb_weapon_ready());psx_mod_write_word(p+0x17c,0x801d9fe4);
+        psx_mod_write_half(p+0x2c6+4*4,0);assert(ttk::climb_weapon_ready() && !ttk::climb_fire_hold_ready());psx_mod_write_half(p+0x2c6+4*4,20);
+        // Armed: stow from the idle or the aim hold, never mid-shot or with a request.
+        psx_mod_write_byte(p+0x3b8,2);psx_mod_write_byte(p+0x3b9,4);
+        for(unsigned upper : {5u,8u}) {psx_mod_write_half(p+0x74,upper);assert(ttk::climb_stow_ready() && ttk::climb_shot_ready());}
+        for(unsigned upper : {6u,9u,11u}) {psx_mod_write_half(p+0x74,upper);assert(!ttk::climb_stow_ready() && ttk::climb_shot_ready());}
+        psx_mod_write_half(p+0x74,5);psx_mod_write_word(p+0x224,4);assert(!ttk::climb_stow_ready());psx_mod_write_word(p+0x224,0);
+        assert(!ttk::climb_fire_hold_ready());
+        ttk::modern=false;assert(!ttk::climb_weapon_ready() && !ttk::climb_stow_ready() && !ttk::climb_shot_ready());ttk::modern=true;
+        // Let go armed with the swapped sidearm: on settled ground the
+        // original request switches back to the swapped weapon.
+        psx_mod_write_byte(p+0x3b8,0);psx_mod_write_half(p+0x74,187);psx_mod_write_byte(p+0x3ba,5);
+        ttk::input.held[ttk::fire]=true;call(0x80043eb8,p,0,0x8004b60c,0x801ff000);ttk::input.held[ttk::fire]=false;
+        assert(psx_mod_read_byte(p+0x3ba)==4 && std::strstr(ttk::controls_debug_json(),"\"swap_from\":5,"));
+        psx_mod_write_word(p+0x17c,attached);
+        psx_mod_write_byte(p+0x22c,0);psx_mod_write_byte(p+0x22d,0);psx_mod_write_half(p+0x60,63);
+        psx_mod_write_byte(p+0x3b8,2);psx_mod_write_byte(p+0x3b9,4);psx_mod_write_half(p+0x74,5);psx_mod_write_word(p+0x224,0);
+        ++ttk::input.sequence;call(0x8003ade4,c,p,0x80025ee8);assert(ttk::movement_ready() && !ttk::climb_weapon_ready());
+        ++ttk::input.command_serial;call(0x80058120,p,0,0x80041c44,0x801ff000);
+        assert(psx_mod_read_byte(p+0x3ba)==5 && (psx_mod_read_word(p+0x224)&4) && std::strstr(ttk::controls_debug_json(),"\"ground_restores\":1,"));
+        psx_mod_write_word(p+0x224,0);psx_mod_write_byte(p+0x3ba,4);
+        psx_mod_write_half(p+0x2c6+4*4,sidearm_ammo);psx_mod_write_half(p+0x2c4+4*4,sidearm_owned);
+        std::puts("PASS: D08J6A climb fire-draw, sidearm swap and return, stow/shot gates, clips and Vanilla");
+    }
+    {
+        // D08J7A: the settled ledge hang (149, mode 6) has the climb lease.
+        // Held fire draws the sidearm at Duke's update (no climb dispatcher
+        // there), holstered again the selection returns; armed, S lets go with
+        // the weapon out: the hang pose takes the upper track for one update,
+        // then the kept weapon block comes back (fallen or refused).
+        const uint16_t sidearm_ammo=psx_mod_read_half(p+0x2c6+4*4),sidearm_owned=psx_mod_read_half(p+0x2c4+4*4);
+        psx_mod_write_half(p+0x2c4+4*4,sidearm_owned|1);psx_mod_write_half(p+0x2c6+4*4,20);
+        psx_mod_write_byte(p+0x22c,6);psx_mod_write_byte(p+0x22d,6);
+        psx_mod_write_half(p+0x60,149);psx_mod_write_half(p+0x74,149);
+        psx_mod_write_byte(p+0x3b8,0);psx_mod_write_byte(p+0x3b9,4);psx_mod_write_byte(p+0x3ba,5);psx_mod_write_word(p+0x224,0);
+        ++ttk::input.sequence;call(0x8003ade4,c,p,0x80025ee8);
+        auto update=[&]{call(0x8005a210,p,0x800c2754,0x80041b34,0x801fff00);};
+        assert(ttk::hang_weapon_ready() && ttk::climb_weapon_ready() && ttk::climb_fire_hold_ready() && !ttk::climb_shot_ready());
+        update();assert(!(psx_mod_read_word(p+0x224)&4) && psx_mod_read_byte(p+0x3ba)==5); // fire not held
+        ttk::input.held[ttk::fire]=true;update();
+        assert(psx_mod_read_byte(p+0x3ba)==4 && (psx_mod_read_word(p+0x224)&4) && std::strstr(ttk::controls_debug_json(),"\"swap_from\":5,"));
+        psx_mod_write_word(p+0x224,0);ttk::input.held[ttk::fire]=false;update();
+        assert(psx_mod_read_byte(p+0x3ba)==5 && std::strstr(ttk::controls_debug_json(),"\"swap_from\":-1,"));
+        // Only the settled ledge hang: grabs, shimmy steps, entry frames, the
+        // mode-7 object/ceiling hang and Vanilla never.
+        for(unsigned anim : {147u,148u,150u,152u,153u,140u}) {psx_mod_write_half(p+0x60,anim);assert(!ttk::hang_weapon_ready());}
+        psx_mod_write_half(p+0x60,149);
+        psx_mod_write_byte(p+0x22d,8);assert(!ttk::hang_weapon_ready());psx_mod_write_byte(p+0x22d,6);
+        psx_mod_write_byte(p+0x22c,7);psx_mod_write_byte(p+0x22d,7);assert(!ttk::hang_weapon_ready() && !ttk::climb_weapon_ready());
+        psx_mod_write_byte(p+0x22c,6);psx_mod_write_byte(p+0x22d,6);
+        ttk::modern=false;assert(!ttk::hang_weapon_ready() && !ttk::climb_weapon_ready());ttk::modern=true;
+        // Armed: stow and view shots as on climbs.
+        psx_mod_write_byte(p+0x3b8,2);psx_mod_write_half(p+0x74,5);
+        assert(ttk::climb_stow_ready() && ttk::climb_shot_ready() && ttk::hang_drop_armed_ready(true) && !ttk::hang_drop_armed_ready(false));
+        psx_mod_write_half(p+0x74,9);assert(!ttk::hang_drop_armed_ready(true));psx_mod_write_half(p+0x74,5);
+        psx_mod_write_word(p+0x224,4);assert(!ttk::hang_drop_armed_ready(true));psx_mod_write_word(p+0x224,0);
+        // S: the hang pose for one update, the weapon block back in the fall.
+        uint32_t block[5];for(unsigned i=0;i<5;++i)block[i]=psx_mod_read_word(p+0x74+4*i);
+        for(unsigned blocked : {(unsigned)ttk::fire,(unsigned)ttk::move_forward,(unsigned)ttk::holster,(unsigned)ttk::interact}) {
+            ttk::input.held[ttk::move_back]=true;ttk::input.held[blocked]=true;update();
+            assert(psx_mod_read_half(p+0x74)==5);ttk::input.held[blocked]=false;
+        }
+        update();assert(psx_mod_read_half(p+0x74)==149 && psx_mod_read_half(p+0x7c)==0 && std::strstr(ttk::controls_debug_json(),"\"hang_drops\":1,"));
+        ttk::input.held[ttk::move_back]=false;
+        psx_mod_write_byte(p+0x22c,9);psx_mod_write_half(p+0x60,108);psx_mod_write_half(p+0x74,108);update();
+        for(unsigned i=0;i<5;++i)assert(psx_mod_read_word(p+0x74+4*i)==block[i]);
+        assert(std::strstr(ttk::controls_debug_json(),"\"hang_drop_restores\":1,"));
+        // Space, refused by the original (still hanging): the block comes back too.
+        psx_mod_write_byte(p+0x22c,6);psx_mod_write_half(p+0x60,149);
+        ttk::input.held[ttk::jump]=true;update();assert(psx_mod_read_half(p+0x74)==149);ttk::input.held[ttk::jump]=false;
+        update();for(unsigned i=0;i<5;++i)assert(psx_mod_read_word(p+0x74+4*i)==block[i]);
+        // A savestate load between the two updates keeps the loaded pose.
+        ttk::input.held[ttk::move_back]=true;update();ttk::input.held[ttk::move_back]=false;assert(psx_mod_read_half(p+0x74)==149);
+        ++save_loads;update();assert(psx_mod_read_half(p+0x74)==149);--save_loads;
+        psx_mod_write_byte(p+0x22c,0);psx_mod_write_byte(p+0x22d,0);psx_mod_write_half(p+0x60,63);
+        psx_mod_write_byte(p+0x3b8,2);psx_mod_write_byte(p+0x3b9,4);psx_mod_write_half(p+0x74,5);psx_mod_write_word(p+0x224,0);
+        psx_mod_write_byte(p+0x3ba,4);
+        psx_mod_write_half(p+0x2c6+4*4,sidearm_ammo);psx_mod_write_half(p+0x2c4+4*4,sidearm_owned);
+        ++ttk::input.sequence;call(0x8003ade4,c,p,0x80025ee8);
+        std::puts("PASS: D08J7A ledge-hang fire-draw, swap return, armed drop handoff, hang gates and Vanilla");
+    }
+    {
+        // D08J6D: the ceiling monkey bars (mode 7 under a climbable object,
+        // 0x80 without 0x40) get the climb lease at the settled hang 149: held
+        // fire draws the sidearm, holstered the selection returns; during a
+        // travel step (150/151) held fire only holds (no Up, no draw); armed,
+        // Ctrl sends original Square; crates, entry frames and Vanilla never.
+        const uint16_t sidearm_ammo=psx_mod_read_half(p+0x2c6+4*4),sidearm_owned=psx_mod_read_half(p+0x2c4+4*4);
+        psx_mod_write_half(p+0x2c4+4*4,sidearm_owned|1);psx_mod_write_half(p+0x2c6+4*4,20);
+        // A scratch type table (the fixture's may be unset) with one grate type.
+        const uint32_t attached=psx_mod_read_word(p+0x17c),old_table=psx_mod_read_word(0x800d2660);
+        constexpr uint32_t table=0x801e8e00,grate=0x801e8f00;constexpr unsigned type=1;
+        psx_mod_write_word(0x800d2660,table);
+        const uint32_t type_flags=psx_mod_read_word(table+28*type);const uint16_t grate_type=psx_mod_read_half(grate+0x2c);
+        psx_mod_write_word(table+28*type,0x80);psx_mod_write_half(grate+0x2c,type);psx_mod_write_word(p+0x17c,grate);
+        psx_mod_write_byte(p+0x22c,7);psx_mod_write_byte(p+0x22d,7);
+        psx_mod_write_half(p+0x60,149);psx_mod_write_half(p+0x74,149);
+        psx_mod_write_byte(p+0x3b8,0);psx_mod_write_byte(p+0x3b9,4);psx_mod_write_byte(p+0x3ba,5);psx_mod_write_word(p+0x224,0);
+        ++ttk::input.sequence;call(0x8003ade4,c,p,0x80025ee8);
+        auto update=[&]{call(0x8005a210,p,0x800c2754,0x80041b34,0x801fff00);};
+        assert(ttk::ceiling_weapon_ready() && ttk::climb_weapon_ready() && ttk::climb_fire_hold_ready() && !ttk::hang_weapon_ready() && !ttk::climb_shot_ready());
+        update();assert(!(psx_mod_read_word(p+0x224)&4) && psx_mod_read_byte(p+0x3ba)==5);
+        ttk::input.held[ttk::fire]=true;update();
+        assert(psx_mod_read_byte(p+0x3ba)==4 && (psx_mod_read_word(p+0x224)&4) && std::strstr(ttk::controls_debug_json(),"\"swap_from\":5,"));
+        psx_mod_write_word(p+0x224,0);ttk::input.held[ttk::fire]=false;update();
+        assert(psx_mod_read_byte(p+0x3ba)==5 && std::strstr(ttk::controls_debug_json(),"\"swap_from\":-1,"));
+        // A travel step: fire holds (Cross masked by pc_input) but draws only at the hang.
+        for(unsigned anim : {150u,151u}) {
+            psx_mod_write_half(p+0x60,anim);psx_mod_write_half(p+0x74,anim);
+            assert(!ttk::ceiling_weapon_ready() && !ttk::climb_weapon_ready() && ttk::climb_fire_hold_ready());
+            ttk::input.held[ttk::fire]=true;update();ttk::input.held[ttk::fire]=false;
+            assert(!(psx_mod_read_word(p+0x224)&4) && psx_mod_read_byte(p+0x3ba)==5);
+        }
+        psx_mod_write_half(p+0x60,149);psx_mod_write_half(p+0x74,149);
+        // Crates (0xc0), other objects, entry frames, other hang clips and Vanilla never.
+        psx_mod_write_word(table+28*type,0xc0);assert(!ttk::ceiling_weapon_ready() && !ttk::climb_fire_hold_ready());
+        psx_mod_write_word(table+28*type,0);assert(!ttk::ceiling_weapon_ready());psx_mod_write_word(table+28*type,0x80);
+        psx_mod_write_byte(p+0x22d,9);assert(!ttk::ceiling_weapon_ready() && !ttk::climb_fire_hold_ready());psx_mod_write_byte(p+0x22d,7);
+        for(unsigned anim : {147u,148u,152u}) {psx_mod_write_half(p+0x60,anim);assert(!ttk::climb_fire_hold_ready());}
+        psx_mod_write_half(p+0x60,149);
+        ttk::modern=false;assert(!ttk::ceiling_weapon_ready() && !ttk::climb_weapon_ready() && !ttk::climb_fire_hold_ready());ttk::modern=true;
+        // Armed: stow, view shots and the Ctrl let-go (original Square).
+        psx_mod_write_byte(p+0x3b8,2);psx_mod_write_half(p+0x74,5);
+        assert(ttk::climb_stow_ready() && ttk::climb_shot_ready() && !ttk::ceiling_armed_drop());
+        ttk::input.held[ttk::crouch]=true;assert(ttk::ceiling_armed_drop());
+        psx_mod_write_byte(p+0x3b8,0);assert(!ttk::ceiling_armed_drop());psx_mod_write_byte(p+0x3b8,2);
+        ttk::modern=false;assert(!ttk::ceiling_armed_drop());ttk::modern=true;
+        ttk::input.held[ttk::crouch]=false;
+        // The hang-and-aim pose builds under the ceiling and in the ledge hang.
+        setenv("DNTTK_WEAPON_AIM","view",1);setenv("DNTTK_CAMERA_MODE","independent",1);
+        // A 19-joint model descriptor and a level view to Duke's right.
+        const uint32_t old_model=psx_mod_read_word(p+0x40);constexpr uint32_t model=0x801e9800;
+        const uint8_t model_joints=psx_mod_read_byte(model);
+        const uint16_t view[3]={psx_mod_read_half(c+12),psx_mod_read_half(c+14),psx_mod_read_half(c+16)};
+        psx_mod_write_byte(model,19);psx_mod_write_word(p+0x40,model);
+        psx_mod_write_half(c+12,4096);psx_mod_write_half(c+14,0);psx_mod_write_half(c+16,0);
+        ++ttk::input.sequence;call(0x8003ade4,c,p,0x80025ee8);
+        auto aimed=[&]{ttk::clock_ms+=200;call(0x800411b8,p,0,0x80042634);return std::strstr(ttk::controls_debug_json(),"\"climb_aim\":{\"set\":true,")!=nullptr;};
+        aimed(); // the first build only starts the real-time ramp
+        assert(aimed());
+        psx_mod_write_byte(p+0x22c,6);psx_mod_write_byte(p+0x22d,6);assert(ttk::hang_weapon_ready() && aimed());
+        psx_mod_write_half(p+0x60,150);assert(!aimed());psx_mod_write_half(p+0x60,149);
+        psx_mod_write_byte(p+0x22c,7);psx_mod_write_byte(p+0x22d,7);psx_mod_write_word(table+28*type,0xc0);assert(!aimed());
+        psx_mod_write_word(table+28*type,type_flags);psx_mod_write_half(grate+0x2c,grate_type);psx_mod_write_word(p+0x17c,attached);
+        psx_mod_write_word(0x800d2660,old_table);
+        psx_mod_write_byte(model,model_joints);psx_mod_write_word(p+0x40,old_model);
+        for(int i=0;i<3;++i)psx_mod_write_half(c+12+2*i,view[i]);
+        psx_mod_write_byte(p+0x22c,0);psx_mod_write_byte(p+0x22d,0);psx_mod_write_half(p+0x60,63);
+        psx_mod_write_byte(p+0x3b8,2);psx_mod_write_byte(p+0x3b9,4);psx_mod_write_half(p+0x74,5);psx_mod_write_word(p+0x224,0);
+        psx_mod_write_byte(p+0x3ba,4);
+        psx_mod_write_half(p+0x2c6+4*4,sidearm_ammo);psx_mod_write_half(p+0x2c4+4*4,sidearm_owned);
+        ++ttk::input.sequence;call(0x8003ade4,c,p,0x80025ee8);aimed();
+        assert(std::strstr(ttk::controls_debug_json(),"\"climb_aim\":{\"set\":false,"));
+        std::puts("PASS: D08J6D ceiling monkey-bar fire-draw, swap return, travel hold, armed Ctrl let-go, hang-and-aim in modes 6/7, crates and Vanilla");
+    }
+    {
+        // D08J6E: armed under the ceiling or on a pole/chain, Duke turns on
+        // the hold toward the view at the player update (rate-limited, eased);
+        // on a chain the view stays 35 degrees to his gun side and a step into
+        // the world (the segment query) is refused. Holstered, stowing, other
+        // climbs, the switch and Vanilla never turn him.
+        const uint16_t sidearm_ammo=psx_mod_read_half(p+0x2c6+4*4),sidearm_owned=psx_mod_read_half(p+0x2c4+4*4);
+        psx_mod_write_half(p+0x2c4+4*4,sidearm_owned|1);psx_mod_write_half(p+0x2c6+4*4,20);
+        const uint32_t attached=psx_mod_read_word(p+0x17c),old_table=psx_mod_read_word(0x800d2660);
+        constexpr uint32_t table=0x801e8e00,hold=0x801e8f00,box=0x801e8f80;constexpr unsigned type=1;
+        psx_mod_write_word(0x800d2660,table);
+        const uint32_t type_flags=psx_mod_read_word(table+28*type);
+        uint8_t saved_hold[0x50],saved_box[16];
+        for(unsigned i=0;i<sizeof saved_hold;++i)saved_hold[i]=psx_mod_read_byte(hold+i);
+        for(unsigned i=0;i<sizeof saved_box;++i)saved_box[i]=psx_mod_read_byte(box+i);
+        psx_mod_write_word(table+28*type,0x80);psx_mod_write_half(hold+0x2c,type);psx_mod_write_word(p+0x17c,hold);
+        setenv("DNTTK_WEAPON_AIM","view",1);setenv("DNTTK_CAMERA_MODE","independent",1);unsetenv("DNTTK_CLIMB_TURN");
+        const uint16_t view[3]={psx_mod_read_half(c+12),psx_mod_read_half(c+14),psx_mod_read_half(c+16)};
+        const int32_t pos[3]={(int32_t)psx_mod_read_word(p+4),(int32_t)psx_mod_read_word(p+8),(int32_t)psx_mod_read_word(p+12)};
+        psx_mod_write_half(c+12,4096);psx_mod_write_half(c+14,0);psx_mod_write_half(c+16,0); // view yaw 1024
+        auto hang=[&](unsigned mode,unsigned anim){
+            psx_mod_write_byte(p+0x22c,mode);psx_mod_write_byte(p+0x22d,mode);psx_mod_write_half(p+0x60,anim);
+            psx_mod_write_byte(p+0x3b8,2);psx_mod_write_byte(p+0x3b9,4);psx_mod_write_byte(p+0x3ba,4);
+            psx_mod_write_half(p+0x74,5);psx_mod_write_word(p+0x224,0);
+            psx_mod_write_half(p+0x1c,0);psx_mod_write_half(p+0x24,0);
+            ++ttk::input.sequence;call(0x8003ade4,c,p,0x80025ee8);
+        };
+        auto update=[&]{call(0x8005a210,p,0x800c2754,0x80041b34,0x801fff00);return (int)(psx_mod_read_half(p+0x1c)&4095);};
+        hang(7,149);assert(ttk::ceiling_weapon_ready());
+        assert(update()==192 && psx_mod_read_half(p+0x24)==192); // full rate far off
+        int yaw=192;for(int i=0;i<20;++i)yaw=update();
+        assert(std::abs(yaw-1024)<4); // eased onto the view, no overshoot
+        assert(std::strstr(ttk::controls_debug_json(),"\"turn_blocks\":0,"));
+        // Stowing, holstered, the original aim key, the switch, Vanilla: no turn.
+        hang(7,149);psx_mod_write_half(p+0x74,7);assert(update()==0);
+        hang(7,149);psx_mod_write_byte(p+0x3b8,0);psx_mod_write_half(p+0x74,149);assert(update()==0);
+        hang(7,149);ttk::input.held[ttk::original_aim]=true;assert(update()==0);ttk::input.held[ttk::original_aim]=false;
+        setenv("DNTTK_CLIMB_TURN","0",1);hang(7,149);assert(update()==0);
+        // arc: only once the view leaves the 50-degree chest clamp.
+        setenv("DNTTK_CLIMB_TURN","arc",1);hang(7,149);for(int i=0;i<20;++i)yaw=update();
+        assert(std::abs(yaw-(1024-569))<4);
+        unsetenv("DNTTK_CLIMB_TURN");
+        hang(7,150);assert(update()==0); // a travel step
+        psx_mod_write_word(table+28*type,0xc0);hang(7,149);assert(update()==0); // crates
+        psx_mod_write_word(table+28*type,0x80);
+        ttk::modern=false;hang(7,149);assert(update()==0);ttk::modern=true;
+        // A chain: a 138-wide column, 4096 tall, its axis at the hold's origin.
+        psx_mod_write_word(table+28*type,0x400);psx_mod_write_word(hold+0x44,0);psx_mod_write_word(hold+0x40,box-4);
+        for(uint32_t o : {4u,8u,12u})psx_mod_write_word(hold+o,0);psx_mod_write_half(hold+0x1c,0);
+        const int16_t column[8]={-69,-2048,-69,97,69,2048,69,2050};
+        for(int i=0;i<8;++i)psx_mod_write_half(box+2*i,(uint16_t)column[i]);
+        psx_mod_write_word(p+4,0);psx_mod_write_word(p+8,(uint32_t)-500);psx_mod_write_word(p+12,(uint32_t)-225);
+        ttk::segment_hit=false;hang(3,192);assert(ttk::climb_weapon_ready());
+        for(int i=0;i<20;++i)yaw=update();
+        assert(std::abs(yaw-(1024-398))<4); // the view 35 degrees to his right
+        // The world in the way (a wall): refused; an actor in the segment is no wall.
+        ttk::segment_hit=true;ttk::segment_kind=1;hang(3,192);assert(update()==0);
+        assert(!std::strstr(ttk::controls_debug_json(),"\"turn_blocks\":0,"));
+        ttk::segment_kind=2;hang(3,192);assert(update()==192);
+        ttk::segment_hit=false;
+        // Ladders and climbing walls do not turn (D08J6F); nor a ladder-type hold.
+        hang(3,187);assert(update()==0);
+        hang(3,198);assert(update()==0);
+        psx_mod_write_word(table+28*type,0x100);hang(3,192);assert(update()==0);
+        ttk::modern=false;psx_mod_write_word(table+28*type,0x400);hang(3,192);assert(update()==0);ttk::modern=true;
+        for(unsigned i=0;i<sizeof saved_hold;++i)psx_mod_write_byte(hold+i,saved_hold[i]);
+        for(unsigned i=0;i<sizeof saved_box;++i)psx_mod_write_byte(box+i,saved_box[i]);
+        psx_mod_write_word(table+28*type,type_flags);psx_mod_write_word(p+0x17c,attached);psx_mod_write_word(0x800d2660,old_table);
+        for(int i=0;i<3;++i) {psx_mod_write_half(c+12+2*i,view[i]);psx_mod_write_word(p+4+4*i,(uint32_t)pos[i]);}
+        ttk::segment_kind=2;
+        psx_mod_write_byte(p+0x22c,0);psx_mod_write_byte(p+0x22d,0);psx_mod_write_half(p+0x60,63);
+        psx_mod_write_byte(p+0x3b8,2);psx_mod_write_byte(p+0x3b9,4);psx_mod_write_half(p+0x74,5);psx_mod_write_word(p+0x224,0);
+        psx_mod_write_byte(p+0x3ba,4);psx_mod_write_half(p+0x1c,0);psx_mod_write_half(p+0x24,0);
+        psx_mod_write_half(p+0x2c6+4*4,sidearm_ammo);psx_mod_write_half(p+0x2c4+4*4,sidearm_owned);
+        ++ttk::input.sequence;call(0x8003ade4,c,p,0x80025ee8);
+        std::puts("PASS: D08J6E armed monkey-bar and chain turn to the view: rate, easing, arc, chain bias, wall refusal, gates and Vanilla");
+    }
+    {
+        // D08J7B: fire during a mantle never stops it. It queues the weapon
+        // selected before the E stow; set in the pull-up (or on the ground after
+        // a height mantle), the original request draws it on the first ground
+        // frame. The pull-up 140 runs 1.6x on both tracks. D08J8: with sidearm
+        // ammo the sidearm is drawn in the climb instead, so the queue is tested
+        // with the sidearm empty and the shotgun selected.
+        auto update=[&]{call(0x8005a210,p,0x800c2754,0x80041b34,0x801fff00);};
+        auto json=[]{return std::string(ttk::controls_debug_json());};
+        const uint16_t sidearm_ammo=psx_mod_read_half(p+0x2c6+4*4),sidearm_owned=psx_mod_read_half(p+0x2c4+4*4);
+        psx_mod_write_half(p+0x2c4+4*4,sidearm_owned|1);psx_mod_write_half(p+0x2c6+4*4,0);
+        const uint16_t shotgun_ammo=psx_mod_read_half(p+0x2c6+4*5),shotgun_owned=psx_mod_read_half(p+0x2c4+4*5);
+        psx_mod_write_half(p+0x2c4+4*5,(shotgun_owned|1)&~8);psx_mod_write_half(p+0x2c6+4*5,20);
+        psx_mod_write_byte(p+0x22c,8);psx_mod_write_byte(p+0x22d,0);
+        psx_mod_write_half(p+0x60,139);psx_mod_write_half(p+0x74,139);
+        psx_mod_write_byte(p+0x3b8,0);psx_mod_write_byte(p+0x3ba,5);psx_mod_write_word(p+0x224,0);
+        update();assert(json().find("\"queued\":false")!=std::string::npos);
+        ttk::input.held[ttk::fire]=true;update();ttk::input.held[ttk::fire]=false;
+        // Queued, but no request while climbing (a ledge hang would serve it).
+        assert(!(psx_mod_read_word(p+0x224)&4) && json().find("\"queued\":true,\"weapon\":5,")!=std::string::npos);
+        assert(ttk::mantle_fire_cross_masked());
+        // The brief hang between the climbs of a platform, W held: still climbing.
+        psx_mod_write_byte(p+0x22c,6);psx_mod_write_half(p+0x60,149);psx_mod_write_half(p+0x74,149);
+        ttk::input.held[ttk::move_forward]=true;ttk::input.held[ttk::fire]=true;update();
+        assert(!(psx_mod_read_word(p+0x224)&4) && psx_mod_read_byte(p+0x3ba)==5); // no hang draw with W held
+        ttk::input.held[ttk::move_forward]=false;ttk::input.held[ttk::fire]=false;
+        // The pull-up: the request (served by the original on the ground), the 2x landing draw.
+        psx_mod_write_byte(p+0x22c,8);psx_mod_write_half(p+0x60,140);psx_mod_write_half(p+0x74,140);update();
+        assert((psx_mod_read_word(p+0x224)&4) && psx_mod_read_byte(p+0x3ba)==5 && json().find("\"requests\":1,")!=std::string::npos);
+        assert(json().find("\"boost\":true")!=std::string::npos && ttk::mantle_fire_cross_masked());
+        psx_mod_write_byte(p+0x22c,0);psx_mod_write_half(p+0x60,72);psx_mod_write_half(p+0x74,72);
+        {
+            CPUState draw{};draw.gpr[29]=0x801ffeb0;draw.gpr[31]=0x8005a5a8;
+            draw.gpr[4]=p+0x74;draw.gpr[5]=p;draw.gpr[6]=0x801fff00-0x2e;draw.gpr[7]=1;
+            psx_mod_write_word(p+0x224,0);psx_mod_write_half(p+0x74,6);
+            ttk::input.sequence+=1;update();psx_mod_write_half(0x801fff00-0x2e,100);
+            hooks().at(0x80059db0)(&draw,0x80059db0);assert(psx_mod_read_half(0x801fff00-0x2e)==200);
+        }
+        psx_mod_write_byte(p+0x3b8,2);psx_mod_write_half(p+0x74,21);update();
+        assert(!ttk::mantle_fire_cross_masked() && json().find("\"boost\":true")!=std::string::npos); // drawing
+        psx_mod_write_half(p+0x74,5);update();assert(json().find("\"boost\":false")!=std::string::npos);
+        // A height mantle is served on the ground.
+        psx_mod_write_byte(p+0x3b8,0);psx_mod_write_byte(p+0x22c,8);psx_mod_write_half(p+0x60,136);psx_mod_write_half(p+0x74,136);
+        ttk::input.held[ttk::fire]=true;update();ttk::input.held[ttk::fire]=false;assert(!(psx_mod_read_word(p+0x224)&4));
+        psx_mod_write_byte(p+0x22c,0);psx_mod_write_half(p+0x60,63);psx_mod_write_half(p+0x74,63);update();
+        assert((psx_mod_read_word(p+0x224)&4) && json().find("\"requests\":2,")!=std::string::npos);
+        psx_mod_write_word(p+0x224,0);psx_mod_write_byte(p+0x3b8,2);psx_mod_write_half(p+0x74,5);update();
+        // Refusals: no usable weapon, already armed, Vanilla; a fall or the
+        // holster drops the queue.
+        psx_mod_write_byte(p+0x22c,8);psx_mod_write_half(p+0x60,139);psx_mod_write_half(p+0x74,139);
+        ttk::input.held[ttk::fire]=true;update();assert(json().find("\"queues\":2,")!=std::string::npos); // armed
+        psx_mod_write_byte(p+0x3b8,0);psx_mod_write_byte(p+0x3ba,0);update();assert(json().find("\"queues\":2,")!=std::string::npos);
+        psx_mod_write_byte(p+0x3ba,5);ttk::modern=false;update();ttk::modern=true;assert(json().find("\"queues\":2,")!=std::string::npos);
+        update();ttk::input.held[ttk::fire]=false;assert(json().find("\"queues\":3,")!=std::string::npos);
+        psx_mod_write_byte(p+0x22c,9);psx_mod_write_half(p+0x60,107);update();
+        assert(!(psx_mod_read_word(p+0x224)&4) && json().find("\"drops\":1,")!=std::string::npos);
+        psx_mod_write_byte(p+0x22c,8);psx_mod_write_half(p+0x60,139);ttk::input.held[ttk::fire]=true;update();ttk::input.held[ttk::fire]=false;
+        ttk::input.held[ttk::holster]=true;psx_mod_write_byte(p+0x22c,0);psx_mod_write_half(p+0x60,72);update();ttk::input.held[ttk::holster]=false;
+        assert(!(psx_mod_read_word(p+0x224)&4) && json().find("\"drops\":2,")!=std::string::npos);
+        // Pull-up: lower and upper 1.6x, once per update; other clips, modes and Vanilla unchanged.
+        CPUState lower{};lower.gpr[29]=0x801ffeb0;lower.gpr[31]=0x8005a3d4;
+        lower.gpr[4]=p+0x60;lower.gpr[5]=p;lower.gpr[6]=0x801fff00-0x30;lower.gpr[7]=0;
+        CPUState upper{};upper.gpr[29]=0x801ffeb0;upper.gpr[31]=0x8005a5a8;
+        upper.gpr[4]=p+0x74;upper.gpr[5]=p;upper.gpr[6]=0x801fff00-0x2e;upper.gpr[7]=1;
+        auto run=[&](CPUState& c,unsigned anim,unsigned mode){
+            psx_mod_write_byte(p+0x22c,mode);psx_mod_write_half(p+0x60,anim);psx_mod_write_half(p+0x74,anim);update();
+            psx_mod_write_half(c.gpr[6],100);hooks().at(0x80059db0)(&c,0x80059db0);return psx_mod_read_half(c.gpr[6]);};
+        assert(run(lower,140,8)==160);
+        hooks().at(0x80059db0)(&lower,0x80059db0);assert(psx_mod_read_half(lower.gpr[6])==160);
+        assert(run(upper,140,8)==160);
+        // D36H10: the left arm and chest channels (2, 3) keep the same clock,
+        // or the frame-offset sync snaps them between frames (vibrating arms).
+        CPUState arm{};arm.gpr[29]=0x801ffeb0;arm.gpr[31]=0x8005a75c;
+        arm.gpr[4]=p+0x88;arm.gpr[5]=p;arm.gpr[6]=0x801fff00-0x2c;arm.gpr[7]=2;
+        CPUState chest{};chest.gpr[29]=0x801ffeb0;chest.gpr[31]=0x8005a7bc;
+        chest.gpr[4]=p+0x9c;chest.gpr[5]=p;chest.gpr[6]=0x801fff00-0x2a;chest.gpr[7]=3;
+        auto run_channel=[&](CPUState& c,unsigned anim){
+            psx_mod_write_byte(p+0x22c,8);psx_mod_write_half(p+0x60,140);psx_mod_write_half(c.gpr[4],anim);update();
+            psx_mod_write_half(c.gpr[6],100);hooks().at(0x80059db0)(&c,0x80059db0);
+            const unsigned once=psx_mod_read_half(c.gpr[6]);
+            hooks().at(0x80059db0)(&c,0x80059db0);assert(psx_mod_read_half(c.gpr[6])==once);
+            return once;};
+        assert(run_channel(arm,140)==160 && run_channel(chest,140)==160);
+        assert(run_channel(arm,5)==100 && run_channel(chest,5)==100);   // armed: the channel plays its own clip
+        chest.gpr[31]=0x8005a75c;assert(run_channel(chest,140)==100);chest.gpr[31]=0x8005a7bc;
+        ttk::modern=false;assert(run_channel(arm,140)==100);ttk::modern=true;
+        assert(run(lower,139,8)==100 && run(lower,140,0)==100 && run(lower,149,6)==100);
+        ttk::modern=false;assert(run(lower,140,8)==100);ttk::modern=true;
+        assert(json().find("\"pullup_boosts\":1,")!=std::string::npos);
+        psx_mod_write_byte(p+0x22c,0);psx_mod_write_byte(p+0x22d,0);psx_mod_write_half(p+0x60,63);
+        psx_mod_write_byte(p+0x3b8,2);psx_mod_write_byte(p+0x3b9,4);psx_mod_write_half(p+0x74,5);psx_mod_write_word(p+0x224,0);
+        psx_mod_write_half(p+0x2c6+4*4,sidearm_ammo);psx_mod_write_half(p+0x2c4+4*4,sidearm_owned);
+        psx_mod_write_half(p+0x2c6+4*5,shotgun_ammo);psx_mod_write_half(p+0x2c4+4*5,shotgun_owned);
+        ++ttk::input.sequence;call(0x8003ade4,c,p,0x80025ee8);
+        std::puts("PASS: D08J7B mantle fire queue, landing draw request and 2x draw, refusals, pull-up 1.6x on all four channels (D36H10) and Vanilla");
+    }
+    {
+        // D08J8: held fire inside a climb over a lip draws the sidearm at once
+        // (mantles, pull-up, water exit, ladder/chain/wall tops), swapping the
+        // selection; the mantles with table bit 0x2000 get their fire track
+        // from the host. D08J9: doors (E, the weapon through the kick).
+        auto update=[&]{call(0x8005a210,p,0x800c2754,0x80041b34,0x801fff00);};
+        auto json=[]{return std::string(ttk::controls_debug_json());};
+        auto has=[&](const char* t){return json().find(t)!=std::string::npos;};
+        const uint16_t sidearm_ammo=psx_mod_read_half(p+0x2c6+4*4),sidearm_owned=psx_mod_read_half(p+0x2c4+4*4);
+        psx_mod_write_half(p+0x2c4+4*4,sidearm_owned|1);psx_mod_write_half(p+0x2c6+4*4,20);
+        auto climb=[&](unsigned clip,unsigned mode){
+            psx_mod_write_byte(p+0x22c,mode);psx_mod_write_byte(p+0x22d,0);psx_mod_write_half(p+0x60,clip);psx_mod_write_half(p+0x74,clip);
+            psx_mod_write_byte(p+0x3b8,0);psx_mod_write_byte(p+0x3ba,4);psx_mod_write_word(p+0x224,0);};
+        unsigned draws=0;
+        for(unsigned clip:{134u,137u,139u,140u,142u,190u,196u,206u}) {
+            climb(clip,8);update();assert(psx_mod_read_byte(p+0x3b8)==0);   // no fire, no draw
+            ttk::input.held[ttk::fire]=true;
+            assert(ttk::mantle_fire_cross_masked());                         // no unarmed Cross before the draw
+            update();ttk::input.held[ttk::fire]=false;++draws;
+            assert(psx_mod_read_byte(p+0x3b8)==2 && psx_mod_read_byte(p+0x3b9)==4 && psx_mod_read_byte(p+0x3ba)==4 &&
+                   psx_mod_read_half(p+0x74)==6 && !(psx_mod_read_word(p+0x224)&4));
+            // Cross stays masked in the mantles the host fires in (table bit 0x2000).
+            const bool owned=(psx_mod_read_word(0x800c2824+4*clip)&0x2000)!=0;
+            assert(ttk::climb_shot_ready() && has("\"queued\":false") && ttk::mantle_fire_cross_masked()==owned);
+            char want[32];std::snprintf(want,sizeof want,"\"draws\":%u,",draws);assert(has(want));
+        }
+        // D08Y step-up mantles also run in mode 0; E held from the grab does not hold the draw back.
+        climb(135,0);ttk::input.held[ttk::fire]=ttk::input.held[ttk::interact]=true;update();
+        ttk::input.held[ttk::fire]=ttk::input.held[ttk::interact]=false;assert(psx_mod_read_byte(p+0x3b8)==2);++draws;
+        // Refusals: the holster, no sidearm ammo, other clips and modes, Vanilla.
+        climb(137,8);ttk::input.held[ttk::fire]=ttk::input.held[ttk::holster]=true;update();
+        ttk::input.held[ttk::holster]=false;assert(psx_mod_read_byte(p+0x3b8)==0);
+        psx_mod_write_half(p+0x2c6+4*4,0);update();assert(psx_mod_read_byte(p+0x3b8)==0 && !ttk::mantle_fire_cross_masked());
+        psx_mod_write_half(p+0x2c6+4*4,20);
+        climb(140,0);update();assert(psx_mod_read_byte(p+0x3b8)==0);
+        climb(149,6);update();assert(psx_mod_read_byte(p+0x3b8)==0 || psx_mod_read_half(p+0x60)==149);
+        climb(191,8);update();assert(psx_mod_read_byte(p+0x3b8)==0);
+        climb(137,8);ttk::modern=false;update();ttk::modern=true;assert(psx_mod_read_byte(p+0x3b8)==0);
+        ttk::input.held[ttk::fire]=false;
+        // Swap: another selected weapon is kept for SIDEARM RETURN.
+        climb(142,8);psx_mod_write_byte(p+0x3ba,5);ttk::input.held[ttk::fire]=true;update();ttk::input.held[ttk::fire]=false;
+        assert(psx_mod_read_byte(p+0x3ba)==4 && has("\"swap_from\":5,") && has("\"swaps\":1,"));
+        // The draw runs 4x on the upper track.
+        {
+            CPUState up{};up.gpr[29]=0x801ffeb0;up.gpr[31]=0x8005a5a8;up.gpr[4]=p+0x74;up.gpr[5]=p;up.gpr[6]=0x801fff00-0x2e;up.gpr[7]=1;
+            ttk::input.sequence+=1;update();psx_mod_write_half(up.gpr[6],10);hooks().at(0x80059db0)(&up,0x80059db0);
+            assert(psx_mod_read_half(up.gpr[6])==40);
+            // Mantle fire: in 137 (bit 0x2000), sidearm out, the host owns the fire
+            // (Cross masked); with fire held the one-arm fire track 11 is put on
+            // the gun arm and left to loop; 142 (no bit) stays the original's.
+            const uint32_t flags137=psx_mod_read_word(0x800c2824+4*137);
+            psx_mod_write_word(0x800c2824+4*137,flags137|0x2000);
+            climb(137,8);psx_mod_write_byte(p+0x3b8,2);psx_mod_write_byte(p+0x3b9,4);psx_mod_write_half(p+0x74,5);
+            assert(ttk::mantle_fire_cross_masked());
+            ttk::input.held[ttk::fire]=true;
+            auto drive=[&](unsigned track){psx_mod_write_half(p+0x74,track);ttk::input.sequence+=1;update();
+                psx_mod_write_half(up.gpr[6],12);hooks().at(0x80059db0)(&up,0x80059db0);return psx_mod_read_half(p+0x74);};
+            assert(drive(5)==11 && psx_mod_read_half(p+0x7c)==0 && has("\"driving\":true,\"starts\":1,"));
+            assert(drive(11)==11 && has("\"starts\":1,"));        // looping: left alone
+            assert(drive(8)==11 && has("\"starts\":2,"));
+            assert(drive(17)==17 && drive(6)==6);                     // reload and draw run
+            ttk::input.held[ttk::fire]=false;assert(drive(5)==5 && has("\"driving\":false"));
+            ttk::input.held[ttk::fire]=true;
+            psx_mod_write_word(0x800c2824+4*137,flags137&~0x2000u);
+            assert(drive(5)==5 && !ttk::mantle_fire_cross_masked());
+            climb(142,8);psx_mod_write_byte(p+0x3b8,2);psx_mod_write_byte(p+0x3b9,4);
+            assert(drive(10)==10 && !ttk::mantle_fire_cross_masked());
+            ttk::input.held[ttk::fire]=false;
+            psx_mod_write_word(0x800c2824+4*137,flags137);
+        }
+        // D08J9 doors: E asks the game's finder and makes the original Action
+        // press with a fresh Cross for that call only; through an armed door use
+        // the weapon's gates (0x40, 116's table bit 0x20000) are open for the
+        // runner alone, and the fire request is made without the kick; left
+        // click at a door is a shot. Holstered, non-door and Vanilla stay native.
+        {
+            const uint32_t object=0x801b0800,other=0x801b0900,types=0x801b2000,saved_types=psx_mod_read_word(0x800d2660);
+            const uint32_t pad_slot=0x800d1b50+4*psx_mod_read_byte(p+0x233),pad=0x801b3000,saved_slot=psx_mod_read_word(pad_slot);
+            const uint32_t kick=0x800c2824+4*116,saved_kick=psx_mod_read_word(kick);
+            const uint32_t t15=0x800c2824+4*15,t5=0x800c2824+4*5,saved15=psx_mod_read_word(t15),saved5=psx_mod_read_word(t5);
+            psx_mod_write_word(0x800d2660,types);psx_mod_write_word(pad_slot,pad);psx_mod_write_word(kick,0x22441);
+            psx_mod_write_word(t15,0x809);psx_mod_write_word(t5,0x200c);
+            unsigned door_kind=0;
+            for(unsigned k=2;k<19;++k)if(psx_mod_read_word(0x80015850+4*(k-2))==0x800515e0u){door_kind=k;break;}
+            assert(door_kind==5);
+            const uint8_t saved233=psx_mod_read_byte(types+28*233+4),saved234=psx_mod_read_byte(types+28*234+4);
+            psx_mod_write_byte(types+28*233+4,door_kind);psx_mod_write_half(object+0x2c,233);
+            psx_mod_write_byte(types+28*234+4,6);psx_mod_write_half(other+0x2c,234);
+            auto idle=[&](unsigned equipment){
+                psx_mod_write_byte(p+0x22c,0);psx_mod_write_byte(p+0x22d,0);psx_mod_write_half(p+0x60,63);psx_mod_write_half(p+0x74,5);
+                psx_mod_write_byte(p+0x3b8,equipment);psx_mod_write_byte(p+0x3b9,4);psx_mod_write_byte(p+0x27d,0);psx_mod_write_byte(p+0x27c,0);
+                psx_mod_write_word(p+0x224,0);psx_mod_write_word(p+0x290,0);psx_mod_write_word(p+0x174,0);psx_mod_write_word(pad,2);};
+            // E at a door, armed: one finder call, one press with a fresh Cross,
+            // the pad word put back, a door use started, the answer 2.
+            door_finder_object=object;idle(2);
+            assert(ttk::door_use_ready());ttk::door_use_request();assert(ttk::door_use_state()==1);
+            ttk::input.sequence+=1;update();
+            assert(door_finds==1 && door_presses==1 && door_press_word==1 && psx_mod_read_word(pad)==2);
+            assert(ttk::door_use_state()==2 && psx_mod_read_byte(p+0x27d)==1 && psx_mod_read_word(p+0x290)==object);
+            // The use started this update: the weapon's window is already open.
+            assert(host_calls_open==1 && !(psx_mod_read_word(p+0x224)&0x40));
+            call(0x80058120,p,0,0x80041c44,0x801fff00);assert(!host_calls_open && (psx_mod_read_word(p+0x224)&0x40));
+            ttk::door_use_end();assert(ttk::door_use_state()==0 && !ttk::door_use_ready());   // a use is running
+            // No door in front: no press, the contact put back, the answer 3.
+            door_finder_object=other;idle(2);psx_mod_write_word(p+0x174,0x1111);
+            ttk::door_use_request();ttk::input.sequence+=1;update();
+            assert(door_presses==1 && ttk::door_use_state()==3 && psx_mod_read_word(p+0x174)==0x1111 && psx_mod_read_byte(p+0x27d)==0);
+            ttk::door_use_end();
+            // The door refuses (facing, its own answer): the answer 3.
+            door_finder_object=object;door_press_accept=false;idle(2);
+            ttk::door_use_request();ttk::input.sequence+=1;update();
+            assert(door_presses==2 && ttk::door_use_state()==3 && psx_mod_read_byte(p+0x27d)==0);
+            ttk::door_use_end();door_press_accept=true;
+            // Holstered, a committed action, airborne or Vanilla: E stays original.
+            idle(0);assert(!ttk::door_use_ready());
+            idle(2);psx_mod_write_word(p+0x224,0x40);assert(!ttk::door_use_ready());
+            idle(2);psx_mod_write_byte(p+0x22c,1);assert(!ttk::door_use_ready());
+            idle(2);ttk::modern=false;assert(!ttk::door_use_ready());ttk::modern=true;
+            // Armed kick 116 (stage 5): the runner sees 0x40 clear and 116 without
+            // 0x20000, under a host call (no savestate); the fire request's entry
+            // puts both back.
+            auto kicking=[&](unsigned equipment){
+                idle(equipment);psx_mod_write_half(p+0x60,116);psx_mod_write_byte(p+0x27d,5);
+                psx_mod_write_word(p+0x224,0x40);psx_mod_write_word(p+0x290,object);};
+            kicking(2);ttk::input.sequence+=1;update();
+            assert(!(psx_mod_read_word(p+0x224)&0x40) && psx_mod_read_word(kick)==(0x22441u&~0x20000u) && host_calls_open==1);
+            assert(ttk::climb_shot_ready() && !ttk::mantle_fire_cross_masked());
+            call(0x80058120,p,0,0x80041c44,0x801fff00);
+            assert((psx_mod_read_word(p+0x224)&0x40) && psx_mod_read_word(kick)==0x22441 && !host_calls_open);
+            // A missed fire request closes at the next runner entry (and reopens).
+            ttk::input.sequence+=1;update();assert(host_calls_open==1);ttk::input.sequence+=1;update();assert(host_calls_open==1);
+            call(0x80058120,p,0,0x80041c44,0x801fff00);assert(!host_calls_open && psx_mod_read_word(kick)==0x22441);
+            // The fire request without the kick: Cross held and a firing-capable
+            // upper (15: bit 8, no 0x2000) set 0x100; the idle 5 (0x2000) or no
+            // Cross does not.
+            kicking(2);psx_mod_write_half(p+0x74,15);psx_mod_write_word(pad,3);
+            ttk::input.sequence+=1;update();assert(psx_mod_read_word(p+0x224)&0x100);
+            call(0x80058120,p,0,0x80041c44,0x801fff00);
+            kicking(2);psx_mod_write_word(pad,3);ttk::input.sequence+=1;update();assert(!(psx_mod_read_word(p+0x224)&0x100));
+            call(0x80058120,p,0,0x80041c44,0x801fff00);
+            kicking(2);psx_mod_write_half(p+0x74,15);ttk::input.sequence+=1;update();assert(!(psx_mod_read_word(p+0x224)&0x100));
+            call(0x80058120,p,0,0x80041c44,0x801fff00);
+            // Holstered, a non-door use and Vanilla: nothing is lent.
+            kicking(0);ttk::input.sequence+=1;update();assert((psx_mod_read_word(p+0x224)&0x40) && !host_calls_open && psx_mod_read_word(kick)==0x22441);
+            kicking(2);psx_mod_write_word(p+0x290,other);ttk::input.sequence+=1;update();assert((psx_mod_read_word(p+0x224)&0x40) && !host_calls_open);
+            kicking(2);ttk::modern=false;ttk::input.sequence+=1;update();ttk::modern=true;assert((psx_mod_read_word(p+0x224)&0x40) && !host_calls_open);
+            // Left click at a door, armed: the press sees Cross held since the last
+            // tick; elsewhere, holstered or with Cross not fresh it is untouched.
+            CPUState press{};press.gpr[29]=0x801ffeb0;press.gpr[31]=0x800467fc;press.gpr[4]=p;
+            door_finder_object=object;idle(2);psx_mod_write_word(pad,1);psx_mod_write_word(p+0x174,0x2222);
+            hooks().at(0x80051890)(&press,0x80051890);assert(psx_mod_read_word(pad)==3 && psx_mod_read_word(p+0x174)==0x2222 && !host_calls_open);
+            door_finder_object=other;idle(2);psx_mod_write_word(pad,1);hooks().at(0x80051890)(&press,0x80051890);assert(psx_mod_read_word(pad)==1);
+            door_finder_object=object;idle(0);psx_mod_write_word(pad,1);hooks().at(0x80051890)(&press,0x80051890);assert(psx_mod_read_word(pad)==1);
+            idle(2);psx_mod_write_word(pad,3);hooks().at(0x80051890)(&press,0x80051890);assert(psx_mod_read_word(pad)==3);
+            idle(2);psx_mod_write_word(pad,1);ttk::modern=false;hooks().at(0x80051890)(&press,0x80051890);ttk::modern=true;assert(psx_mod_read_word(pad)==1);
+            assert(has("\"door\":{\"request\":0,\"requests\":3,\"uses\":1,\"misses\":1,\"refusals\":1,"));
+            assert(has("\"clicks\":1,"));
+            psx_mod_write_byte(types+28*233+4,saved233);psx_mod_write_byte(types+28*234+4,saved234);
+            psx_mod_write_word(0x800d2660,saved_types);psx_mod_write_word(pad_slot,saved_slot);psx_mod_write_word(kick,saved_kick);
+            psx_mod_write_word(t15,saved15);psx_mod_write_word(t5,saved5);
+            psx_mod_write_word(p+0x174,0);psx_mod_write_word(p+0x290,0);psx_mod_write_byte(p+0x27d,0);psx_mod_write_byte(p+0x27c,0);
+        }
+        psx_mod_write_byte(p+0x22c,0);psx_mod_write_byte(p+0x22d,0);psx_mod_write_half(p+0x60,63);
+        psx_mod_write_byte(p+0x3b8,2);psx_mod_write_byte(p+0x3b9,4);psx_mod_write_byte(p+0x3ba,4);psx_mod_write_half(p+0x74,5);psx_mod_write_word(p+0x224,0);
+        psx_mod_write_half(p+0x2c6+4*4,sidearm_ammo);psx_mod_write_half(p+0x2c4+4*4,sidearm_owned);
+        ++ttk::input.sequence;call(0x8003ade4,c,p,0x80025ee8);
+        std::puts("PASS: D08J8 traversal sidearm draw (mantles, pull-up, water exit, ladder/chain/wall tops), swap, refusals, mantle fire track, D08J9 doors (E use, weapon through the kick, left click) and Vanilla");
+    }
+    {
+        // D08J7C: W in a ledge hang with the sidearm out pulls up one-handed.
+        // The hang pose takes the upper track for one update (the original
+        // pull-up check refuses a weapon pose), then the sidearm block comes
+        // back over the pull-up 140. Only the handoff update masks Cross; the
+        // whole pull-up then takes view-adapted shots (revision 3). Back on the ground the
+        // swapped weapon returns 0.75 s off the trigger; a weapon choice cancels it.
+        auto update=[&]{call(0x8005a210,p,0x800c2754,0x80041b34,0x801fff00);};
+        auto json=[]{return std::string(ttk::controls_debug_json());};
+        auto select=[&]{++ttk::input.command_serial;call(0x80058120,p,0,0x80041c44,0x801ff000);};
+        const uint16_t sidearm_ammo=psx_mod_read_half(p+0x2c6+4*4),sidearm_owned=psx_mod_read_half(p+0x2c4+4*4);
+        psx_mod_write_half(p+0x2c4+4*4,sidearm_owned|1);psx_mod_write_half(p+0x2c6+4*4,20);
+        auto hang_draw=[&]{
+            psx_mod_write_byte(p+0x22c,6);psx_mod_write_byte(p+0x22d,6);psx_mod_write_half(p+0x60,149);psx_mod_write_half(p+0x74,149);
+            psx_mod_write_byte(p+0x3b8,0);psx_mod_write_byte(p+0x3b9,4);psx_mod_write_byte(p+0x3ba,5);psx_mod_write_word(p+0x224,0);
+            ++ttk::input.sequence;call(0x8003ade4,c,p,0x80025ee8);
+            ttk::input.held[ttk::fire]=true;update();ttk::input.held[ttk::fire]=false;
+            assert(psx_mod_read_byte(p+0x3ba)==4 && json().find("\"swap_from\":5,")!=std::string::npos);
+            psx_mod_write_word(p+0x224,0);psx_mod_write_byte(p+0x3b8,2);psx_mod_write_half(p+0x74,5);
+        };
+        hang_draw();
+        // Input: Up while W is held, any sidearm pose; never another weapon, holstered or Vanilla.
+        assert(ttk::hang_pullup_input_ready(true) && !ttk::hang_pullup_input_ready(false));
+        psx_mod_write_byte(p+0x3b9,5);assert(!ttk::hang_pullup_input_ready(true));psx_mod_write_byte(p+0x3b9,4);
+        psx_mod_write_byte(p+0x3b8,0);assert(!ttk::hang_pullup_input_ready(true));psx_mod_write_byte(p+0x3b8,2);
+        ttk::modern=false;assert(!ttk::hang_pullup_input_ready(true));ttk::modern=true;
+        // The handoff waits for a sidearm pose (not a draw/stow) and no request; holster/E refuse it.
+        ttk::input.held[ttk::move_forward]=true;ttk::input.held[ttk::fire]=true;
+        psx_mod_write_half(p+0x74,6);update();assert(psx_mod_read_half(p+0x74)==6);
+        psx_mod_write_half(p+0x74,5);psx_mod_write_word(p+0x224,4);update();assert(psx_mod_read_half(p+0x74)==5);psx_mod_write_word(p+0x224,0);
+        for(unsigned blocked : {(unsigned)ttk::holster,(unsigned)ttk::interact,(unsigned)ttk::move_back}) {
+            ttk::input.held[blocked]=true;update();assert(psx_mod_read_half(p+0x74)==5);ttk::input.held[blocked]=false;
+        }
+        psx_mod_write_half(p+0x74,10); // mid-shot: still one-handed
+        uint32_t block[5];for(unsigned i=0;i<5;++i)block[i]=psx_mod_read_word(p+0x74+4*i);
+        update();
+        assert(psx_mod_read_half(p+0x74)==149 && psx_mod_read_half(p+0x7c)==0 && ttk::hang_pullup_handoff() && ttk::armed_pullup_fire_masked());
+        const std::string drops_before=json().substr(json().find("\"hang_drops\":"),16);
+        assert(json().find("\"armed_pullups\":1,")!=std::string::npos);
+        // The original started the pull-up: the sidearm block comes back over 140.
+        psx_mod_write_byte(p+0x22c,8);psx_mod_write_byte(p+0x22d,6);psx_mod_write_half(p+0x60,140);psx_mod_write_half(p+0x66,1479);
+        psx_mod_write_half(p+0x74,140);update();
+        for(unsigned i=0;i<5;++i)assert(psx_mod_read_word(p+0x74+4*i)==block[i]);
+        assert(json().find("\"armed_pullup\":true,")!=std::string::npos && json().find("\"armed_pullup_restores\":1,")!=std::string::npos);
+        assert(json().substr(json().find("\"hang_drops\":"),16)==drops_before); // not a drop
+        psx_mod_write_byte(p+0x22d,8);
+        // Every pull-up frame, chest below the lip or not: no mask, view shots.
+        for(unsigned frame : {1479u,1482u,1484u,1485u,1488u}) {
+            psx_mod_write_half(p+0x66,frame);assert(!ttk::armed_pullup_fire_masked() && ttk::climb_shot_ready());
+        }
+        ttk::modern=false;assert(!ttk::armed_pullup_fire_masked() && !ttk::climb_shot_ready());ttk::modern=true;
+        psx_mod_write_byte(p+0x3b8,0);assert(!ttk::climb_shot_ready());psx_mod_write_byte(p+0x3b8,2);
+        // Landed: the pull-up is over; its shots and mask with it.
+        ttk::input.held[ttk::move_forward]=false;
+        psx_mod_write_byte(p+0x22c,0);psx_mod_write_byte(p+0x22d,0);psx_mod_write_half(p+0x60,72);psx_mod_write_half(p+0x74,5);update();
+        assert(json().find("\"armed_pullup\":false,")!=std::string::npos && !ttk::armed_pullup_fire_masked());
+        // D08J8: an armed sidearm in a pull-up is shot-ready by the traversal rule.
+        psx_mod_write_byte(p+0x22c,8);psx_mod_write_half(p+0x60,140);psx_mod_write_half(p+0x66,1486);assert(ttk::climb_shot_ready());
+        // Return: kept while fire is held and for 0.75 s after it.
+        psx_mod_write_byte(p+0x22c,0);psx_mod_write_half(p+0x60,63);psx_mod_write_word(p+0x224,0);
+        ++ttk::input.sequence;call(0x8003ade4,c,p,0x80025ee8);assert(ttk::movement_ready());
+        select();assert(psx_mod_read_byte(p+0x3ba)==4); // fire still held
+        ttk::input.held[ttk::fire]=false;
+        ttk::clock_ms+=500;select();assert(psx_mod_read_byte(p+0x3ba)==4 && !(psx_mod_read_word(p+0x224)&4));
+        assert(json().find("\"return_waits\":1,")!=std::string::npos);
+        ttk::input.held[ttk::fire]=true;select();ttk::input.held[ttk::fire]=false; // a tap restarts the pause
+        ttk::clock_ms+=500;select();assert(psx_mod_read_byte(p+0x3ba)==4);
+        ttk::clock_ms+=300;select();
+        assert(psx_mod_read_byte(p+0x3ba)==5 && (psx_mod_read_word(p+0x224)&4) && json().find("\"swap_from\":-1,")!=std::string::npos);
+        // Refused by the original (still hanging): the block comes back, no pull-up tracked.
+        hang_draw();ttk::input.held[ttk::move_forward]=true;update();assert(psx_mod_read_half(p+0x74)==149);
+        ttk::input.held[ttk::move_forward]=false;update();
+        assert(psx_mod_read_half(p+0x74)==5 && json().find("\"armed_pullup\":false,")!=std::string::npos && !ttk::armed_pullup_fire_masked());
+        // A weapon choice cancels the pending return (D08J7A armed drop here).
+        psx_mod_write_byte(p+0x22c,0);psx_mod_write_byte(p+0x22d,0);psx_mod_write_half(p+0x60,63);psx_mod_write_word(p+0x224,0);
+        ++ttk::input.sequence;call(0x8003ade4,c,p,0x80025ee8);
+        ttk::input.commands[0]=ttk::weapon_group_3;ttk::input.command_count=1;select();ttk::input.command_count=0;
+        assert(json().find("\"swap_from\":-1,")!=std::string::npos && json().find("\"return_cancels\":1,")!=std::string::npos);
+        psx_mod_write_word(p+0x224,0);
+        ttk::clock_ms+=1000;select();assert(!(psx_mod_read_word(p+0x224)&4));
+        // OPTIONS > SIDEARM RETURN NEVER (the default, unset here): the sidearm
+        // stays, the swap is forgotten.
+        ttk_live_env_set("DNTTK_SIDEARM_RETURN",nullptr);
+        hang_draw();
+        psx_mod_write_byte(p+0x22c,0);psx_mod_write_byte(p+0x22d,0);psx_mod_write_half(p+0x60,63);psx_mod_write_word(p+0x224,0);
+        ++ttk::input.sequence;call(0x8003ade4,c,p,0x80025ee8);
+        ttk::clock_ms+=1000;select();
+        assert(psx_mod_read_byte(p+0x3ba)==4 && !(psx_mod_read_word(p+0x224)&4) && json().find("\"swap_from\":-1,")!=std::string::npos);
+        ttk_live_env_set("DNTTK_SIDEARM_RETURN","auto");
+        psx_mod_write_byte(p+0x22c,0);psx_mod_write_byte(p+0x22d,0);psx_mod_write_half(p+0x60,63);
+        psx_mod_write_byte(p+0x3b8,2);psx_mod_write_byte(p+0x3b9,4);psx_mod_write_half(p+0x74,5);psx_mod_write_word(p+0x224,0);
+        psx_mod_write_byte(p+0x3ba,4);
+        psx_mod_write_half(p+0x2c6+4*4,sidearm_ammo);psx_mod_write_half(p+0x2c4+4*4,sidearm_owned);
+        ++ttk::input.sequence;call(0x8003ade4,c,p,0x80025ee8);
+        std::puts("PASS: D08J7C armed one-handed pull-up handoff, handoff-only fire mask and view shots throughout, sidearm return timer, choice cancel, SIDEARM RETURN NEVER default and Vanilla");
+    }
+    {
+        // D08J6B: the hang-and-aim pose. Sidearm out on a mode 3 climb under
+        // view aiming: the chest turns toward the view within 50 degrees, the
+        // off-hand arm is solved back onto its climb-clip contact (shoulder
+        // swing, elbow bend, hand grip kept), the head turns, and while the
+        // original aims the head look-at and the one-arm aim (+0x124, lent for
+        // the gun shoulder only) take the clamped view direction.
+        const uint32_t attached=psx_mod_read_word(p+0x17c),old_model=psx_mod_read_word(p+0x40);
+        const uint16_t heading=psx_mod_read_half(p+0x1c),view[3]={psx_mod_read_half(c+12),psx_mod_read_half(c+14),psx_mod_read_half(c+16)};
+        setenv("DNTTK_WEAPON_AIM","view",1);setenv("DNTTK_CAMERA_MODE","independent",1);
+        // A 19-joint model: pelvis, chest (part 9, depth 2), left arm 0x0a-0x0c
+        // (depth 3-5), right arm 0x0d-0x0f, head (part 0x10, depth 3).
+        constexpr uint32_t model=0x801e9000;
+        const unsigned parts[19]={0,9,0x0a,0x0b,0x0c,0x0d,0x0e,0x0f,0x14,0x10,1,2,3,4,5,6,7,8,0x11};
+        const unsigned depth[19]={1,2,3,4,5,3,4,5,3,3,2,3,4,5,2,3,4,5,3};
+        for(uint32_t i=0;i<0x44+0x28*19;++i)psx_mod_write_byte(model+i,0);
+        psx_mod_write_byte(model,19);
+        for(unsigned j=0;j<19;++j) {
+            psx_mod_write_byte(model+0x24+parts[j],j);psx_mod_write_byte(model+0x44+0x28*j+1,parts[j]);
+            psx_mod_write_byte(model+0x44+0x28*j+2,depth[j]);
+        }
+        const int tf[3]={0,130,0},th[3]={0,0,128};
+        for(int i=0;i<3;++i) {
+            psx_mod_write_word(model+0x44+0x28*3+0x14+4*i,(uint32_t)tf[i]);
+            psx_mod_write_word(model+0x44+0x28*4+0x14+4*i,(uint32_t)th[i]);
+        }
+        psx_mod_write_word(p+0x40,model);
+        psx_mod_write_word(p+0x17c,0x801d9fe4);
+        psx_mod_write_byte(p+0x22c,3);psx_mod_write_byte(p+0x22d,3);
+        psx_mod_write_half(p+0x60,187);psx_mod_write_half(p+0x74,5);psx_mod_write_half(p+0x1c,0);
+        psx_mod_write_byte(p+0x3b8,2);psx_mod_write_byte(p+0x3b9,4);psx_mod_write_byte(p+0x3ba,4);psx_mod_write_word(p+0x224,0);
+        // View 90 degrees to Duke's right (+X; he faces +Z).
+        psx_mod_write_half(c+12,4096);psx_mod_write_half(c+14,0);psx_mod_write_half(c+16,0);
+        ++ttk::input.sequence;call(0x8003ade4,c,p,0x80025ee8);
+        assert(ttk::climb_weapon_ready() && ttk::climb_shot_ready());
+        auto json=[&](){return std::string(ttk::controls_debug_json());};
+        auto begin=[&](uint32_t ra=0x80042634){ttk::clock_ms+=200;call(0x800411b8,p,0,ra);};
+        // Real-time ramp: steps are capped at 100 ms, the ramp is 160 ms.
+        begin();begin();begin();
+        assert(json().find("\"climb_aim\":{\"set\":true,\"weight\":1.000,")!=std::string::npos);
+        assert(json().find("\"chest_yaw\":0.873,\"head_yaw\":1.222,\"dir\":[1.000,0.000,0.000]")!=std::string::npos);
+        // Matrices: row-major Q12, translation at +0x14.
+        using M=std::array<std::array<double,3>,3>;
+        auto put=[&](uint32_t a,const M& m,const double* t=nullptr) {
+            for(int i=0;i<3;++i)for(int j=0;j<3;++j)psx_mod_write_half(a+2*(3*i+j),(uint16_t)(int16_t)std::lround(m[i][j]*4096));
+            for(int i=0;i<3;++i)psx_mod_write_word(a+0x14+4*i,(uint32_t)(int32_t)std::lround(t?t[i]:0));
+        };
+        auto get=[&](uint32_t a){M m{};for(int i=0;i<3;++i)for(int j=0;j<3;++j)m[i][j]=(int16_t)psx_mod_read_half(a+2*(3*i+j))/4096.0;return m;};
+        auto mul=[](const M& a,const M& b){M m{};for(int i=0;i<3;++i)for(int j=0;j<3;++j)for(int k=0;k<3;++k)m[i][j]+=a[i][k]*b[k][j];return m;};
+        auto mv=[](const M& m,const double* v,double* o){for(int i=0;i<3;++i)o[i]=m[i][0]*v[0]+m[i][1]*v[1]+m[i][2]*v[2];};
+        const M id{{{1,0,0},{0,1,0},{0,0,1}}};
+        const double ce=std::cos(1.0),se=std::sin(1.0);
+        const M bend{{{1,0,0},{0,ce,-se},{0,se,ce}}}; // the clip's elbow
+        const double ts[3]={-100,-160,0};
+        auto compose=[&](unsigned joint,uint32_t parent,uint32_t local,uint32_t out,uint32_t ra=0x8009899c,uint32_t actor=0) {
+            if(!actor)actor=p;
+            CPUState cpu{};cpu.gpr[29]=0x801f0000;cpu.gpr[31]=ra;cpu.gpr[4]=parent;cpu.gpr[5]=local;cpu.gpr[6]=out;
+            cpu.gpr[ra==0x8009899c?16:17]=model+0x44+0x28*joint;cpu.gpr[21]=actor;
+            hooks().at(0x800b42ec)(&cpu,0x800b42ec);
+        };
+        constexpr uint32_t L=0x1f800300;
+        // One build: the chest turn, then the left arm (shoulder, forearm, hand).
+        auto build=[&](M& ws,M& wf,M& wh,double* hand) {
+            put(0x1f800020,id);put(L,id);compose(1,0x1f800020,L,0x1f800040);
+            const M chest=get(L);put(0x1f800040,chest);
+            put(L,id,ts);compose(2,0x1f800040,L,0x1f800060);
+            ws=mul(chest,get(L));double s[3];mv(chest,ts,s);put(0x1f800060,ws,s);
+            put(L,bend);for(int i=0;i<3;++i)psx_mod_write_word(L+0x14+4*i,(uint32_t)tf[i]);
+            compose(3,0x1f800060,L,0x1f800080);
+            wf=mul(ws,get(L));double e[3],d[3];mv(ws,(const double[]){0,130,0},d);for(int i=0;i<3;++i)e[i]=s[i]+d[i];
+            put(0x1f800080,wf,e);
+            put(L,id);compose(4,0x1f800080,L,0x1f8000a0);
+            wh=mul(wf,get(L));mv(wf,(const double[]){0,0,128},d);for(int i=0;i<3;++i)hand[i]=e[i]+d[i];
+        };
+        // The chest local is the 50 degree world turn.
+        M ws,wf,wh;double hand[3];
+        build(ws,wf,wh,hand);
+        {
+            put(0x1f800020,id);put(L,id);compose(1,0x1f800020,L,0x1f800040);const M chest=get(L);
+            assert(std::abs(chest[0][2]-std::sin(0.873))<.002 && std::abs(chest[2][0]+std::sin(0.873))<.002 && std::abs(chest[1][1]-1)<.002);
+        }
+        // Unturned reference: shoulder at ts, the hand at ts + tf + bend*th.
+        double ref[3];{double d[3];mv(bend,(const double[]){0,0,128},d);for(int i=0;i<3;++i)ref[i]=ts[i]+tf[i]+d[i];}
+        // First build had no cached forearm: the shoulder only keeps its orientation.
+        // Second build: the hand is back on its contact with its grip unchanged.
+        begin();build(ws,wf,wh,hand);
+        const double drift=std::hypot(hand[0]-ref[0],hand[1]-ref[1],hand[2]-ref[2]);
+        assert(drift<3 && json().find("\"ik_solves\":")!=std::string::npos);
+        const M wh0=bend;
+        for(int i=0;i<3;++i)for(int j=0;j<3;++j)assert(std::abs(wh[i][j]-wh0[i][j])<.01);
+        // Foreign actors, callers and joint shapes are untouched.
+        put(L,id);compose(1,0x1f800020,L,0x1f800040,0x8009899c,p+0x8a4);assert(get(L)[0][2]==0);
+        put(L,id);compose(1,0x1f800020,L,0x1f800040,0x80098998);assert(get(L)[0][2]==0);
+        put(L,id);compose(1,0x1f800000,L,0x1f800040);assert(get(L)[0][2]==0);
+        // Firing (aim bit, pose 11): +0x124 holds the clamped view for the gun
+        // shoulder only, back at the next joint's composition; the head's
+        // look-at takes the same direction.
+        for(int i=0;i<3;++i)psx_mod_write_word(p+0x124+4*i,(uint32_t)(i==2?4096:0));
+        psx_mod_write_word(p+0x224,0x100);psx_mod_write_half(p+0x74,11);begin();
+        assert((int32_t)psx_mod_read_word(p+0x124)==4096 && psx_mod_read_word(p+0x12c)==0 && json().find("\"lent\":true")!=std::string::npos);
+        put(L,id);compose(6,0x1f800060,L,0x1f800080,0x800980d0);
+        assert(psx_mod_read_word(p+0x124)==0 && (int32_t)psx_mod_read_word(p+0x12c)==4096 && json().find("\"lent\":false")!=std::string::npos);
+        {
+            CPUState look{};look.gpr[29]=0x801f0000;look.gpr[31]=0x80097f28;look.gpr[4]=0x1f800060;look.gpr[5]=p+0x124;look.gpr[18]=p;
+            hooks().at(0x80097a44)(&look,0x80097a44);
+            assert(look.gpr[5]!=p+0x124 && (int32_t)psx_mod_read_word(look.gpr[5])==4096 && psx_mod_read_word(look.gpr[5]+8)==0);
+        }
+        // A restore point before the forearm also gives +0x124 back.
+        begin();assert(json().find("\"lent\":true")!=std::string::npos);
+        call(0x8003ade4,c,p,0x80025ee8);assert((int32_t)psx_mod_read_word(p+0x12c)==4096 && json().find("\"lent\":false")!=std::string::npos);
+        // Behind Duke: the chest stops at 50 degrees, the gun arm at its arc.
+        psx_mod_write_word(p+0x224,0);psx_mod_write_half(p+0x74,5);
+        psx_mod_write_half(c+12,(uint16_t)-2896);psx_mod_write_half(c+16,(uint16_t)-2896);begin();
+        assert(json().find("\"chest_yaw\":-0.873,")!=std::string::npos);
+        psx_mod_write_half(c+12,4096);psx_mod_write_half(c+16,0);
+        // D08J6F: on the ladder a view 150 degrees right swings the root out
+        // about the off hand's contact (60 degrees past the 90 start, eased in
+        // real time); scratch root and stored entry 0 turn together, the hand
+        // stays on its hold. Nothing is refused: behind on the off-hand side
+        // he takes the nearer reach.
+        {
+            build(ws,wf,wh,hand);
+            assert(json().find("\"swing\":{\"family\":true,")!=std::string::npos && json().find("\"pivot\":true")!=std::string::npos);
+            psx_mod_write_half(c+12,2048);psx_mod_write_half(c+16,(uint16_t)-3547);
+            for(int k=0;k<4;++k)begin();
+            assert(json().find("\"angle\":1.047,\"target\":1.047,\"applied\":1.047,\"miss\":0.000")!=std::string::npos);
+            const uint32_t old_entry=psx_mod_read_word(p+0x3c);constexpr uint32_t entry=0x801ea000;
+            const double t0[3]={0,300,0},a0[3]={double((int32_t)psx_mod_read_word(p+4)),double((int32_t)psx_mod_read_word(p+8)),double((int32_t)psx_mod_read_word(p+12))};
+            const double te[3]={a0[0],a0[1]+300,a0[2]};
+            psx_mod_write_word(p+0x3c,entry);put(0x1f800020,id,t0);put(entry,id,te);put(L,id);
+            compose(1,0x1f800020,L,0x1f800040);
+            const M root=get(0x1f800020),stored=get(entry);
+            assert(std::abs(root[0][2]-std::sin(1.047))<.003 && std::abs(stored[2][0]-std::sin(1.047))<.003 && json().find("\"root_mismatches\":0")!=std::string::npos);
+            // The root turned about the pivot: the stored translation moved, Duke did not.
+            assert((int32_t)psx_mod_read_word(entry+0x14)!=(int32_t)std::lround(te[0]) && (int32_t)psx_mod_read_word(p+4)==(int32_t)a0[0]);
+            psx_mod_write_word(p+0x3c,old_entry);
+            // 142 degrees left, already swung out: the gun side, swung fully
+            // (100 degrees), the arm 8 degrees short of the view.
+            psx_mod_write_half(c+12,(uint16_t)-2522);psx_mod_write_half(c+16,(uint16_t)-3227);
+            for(int k=0;k<4;++k)begin();
+            assert(json().find("\"angle\":1.745,\"target\":1.745,\"applied\":1.745,\"miss\":0.140")!=std::string::npos);
+            // 100 degrees left: across the body, no swing, the arm on the view.
+            psx_mod_write_half(c+12,(uint16_t)-4034);psx_mod_write_half(c+16,(uint16_t)-711);
+            for(int k=0;k<6;++k)begin();
+            assert(json().find("\"angle\":0.000,\"target\":0.000,\"applied\":0.000,\"miss\":0.000")!=std::string::npos);
+            // A chain turns Duke instead (D08J6E): no swing.
+            psx_mod_write_half(p+0x60,193);begin();assert(json().find("\"swing\":{\"family\":false,")!=std::string::npos);
+            psx_mod_write_half(p+0x60,187);
+            psx_mod_write_half(c+12,4096);psx_mod_write_half(c+16,0);begin();begin();
+            std::puts("PASS: D08J6F swing out on the grip: eased swing, root and stored entry turned about the pivot, nearer reach behind, across-body reach, chains excluded");
+        }
+        // The stow ramps out; refusals clear the build.
+        psx_mod_write_half(p+0x74,7);ttk::clock_ms+=80;call(0x800411b8,p,0,0x80042634);
+        assert(json().find("\"weight\":0.500,")!=std::string::npos);
+        psx_mod_write_half(p+0x74,5);begin();begin();
+        auto refused=[&](){begin();return json().find("\"climb_aim\":{\"set\":false,")!=std::string::npos;};
+        begin(0x80042630);assert(json().find("\"climb_aim\":{\"set\":false,")!=std::string::npos);
+        psx_mod_write_byte(p+0x3b9,5);assert(refused());psx_mod_write_byte(p+0x3b9,4);
+        psx_mod_write_byte(p+0x3b8,0);assert(refused());psx_mod_write_byte(p+0x3b8,2);
+        ttk::input.held[ttk::original_aim]=true;assert(refused());ttk::input.held[ttk::original_aim]=false;
+        setenv("DNTTK_WEAPON_AIM","original",1);assert(refused());setenv("DNTTK_WEAPON_AIM","view",1);
+        psx_mod_write_half(p+0x60,140);assert(refused());psx_mod_write_half(p+0x60,187);
+        ttk::modern=false;
+        {
+            ttk::clock_ms+=200;call(0x800411b8,p,0,0x80042634);
+            for(int i=0;i<3;++i)psx_mod_write_word(p+0x124+4*i,(uint32_t)(i==2?4096:0));
+            put(L,id);writes=0;compose(1,0x1f800020,L,0x1f800040);assert(writes==0);
+        }
+        ttk::modern=true;assert(!refused());
+        psx_mod_write_word(p+0x17c,attached);psx_mod_write_word(p+0x40,old_model);
+        psx_mod_write_byte(p+0x22c,0);psx_mod_write_byte(p+0x22d,0);psx_mod_write_half(p+0x60,63);psx_mod_write_half(p+0x74,5);
+        psx_mod_write_half(p+0x1c,heading);for(int i=0;i<3;++i)psx_mod_write_half(c+12+2*i,view[i]);
+        ++ttk::input.sequence;call(0x8003ade4,c,p,0x80025ee8);begin();
+        assert(json().find("\"climb_aim\":{\"set\":false,")!=std::string::npos);
+        std::puts("PASS: D08J6B climb hang-and-aim: chest turn, off-hand IK onto the contact with its grip, clamps, +0x124 lend and returns, head look-at, stow ramp, refusals and Vanilla");
+    }
+    {
+        // D08Q5: in flight (mode 10) weapon groups, the wheel and X reach the
+        // original request; items other than the pack, the kick, fire held,
+        // draws and Vanilla stay refused.
+        psx_mod_write_half(p+0x358,3);psx_mod_write_half(p+0x35a,9000);
+        psx_mod_write_byte(p+0x22c,10);psx_mod_write_byte(p+0x22d,10);psx_mod_write_half(p+0x60,164);
+        psx_mod_write_byte(p+0x3b9,4);psx_mod_write_byte(p+0x3ba,4);
+        ++ttk::input.sequence;call(0x8003ade4,c,p,0x80025ee8);
+        assert(ttk::jetpack_input_ready() && !ttk::movement_ready());
+        // D08Q7: fire draws only a settled holstered flight weapon, never
+        // boot, transient equipment, an attack, inventory or foreign state.
+        psx_mod_write_word(p+0x224,0);psx_mod_write_byte(p+0x3b8,0);
+        for(unsigned anim=163;anim<=170;++anim) {
+            psx_mod_write_half(p+0x60,anim);psx_mod_write_half(p+0x74,anim);
+            assert(ttk::fire_draw_ready() && !ttk::interaction_restore_ready());
+        }
+        psx_mod_write_half(p+0x60,164);psx_mod_write_half(p+0x74,164);
+        psx_mod_write_byte(p+0x3ba,0);assert(!ttk::fire_draw_ready());psx_mod_write_byte(p+0x3ba,4);
+        for(unsigned flag : {1u,4u,0x40u,0x80u,0x200u}) {
+            psx_mod_write_word(p+0x224,flag);assert(!ttk::fire_draw_ready());
+        }
+        psx_mod_write_word(p+0x224,0);
+        for(unsigned equipment : {1u,2u,3u}) {
+            psx_mod_write_byte(p+0x3b8,equipment);assert(!ttk::fire_draw_ready());
+        }
+        psx_mod_write_byte(p+0x3b8,0);psx_mod_write_half(p+0x74,21);assert(!ttk::fire_draw_ready());
+        psx_mod_write_half(p+0x74,164);
+        ttk::input.active=false;assert(!ttk::fire_draw_ready());ttk::input.active=true;
+        ttk::modern=false;assert(!ttk::fire_draw_ready());ttk::modern=true;
+        psx_mod_write_word(p,2);assert(!ttk::fire_draw_ready());psx_mod_write_word(p,0);
+        psx_mod_write_word(c+0xa4,0);assert(!ttk::fire_draw_ready());psx_mod_write_word(c+0xa4,p);
+        poke(0x4ade0);assert(!ttk::fire_draw_ready());poke(0x4ade0);
+        psx_mod_write_byte(p+0x3b8,2);psx_mod_write_half(p+0x74,5);
+        std::puts("PASS: D08Q7 flight fire-draw and native transition/ownership/Vanilla guards");
+        request(ttk::weapon_group_3);assert(psx_mod_read_byte(p+0x3ba)==5 && (psx_mod_read_word(p+0x224)&4));
+        psx_mod_write_byte(p+0x3ba,4);request(ttk::weapon_next);assert(psx_mod_read_byte(p+0x3ba)==5);
+        psx_mod_write_byte(p+0x3b9,5);psx_mod_write_byte(p+0x3ba,5);request(ttk::weapon_previous);
+        assert(psx_mod_read_byte(p+0x3ba)==4);
+        psx_mod_write_byte(p+0x3ba,5);psx_mod_write_half(p+0x368,1);psx_mod_write_half(p+0x36a,100);
+        request(ttk::medkit);assert(!(psx_mod_read_word(p+0x224)&12) && psx_mod_read_byte(p+0x3ba)==5);
+        request(ttk::quick_kick);assert(kicks==1 && !(psx_mod_read_word(p+0x224)&12));
+        ttk::input.held[ttk::fire]=true;request(ttk::weapon_group_5);assert(psx_mod_read_byte(p+0x3ba)==5);
+        ttk::input.held[ttk::fire]=false;
+        psx_mod_write_half(p+0x74,22);request(ttk::weapon_group_5);assert(psx_mod_read_byte(p+0x3ba)==5);
+        psx_mod_write_half(p+0x74,5);
+        ttk::modern=false;request(ttk::weapon_group_5);assert(psx_mod_read_byte(p+0x3ba)==5);ttk::modern=true;
+        request(ttk::weapon_group_5);assert(psx_mod_read_byte(p+0x3ba)==8);
+        psx_mod_write_half(p+0x358,0);psx_mod_write_byte(p+0x22c,0);psx_mod_write_byte(p+0x22d,0);
+        psx_mod_write_half(p+0x60,63);psx_mod_write_byte(p+0x3b9,4);psx_mod_write_byte(p+0x3ba,4);
+        psx_mod_write_word(p+0x224,0);++ttk::input.sequence;call(0x8003ade4,c,p,0x80025ee8);
+        assert(ttk::movement_ready());
+        std::puts("PASS: D08Q5 flight weapon groups, wheel and refusals (items, kick, fire, draw, Vanilla)");
+    }
+    {
+        // D08A36: jumps and falls (mode 9) take weapon groups, the wheel and X
+        // through the same request; items, the kick, fire held, draws, dodge
+        // rolls and Vanilla stay refused, and the ground lease returns on landing.
+        psx_mod_write_byte(p+0x3b8,2);psx_mod_write_byte(p+0x3b9,4);psx_mod_write_byte(p+0x3ba,4);psx_mod_write_half(p+0x74,5);
+        static const unsigned air[][3]={{97,9,0},{97,9,9},{98,9,9},{104,9,9},{107,9,0},{108,9,9},{105,0,9}};
+        for(const auto& r:air) {
+            psx_mod_write_half(p+0x60,r[0]);psx_mod_write_byte(p+0x22c,r[1]);psx_mod_write_byte(p+0x22d,r[2]);
+            psx_mod_write_word(p+0x224,0);++ttk::input.sequence;call(0x8003ade4,c,p,0x80025ee8);
+            assert(ttk::airborne_shot_ready() && !ttk::movement_ready() && !ttk::jetpack_input_ready());
+            psx_mod_write_byte(p+0x3b9,4);psx_mod_write_byte(p+0x3ba,4);
+            request(ttk::weapon_group_3);assert(psx_mod_read_byte(p+0x3ba)==5 && (psx_mod_read_word(p+0x224)&4));
+        }
+        // The air switch runs 2x on the upper track, with the generic blend
+        // while a weapon is requested; never another track or a roll.
+        {
+            CPUState up{};up.gpr[29]=0x801effc0;up.gpr[31]=0x8005a5a8;
+            up.gpr[4]=p+0x74;up.gpr[5]=p;up.gpr[6]=0x801effd2;up.gpr[7]=1;
+            auto rate=[&](unsigned upper,unsigned equipment,unsigned selected,unsigned animation) {
+                psx_mod_write_half(p+0x60,animation);psx_mod_write_byte(p+0x22c,9);psx_mod_write_byte(p+0x22d,9);
+                psx_mod_write_word(p+0x224,0);++ttk::input.sequence;call(0x8003ade4,c,p,0x80025ee8);
+                call(0x8005a210,p,0x800c2754,0x80041b34);psx_mod_write_half(p+0x60,animation);
+                psx_mod_write_half(p+0x74,upper);psx_mod_write_byte(p+0x3b8,equipment);psx_mod_write_byte(p+0x3ba,selected);
+                psx_mod_write_half(0x801effd2,1024);hooks().at(0x80059db0)(&up,0x80059db0);
+                const unsigned once=psx_mod_read_half(0x801effd2);
+                hooks().at(0x80059db0)(&up,0x80059db0);assert(psx_mod_read_half(0x801effd2)==once);
+                return once;
+            };
+            for(unsigned upper : {6u,7u,21u,22u,30u,31u,36u,40u})assert(rate(upper,2,5,97)==2048);
+            assert(rate(1,0,5,97)==2048 && rate(0,0,5,108)==2048);
+            assert(rate(1,0,0,97)==1024 && rate(1,2,5,97)==1024 && rate(20,2,5,97)==1024 && rate(24,2,5,97)==1024);
+            assert(rate(6,2,5,157)==1024);
+            ttk::modern=false;assert(rate(6,2,5,97)==1024);ttk::modern=true;
+            psx_mod_write_byte(p+0x3b8,2);psx_mod_write_byte(p+0x3b9,4);psx_mod_write_byte(p+0x3ba,4);psx_mod_write_half(p+0x74,5);
+        }
+        psx_mod_write_half(p+0x60,97);psx_mod_write_byte(p+0x22c,9);psx_mod_write_byte(p+0x22d,9);
+        psx_mod_write_word(p+0x224,0);++ttk::input.sequence;call(0x8003ade4,c,p,0x80025ee8);
+        psx_mod_write_byte(p+0x3ba,4);request(ttk::weapon_next);assert(psx_mod_read_byte(p+0x3ba)==5);
+        psx_mod_write_byte(p+0x3b9,5);psx_mod_write_byte(p+0x3ba,5);request(ttk::weapon_previous);
+        assert(psx_mod_read_byte(p+0x3ba)==4);
+        psx_mod_write_byte(p+0x3ba,5);psx_mod_write_half(p+0x368,1);psx_mod_write_half(p+0x36a,100);
+        request(ttk::medkit);assert(!(psx_mod_read_word(p+0x224)&12) && psx_mod_read_byte(p+0x3ba)==5);
+        const unsigned kicked=kicks;request(ttk::quick_kick);assert(kicks==kicked && !(psx_mod_read_word(p+0x224)&12));
+        ttk::input.held[ttk::fire]=true;request(ttk::weapon_group_5);assert(psx_mod_read_byte(p+0x3ba)==5);
+        ttk::input.held[ttk::fire]=false;
+        psx_mod_write_half(p+0x74,22);request(ttk::weapon_group_5);assert(psx_mod_read_byte(p+0x3ba)==5);
+        psx_mod_write_half(p+0x74,5);
+        ttk::modern=false;request(ttk::weapon_group_5);assert(psx_mod_read_byte(p+0x3ba)==5);ttk::modern=true;
+        for(unsigned roll : {157u,160u}) {
+            psx_mod_write_half(p+0x60,roll);psx_mod_write_word(p+0x224,0);++ttk::input.sequence;call(0x8003ade4,c,p,0x80025ee8);
+            request(ttk::weapon_group_5);assert(psx_mod_read_byte(p+0x3ba)==5 && !(psx_mod_read_word(p+0x224)&4));
+        }
+        psx_mod_write_half(p+0x60,97);psx_mod_write_word(p+0x224,0);++ttk::input.sequence;call(0x8003ade4,c,p,0x80025ee8);
+        request(ttk::weapon_group_5);assert(psx_mod_read_byte(p+0x3ba)==8);
+        psx_mod_write_byte(p+0x22c,0);psx_mod_write_byte(p+0x22d,0);
+        psx_mod_write_half(p+0x60,63);psx_mod_write_byte(p+0x3b9,4);psx_mod_write_byte(p+0x3ba,4);
+        psx_mod_write_word(p+0x224,0);++ttk::input.sequence;call(0x8003ade4,c,p,0x80025ee8);
+        assert(ttk::movement_ready() && !ttk::airborne_shot_ready());
+        std::puts("PASS: D08A36 mid-air weapon groups, wheel, 2x air switch (stow, blend, draw) and refusals (items, kick, fire, draw, rolls, Vanilla)");
+    }
+
+    // Stance request has no Triangle/turn write; original animation delta is accelerated once.
+    ttk::input.held[ttk::crouch]=true;ttk::input.command_count=0;
+    call(0x8005a210,p,0x800c2754,0x80041b34,0x801ff000);
+    assert(psx_mod_read_half(p+0x60)==176 && psx_mod_read_half(p+0x6a)==0);
+    CPUState stance{};stance.gpr[4]=p+0x60;stance.gpr[5]=p;stance.gpr[6]=0x801fefd0;
+    stance.gpr[29]=0x801fefc0;stance.gpr[31]=0x8005a3d4;psx_mod_write_half(0x801fefd0,30);
+    hooks().at(0x80059db0)(&stance,0x80059db0);assert(psx_mod_read_half(0x801fefd0)==120);
+    hooks().at(0x80059db0)(&stance,0x80059db0);assert(psx_mod_read_half(0x801fefd0)==120);
+    psx_mod_write_half(p+0x60,178);ttk::input.held[ttk::crouch]=false;clearance_result=500;
+    call(0x8005a210,p,0x800c2754,0x80041b34,0x801ff000);assert(psx_mod_read_half(p+0x60)==178);
+    clearance_result=2048;ttk::input.active=false;
+    call(0x8005a210,p,0x800c2754,0x80041b34,0x801ff000);
+    assert(psx_mod_read_half(p+0x60)==176 && psx_mod_read_half(p+0x6a)==1); // focus release also stands
+    // D08K11: shallow water is grounded crouch territory, including a body
+    // below the plane. Native swim/deep water and Original crouch stay out.
+    {
+        const auto saved_water=psx_mod_read_word(p+0x834),saved_flag=psx_mod_read_word(p+0x20c);
+        const auto saved_y=psx_mod_read_word(p+8),saved_floor=psx_mod_read_word(p+0x1c8);
+        for(int test=0;test<8;++test) {
+            ttk::input.active=true;ttk::input.held[ttk::crouch]=false;
+            psx_mod_write_half(p+0x60,63);psx_mod_write_byte(p+0x22c,0);psx_mod_write_byte(p+0x22d,0);
+            psx_mod_write_word(p+0x224,0);psx_mod_write_word(p+0x834,0x40000000);psx_mod_write_word(p+0x20c,0);
+            call(0x8005a210,p,0x800c2754,0x80041b34,0x801ff000);
+            const int depth=test==1?512:test==2?640:test==3?641:128;
+            psx_mod_write_word(p+0x834,-depth);psx_mod_write_word(p+0x1c8,0);
+            psx_mod_write_word(p+8,-282);psx_mod_write_word(p+0x20c,0x3b800);
+            if(test==1 || test==2) {psx_mod_write_byte(p+0x22c,1);psx_mod_write_byte(p+0x22d,1);}
+            if(test==4)psx_mod_write_byte(p+0x22c,4);
+            if(test==5)psx_mod_write_byte(p+0x22c,5);
+            if(test==6)setenv("DNTTK_CROUCH","original",1);
+            if(test==7)ttk::modern=false;
+            ++ttk::input.sequence;call(0x8003ade4,c,p,0x80025ee8);
+            ttk::input.held[ttk::crouch]=true;
+            call(0x8005a210,p,0x800c2754,0x80041b34,0x801ff000);
+            assert(psx_mod_read_half(p+0x60)==(test<3?176:63));
+            assert(psx_mod_read_word(p+0x20c)==0x3b800); // never force submersion
+            assert(psx_mod_read_byte(p+0x22c)==(test==4?4:test==5?5:(test==1 || test==2)?1:0));
+            if(test<3) {
+                psx_mod_write_half(p+0x60,178);
+                call(0x80048410,p,0,0x8004b634,0x801ff000);
+                assert(psx_mod_read_word(0x800548e8)==(test?0x10000008u:0x14400008u));
+                // The next hook restores before checking identity, even in Vanilla.
+                ttk::modern=false;call(0x80058120,p,0,0x80041c44,0x801ff000);
+                assert(psx_mod_read_word(0x800548e8)==0x14400008u);
+                ttk::modern=true;
+                // A held crouch crossing into deep water plays the normal
+                // exit so native swim checks are no longer excluded by 178.
+                psx_mod_write_word(p+0x834,-800);clearance_result=500;
+                call(0x8005a210,p,0x800c2754,0x80041b34,0x801ff000);
+                assert(psx_mod_read_half(p+0x60)==178); // keep clearance
+                clearance_result=2048;
+                call(0x8005a210,p,0x800c2754,0x80041b34,0x801ff000);
+                assert(psx_mod_read_half(p+0x60)==176 && psx_mod_read_half(p+0x6a)==1);
+                assert(psx_mod_read_word(p+0x20c)==0x3b800);
+            }
+            ttk::modern=true;unsetenv("DNTTK_CROUCH");
+        }
+        psx_mod_write_word(p+0x834,saved_water);psx_mod_write_word(p+0x20c,saved_flag);
+        psx_mod_write_word(p+8,saved_y);psx_mod_write_word(p+0x1c8,saved_floor);
+        ttk::input.held[ttk::crouch]=false;ttk::input.active=false;
+        psx_mod_write_half(p+0x60,63);psx_mod_write_byte(p+0x22c,0);
+        std::puts("PASS: D08K11 shallow/mid water crouch, submerged body, deep/swim/Original/Vanilla exclusions, native water mask preserved");
+    }
+    // D08K2 crouch probe via the debug mover (crouchgo): a crouched Duke (178)
+    // steps by (20, 0) per update when the crouch hull fits, with the head ray
+    // at feet - 0x2c0; each refusal reason leaves him where he was.
+    {
+        bool close=false;
+        const auto say=[](const char*){};
+        uint32_t keep[5];for(int i=0;i<4;++i)keep[i]=psx_mod_read_word(p+4+4*i);keep[4]=psx_mod_read_word(p+0x1c8);
+        assert(ttk::crouch_console_command("crouchgo 20 0",say,close) && close);
+        // An unowned 178 with crouch released: crouch.inc neither requests nor
+        // releases (one update at 63 drops the earlier fixture's ownership).
+        ttk::input.held[ttk::crouch]=false;psx_mod_write_half(p+0x60,63);
+        call(0x8005a210,p,0x800c2754,0x80041b34,0x801ff000);psx_mod_write_half(p+0x60,178);
+        psx_mod_write_word(p+0x1c8,uint32_t(-1000));psx_mod_write_word(p+8,uint32_t(-1500));
+        auto step=[&](int clearance,int32_t floor_step,uint32_t object,int ray,int steep){
+            clearance_result=clearance;lookahead_drop=floor_step;hull_object=object;hull_ray_hit=ray;hull_steep=steep;hull_ray_y.clear();
+            const int32_t x0=int32_t(psx_mod_read_word(p+4));
+            if(psx_mod_read_half(p+0x60)!=63)psx_mod_write_half(p+0x60,178);
+            call(0x8005a210,p,0x800c2754,0x80041b34,0x801ff000);
+            const int32_t moved=int32_t(psx_mod_read_word(p+4))-x0;
+            return moved;
+        };
+        assert(step(0x2e0,0,0,0,0)==20);                     // fits crouched (704) but not standing (880)
+        assert(hull_ray_y.size()==2 && hull_ray_y[0]==-1000-0x2c0 && hull_ray_y[1]==-1000-0x2c0);
+        assert(step(0x2b0,0,0,0,0)==0);                      // too low even crouched
+        assert(step(0xffff,int32_t(0xffff0000u),0,0,0)==0);  // no floor: wall
+        assert(step(2048,0x180,0,0,0)==0);                   // drop over 0x100: edge
+        assert(step(2048,-0x180,0,0,0)==0);                  // step up over 0x100
+        // D08K7: objects as 0x8007926c judges them. A fake object (type 5) and
+        // type table; flag 0x1000 marks a walkable top (the dumpsters).
+        constexpr uint32_t obj=0x801c0000,types=0x801c0100;
+        psx_mod_write_word(0x800d2660,types);psx_mod_write_half(obj+0x2c,5);
+        const int32_t duke_x=int32_t(psx_mod_read_word(p+4));
+        auto place=[&](int32_t dx,uint32_t flags,int32_t top){
+            psx_mod_write_word(obj+4,uint32_t(duke_x+dx));psx_mod_write_word(obj+0xc,psx_mod_read_word(p+0xc));
+            psx_mod_write_word(types+28*5,flags);hull_object_top=top;
+        };
+        place(100,0x1000,-0x180);
+        assert(step(2048,0,obj,0,0)==0);                     // taller than a step: in the way
+        assert(psx_mod_read_word(p+0x174)==0);               // restored after the refusal
+        place(-100,0x1000,-0x180);
+        assert(step(2048,0,obj,0,0)==20);                    // already overlapping it: stepping away is allowed
+        place(0,0x1000,-0x80);
+        assert(step(0x2e0,0x400,obj,0,0)==0);                // walkable top: headroom from it (0x2e0-0x400-0x80) too low
+        hull_ray_y.clear();
+        const int32_t top_y=int32_t(psx_mod_read_word(p+8));
+        assert(step(0x800,0x400,obj,0,0)==20);               // walkable top is the floor: up 0x80 onto it
+        assert(int32_t(psx_mod_read_word(p+8))==top_y-0x80 && psx_mod_read_word(p+0x174)==obj);
+        assert(hull_ray_y.size()==2 && hull_ray_y[1]==-1000-0x80-0x2c0);
+        psx_mod_write_word(p+8,uint32_t(top_y));psx_mod_write_word(p+0x1c8,uint32_t(-1000));
+        place(0,0x1000,0);
+        assert(step(0x800,0x180,obj,0,0)==20);               // its top at feet level over a 0x180 drop: no edge
+        place(0,0x1000,0x180);
+        assert(step(0x800,0x180,obj,0,0)==0);                // off its top over the drop: edge
+        place(0,0,-0x80);
+        assert(step(2048,0,obj,0,0)==20);                    // not walkable: the room decides, contact cleared
+        assert(psx_mod_read_word(p+0x174)==0 && int32_t(psx_mod_read_word(p+0x1c8))==-1000);
+        // Stand-up on a walkable top: 0x370 from the top to the room's ceiling
+        // (the slot 10 dumpster: refused on any contact before).
+        assert(ttk::crouch_console_command("crouchwalk off",say,close) && !close);
+        place(0,0x1000,0);
+        auto stand=[&](int clearance,int32_t room_step,uint32_t object=0x801c0000){
+            clearance_result=clearance;lookahead_drop=room_step;hull_object=object;
+            ttk::input.active=true;++ttk::input.sequence;ttk::input.command_count=0;
+            ttk::input.held[ttk::crouch]=true;psx_mod_write_half(p+0x60,63);
+            call(0x8003ade4,c,p,0x80025ee8);
+            call(0x8005a210,p,0x800c2754,0x80041b34,0x801ff000);      // owned crouch (176)
+            assert(psx_mod_read_half(p+0x60)==176);
+            psx_mod_write_half(p+0x60,178);ttk::input.held[ttk::crouch]=false;
+            call(0x8005a210,p,0x800c2754,0x80041b34,0x801ff000);
+            return psx_mod_read_half(p+0x60)==176 && psx_mod_read_half(p+0x6a)==1;
+        };
+        assert(!stand(0x600,0x400));                         // 0x200 over the top: stays down
+        assert(psx_mod_read_word(p+0x174)==0);               // query fields restored
+        assert(stand(0x800,0x400));                          // 0x400 over the top: stands
+        place(0,0x1000,-0x180);
+        assert(!stand(0x2000,0));                            // overlapping something taller than a step
+        assert(ttk::crouch_console_command("crouchstand block",say,close));
+        assert(!stand(0x2000,0,0));                          // debug block
+        assert(ttk::crouch_console_command("crouchstand free",say,close));
+        assert(stand(0x2000,0,0));
+        ttk::input.active=false;
+        psx_mod_write_word(0x800d2660,0);hull_object=0;hull_object_top=0;
+        for(int i=0;i<4;++i)psx_mod_write_word(p+4+4*i,keep[i]);psx_mod_write_word(p+0x1c8,keep[4]);
+        psx_mod_write_word(p+0x1c8,uint32_t(-1000));psx_mod_write_word(p+8,uint32_t(-1500));
+        assert(ttk::crouch_console_command("crouchgo 20 0",say,close) && close);
+        ttk::input.held[ttk::crouch]=false;psx_mod_write_half(p+0x60,63);
+        call(0x8005a210,p,0x800c2754,0x80041b34,0x801ff000);psx_mod_write_half(p+0x60,178);
+        assert(step(2048,0,0,1,0)==0);                       // head ray hit
+        assert(step(2048,-0x80,0,0,1)==0);                   // steep step up
+        const int32_t y0=int32_t(psx_mod_read_word(p+8));
+        assert(step(2048,0x40,0,0,0)==20);                   // step down follows the floor
+        assert(int32_t(psx_mod_read_word(p+8))==y0+0x40 && int32_t(psx_mod_read_word(p+0x1c8))==-1000+0x40);
+        psx_mod_write_half(p+0x60,63);assert(step(2048,0,0,0,0)==0);psx_mod_write_half(p+0x60,178);   // only while crouched (178)
+        assert(ttk::crouch_console_command("crouchwalk off",say,close) && !close);
+        psx_mod_write_half(p+0x60,178);assert(step(2048,0,0,0,0)==0);  // off
+        clearance_result=2048;lookahead_drop=-100000;hull_object=0;hull_ray_hit=hull_steep=0;
+        ttk::input.held[ttk::crouch]=false;psx_mod_write_half(p+0x60,63);
+        for(int i=0;i<4;++i)psx_mod_write_word(p+4+4*i,keep[i]);psx_mod_write_word(p+0x1c8,keep[4]);
+        std::puts("PASS: D08K2 crouch probe (crouch-only clearance passes, head ray at feet-0x2c0, low/wall/edge/step/object/ray/slope refusals restore state, floor follow, 178 only, off); D08K7 objects as the original walk judges them (tall refused, step away, walkable top as floor, other objects ignored) and stand-up on a walkable top");
+    }
+    // Distance clamps/smoothing, wall compression independence and no FOV mutation.
+    ttk::input.active=true;ttk::input.held[ttk::crouch]=false;psx_mod_write_half(p+0x60,63);
+    psx_mod_write_word(c+0x50,p+0x7bc);psx_mod_write_word(c+0x4c,p+0x7bc);
+    auto metric=[](const char* key){auto text=std::strstr(ttk::controls_debug_json(),key);assert(text);return std::strtod(text+std::strlen(key),nullptr);};
+    ttk::input.distance_total=100;++ttk::input.sequence;call(0x8003ade4,c,p,0x80025ee8);
+    assert(metric("\"preferred_radius\":")==768);
+    for(unsigned i=0;i<40;++i){++ttk::input.sequence;call(0x8003ade4,c,p,0x80025ee8);}
+    assert(std::abs(metric("\"radius\":")-768)<1);
+    ttk::input.distance_total=-100;++ttk::input.sequence;call(0x8003ade4,c,p,0x80025ee8);
+    assert(metric("\"preferred_radius\":")==6144 && metric("\"radius\":")<6144);
+    psx_mod_write_word(c+0x64,0);psx_mod_write_word(c+0x68,0);psx_mod_write_word(c+0x6c,10);
+    ++ttk::input.epoch;ttk::input.distance_total=0;++ttk::input.sequence;call(0x8003ade4,c,p,0x80025ee8);
+    assert(metric("\"preferred_radius\":")==6144); // solved wall boom cannot become preference
+    // D08L1: real crouch mover crosses only a collision-checked drop, keeps
+    // departure feet height and starts original falling without upward speed.
+    {
+        const auto saved=ttk::input;
+        const uint32_t saved_x=psx_mod_read_word(p+4),saved_z=psx_mod_read_word(p+12);
+        const bool saved_running=ttk::running;
+        for(bool running:{false,true}) for(int reject=0;reject<6;++reject) {
+            ttk::running=running;
+            ttk::input=saved;ttk::input.active=true;ttk::input.move_x=0;ttk::input.move_y=1;
+            ttk::input.held[ttk::crouch]=false;ttk::input.held[ttk::interact]=false;
+            ttk::input.held[ttk::original_aim]=false;
+            psx_mod_write_word(p,0);psx_mod_write_word(p+0x224,0);psx_mod_write_word(p+0x20c,0);
+            psx_mod_write_word(p+0x834,0x40000000);psx_mod_write_half(p+0x60,63);
+            psx_mod_write_byte(p+0x22c,0);psx_mod_write_byte(p+0x22d,0);
+            psx_mod_write_half(p+0xba,11);psx_mod_write_word(p+0x1c8,uint32_t(-1000));
+            psx_mod_write_word(p+8,uint32_t(-1282));
+            lookahead_drop=0;clearance_result=2048;hull_object=0;hull_ray_hit=0;
+            call(0x8003ade4,c,p,0x80025ee8);
+            call(0x8005a210,p,0x800c2754,0x80041b34,0x801ff000);
+            ttk::input.held[ttk::crouch]=reject!=5;landing_clips=true;
+            if(reject==5) { // native forced kneel, no modern crouch request
+                psx_mod_write_half(p+0x60,178);clearance_result=0x2e0;ttk::input.move_y=0;
+            }
+            call(0x8005a210,p,0x800c2754,0x80041b34,0x801ff000);
+            if(reject==5){assert(ttk::crouch_walk_input_ready());ttk::input.held[ttk::crouch]=true;}
+            ttk::input.move_y=1;
+            psx_mod_write_half(p+0x60,178);
+            // D08K12: the actual mover retains crouch in vent-sized clearance,
+            // switches pace immediately, and never exceeds that pace diagonally.
+            if(reject==0) {
+                clearance_result=0x2e0;
+                for(int phase=0;phase<4;++phase) {
+                    ttk::running=phase==1 || phase==2;
+                    ttk::input.move_x=phase==2?1:0;
+                    const int32_t x=int32_t(psx_mod_read_word(p+4)),z=int32_t(psx_mod_read_word(p+12));
+                    call(0x8005a210,p,0x800c2754,0x80041b34,0x801ff000);
+                    const double distance=std::hypot(double(int32_t(psx_mod_read_word(p+4))-x),
+                                                     double(int32_t(psx_mod_read_word(p+12))-z));
+                    assert(std::abs(distance-(ttk::running?97.6171875:20.8154296875))<1.0);
+                    // D08K14 selects separate run frames and returns to the
+                    // accepted walk frames when speed is released.
+                    const unsigned clip=ttk::running?21:1;
+                    const unsigned pose_frame=psx_mod_read_half(p+0x66);
+                    assert(pose_frame>=10000+clip*10+1 && pose_frame<=10000+clip*10+2);
+                    assert(psx_mod_read_half(p+0x60)==178 && ttk::crouch_walk_input_ready());
+                }
+                // D08K13: neutral retail input must not expire into crouch
+                // fidget 179 and expose a direction to the roll selector.
+                // Model its countdown across sustained/reversing movement,
+                // both paces and a blocked path. Native gameplay covers the
+                // actual selector; this fixture checks the ownership contract.
+                for(int tick=0;tick<1200;++tick) {
+                    ttk::running=(tick/120)%2;
+                    ttk::input.move_x=0;
+                    ttk::input.move_y=(tick/60)%2 ? -1 : 1;
+                    hull_ray_hit=tick>=600 ? 1 : 0;
+                    const unsigned timer=psx_mod_read_half(p+0x240);
+                    psx_mod_write_half(p+0x240,timer>30?timer-30:0);
+                    call(0x8005a210,p,0x800c2754,0x80041b34,0x801ff000);
+                    assert(psx_mod_read_half(p+0x240)>30);
+                    assert(psx_mod_read_half(p+0x60)==178 && ttk::crouch_walk_input_ready());
+                }
+                hull_ray_hit=0;ttk::input.move_y=1;
+                // D08T12: already squeezed below the crouch hull (a crouched
+                // landing under a low ceiling), Duke crawls through equal
+                // headroom instead of being refused everywhere; no headroom
+                // at all still refuses.
+                {
+                    const bool keep_running=ttk::running;ttk::running=false;ttk::input.move_x=0;
+                    auto moved=[&]{
+                        const int32_t x=int32_t(psx_mod_read_word(p+4)),z=int32_t(psx_mod_read_word(p+12));
+                        call(0x8005a210,p,0x800c2754,0x80041b34,0x801ff000);
+                        return int32_t(psx_mod_read_word(p+4))!=x || int32_t(psx_mod_read_word(p+12))!=z;
+                    };
+                    clearance_result=0x280;assert(moved());
+                    assert(psx_mod_read_half(p+0x60)==178 && ttk::crouch_walk_input_ready());
+                    clearance_result=0xf0;assert(!moved());
+                    clearance_result=0x2e0;ttk::running=keep_running;
+                }
+                // Released Ctrl cannot stand under a low ceiling; run remains
+                // available until the existing stand-up owner finds headroom.
+                ttk::input.held[ttk::crouch]=false;ttk::running=true;
+                call(0x8005a210,p,0x800c2754,0x80041b34,0x801ff000);
+                assert(psx_mod_read_half(p+0x60)==178 && ttk::crouch_walk_input_ready());
+                ttk::input.held[ttk::crouch]=true;ttk::running=running;
+            }
+            lookahead_drop=1024;clearance_result=1024+0x2e0;hull_ray_y.clear();
+            if(reject==1)clearance_result=1024+0x2b0; // room below fits, departure does not
+            if(reject==2)hull_ray_hit=1;
+            if(reject==3)lookahead_drop=-384;
+            if(reject==4){lookahead_drop=-65536;clearance_result=0xffff;}
+            const auto before=crouch_falls;const auto feet=psx_mod_read_word(p+0x1c8);
+            call(0x8005a210,p,0x800c2754,0x80041b34,0x801ff000);
+            assert(crouch_falls==before+(reject==0 || reject==5));
+            assert(psx_mod_read_word(p+0x1c8)==feet);
+            if(reject==0 || reject==5) {
+                assert(psx_mod_read_half(p+0x60)==108 && psx_mod_read_byte(p+0x22c)==9);
+                assert(psx_mod_read_word(p+0x1f8)==0 && !ttk::crouch_walk_input_ready());
+                assert(hull_ray_y.size()==2 && hull_ray_y[0]==hull_ray_y[1]);
+            }
+        }
+        ttk::running=saved_running;
+        landing_clips=false;hull_ray_hit=0;lookahead_drop=-100000;clearance_result=2048;
+        ttk::input=saved;psx_mod_write_half(p+0x60,63);psx_mod_write_byte(p+0x22c,0);
+        psx_mod_write_half(p+0xba,0);
+        psx_mod_write_word(p+4,saved_x);psx_mod_write_word(p+12,saved_z);
+        std::puts("PASS: D08K12 walk/run/release/diagonal crouch pace and blocked standing; D08T12 squeezed crawl; D08L1 walk/run ledge falls and collision refusals");
+    }
+    // D10E: inspection rotates the view alone, then returns to the retained
+    // gameplay heading; its virtual shot eye translates with the player.
+    {
+        const auto saved=ttk::input;
+        auto frame=[&](){++ttk::input.sequence;ttk::clock_ms+=1000.0/60;call(0x8003ade4,c,p,0x80025ee8);};
+        ttk::input.first_person=false;frame();frame();
+        const double base=metric("\"yaw\":");
+        ttk::input.held[ttk::camera_free_look]=true;frame();
+        assert(ttk::free_look_active());
+        ttk::input.total_x+=1000;ttk::input.total_y+=100;frame();
+        assert(std::abs(metric("\"offset_yaw\":"))>0.1);
+        assert(std::abs(metric("\"yaw\":")-base)<1e-6);
+        double eye[3],forward[3],moved[3],forward2[3];
+        assert(ttk::free_look_aim(eye,forward));
+        assert(std::abs(std::atan2(forward[0],forward[2])-base)<1e-6);
+        const auto px=psx_mod_read_word(p+4);psx_mod_write_word(p+4,px+256);
+        assert(ttk::free_look_aim(moved,forward2));assert(moved[0]==eye[0]+256);
+        for(int k=0;k<3;++k)assert(forward[k]==forward2[k]);
+        psx_mod_write_word(p+4,px);
+        call(0x80058120,p,0,0x80041c44);
+        const auto heading=psx_mod_read_half(p+0x1c);
+        for(int n=0;n<10;++n){ttk::input.total_x+=100;frame();call(0x80058120,p,0,0x80041c44);assert(psx_mod_read_half(p+0x1c)==heading);}
+        ttk::input.held[ttk::camera_free_look]=false;
+        double last=std::abs(metric("\"offset_yaw\":"));
+        for(int n=0;n<60;++n){frame();const double next=std::abs(metric("\"offset_yaw\":"));assert(next<=last+1e-6);last=next;}
+        assert(!ttk::free_look_active());assert(std::abs(metric("\"yaw\":")-base)<1e-6);
+        // D10E release regression: continuous steering previously replenished
+        // the return offset forever, leaving gameplay yaw and Duke frozen.
+        // Every release must steer on its first update and finish returning
+        // even when the mouse never stops (also repeat during a return).
+        for(int cycle=0;cycle<3;++cycle) {
+            ttk::input.held[ttk::camera_free_look]=true;frame();
+            ttk::input.total_x+=200;frame();
+            const double start=metric("\"yaw\":");
+            const double start_pitch=metric("\"pitch\":");
+            ttk::input.held[ttk::camera_free_look]=false;
+            const double step=metric("\"mouse_deg\":")*ttk::tau/360;
+            ttk::input.total_x+=2;ttk::input.total_y-=1;frame();
+            assert(std::abs(ttk::wrap_yaw(metric("\"yaw\":")-start)-2*step)<2e-6);
+            assert(std::abs(metric("\"pitch\":")-ttk::clamp_pitch(start_pitch+step))<2e-6); // inverted Y fixture
+            call(0x80058120,p,0,0x80041c44);
+            assert(psx_mod_read_half(p+0x1c)==(int(std::lround(metric("\"yaw\":")*4096/ttk::tau))&4095));
+            double offset=std::abs(metric("\"offset_yaw\":"));
+            for(int n=0;n<60;++n) {
+                ttk::input.total_x+=2;frame();
+                const double next=std::abs(metric("\"offset_yaw\":"));
+                assert(next<=offset+1e-6);offset=next;
+            }
+            assert(!ttk::free_look_active());
+        }
+        // Repress while returning must retain the same gameplay anchor.
+        ttk::input.held[ttk::camera_free_look]=true;frame();ttk::input.total_x+=500;frame();
+        ttk::input.held[ttk::camera_free_look]=false;frame();
+        ttk::input.held[ttk::camera_free_look]=true;frame();assert(ttk::free_look_active());
+        ttk::input.first_person=true;frame();assert(!ttk::free_look_active());
+        ttk::input.first_person=false;frame();frame();
+        ttk::input.held[ttk::camera_free_look]=false;ttk::input.active=false;frame();assert(!ttk::free_look_active());
+        ttk::input=saved;frame();
+        std::puts("PASS: D10E separate inspection yaw, fixed facing/shot direction, translated aim eye, smooth release, immediate continuous steering recovery, repress and view/input boundaries");
+    }
+    {
+        // D26K: while the console holds input the native idle countdown
+        // (player+0x240, 0x80053038) keeps its value; activity resets still
+        // apply. The fixture models the native step (10) between updates.
+        const uint16_t saved_timer=psx_mod_read_half(p+0x240);
+        const auto saved_input=ttk::input;
+        auto timer=[&]{return unsigned(psx_mod_read_half(p+0x240));};
+        auto set=[&](unsigned v){psx_mod_write_half(p+0x240,v);};
+        auto update=[&]{++ttk::input.sequence;call(0x8005a210,p,0x800c2754,0x80041b34,0x801fff00);};
+        auto native_step=[&]{const unsigned t=timer();set(t>10?t-10:0);};
+        ttk::input.active=true;ttk::input.move_x=ttk::input.move_y=0;
+        assert(ttk::player_identity_ready());
+        set(1200);update();native_step();update();assert(timer()==1190);  // closed: the original's countdown
+        ttk::console_holding=true;update();
+        for(int i=0;i<600;++i){native_step();update();assert(timer()==1190);}
+        set(3000);update();native_step();update();assert(timer()==3000);   // a reset applies and is kept
+        ttk::console_holding=false;update();native_step();update();assert(timer()==2990); // closing resumes
+        ttk::console_holding=true;set(8);update();native_step();update();native_step();update();assert(timer()==8); // never expires
+        ++ttk::input.epoch;set(700);update();native_step();update();assert(timer()==700);  // new epoch: latched again
+        ttk::console_holding=false;
+        ttk::modern=false;ttk::console_holding=true;set(500);update();native_step();update();assert(timer()==490); // Vanilla
+        ttk::modern=true;ttk::console_holding=false;
+        ttk::input=saved_input;set(saved_timer);update();
+        std::puts("PASS: D26K console keeps the native idle countdown (no idle holster), resets apply, close resumes, epoch/Vanilla guards");
+    }
+    // D10 recenter: V swings yaw behind Duke's heading and pitch to the first
+    // (original) follow pitch; mouse motion cancels a swing. Shoulder offsets
+    // only the requested eye along the view's right row before the original solve.
+    {
+        const double quarter=6.2831853071795864769/4;
+        psx_mod_write_half(p+0x1c,1024); // Duke faces +X
+        auto frame=[&](){++ttk::input.sequence;call(0x8003ade4,c,p,0x80025ee8);};
+        const double yaw0=metric("\"yaw\":");const uint16_t heading0=psx_mod_read_half(p+0x1c);
+        const uint32_t camera_x0=psx_mod_read_word(c+0x64),camera_z0=psx_mod_read_word(c+0x6c);
+        const double before=metric("\"recenters\":");
+        ttk::input.recenter_total=1;frame();
+        assert(std::strstr(ttk::controls_debug_json(),"\"recentering\":true"));
+        for(unsigned i=0;i<60;++i)frame();
+        assert(std::abs(metric("\"yaw\":")-quarter)<1e-6);
+        assert(std::abs(metric("\"pitch\":")-metric("\"rest_pitch\":"))<1e-6);
+        assert(metric("\"recenters\":")==before+1);
+        // D10C look keys: Look Up turns the pitch up (negative) at 150 deg/s
+        // while held and eases back to the rest pitch on release; Lock Look
+        // Down turns it at 80 deg/s and keeps it; a Look tap unlocks it.
+        {
+            const double deg=6.2831853071795864769/360,rest=metric("\"rest_pitch\":");
+            auto timed=[&](unsigned n){for(unsigned i=0;i<n;++i){ttk::clock_ms+=50;frame();}};
+            using ttk::Action;
+            ttk::input.held[ttk::look_up]=true;timed(4);   // the first update takes the key
+            assert(std::abs(metric("\"pitch\":")-ttk::clamp_pitch(rest-150*deg*0.15))<1e-6);
+            assert(std::strstr(ttk::controls_debug_json(),"\"hold\":-1"));
+            ttk::input.held[ttk::look_up]=false;timed(1);
+            assert(std::strstr(ttk::controls_debug_json(),"\"returning\":true"));
+            timed(20);
+            assert(std::abs(metric("\"pitch\":")-rest)<1e-6 && metric("\"returns\":")==1);
+            ttk::input.held[ttk::lock_look_down]=true;timed(3);
+            ttk::input.held[ttk::lock_look_down]=false;timed(20);
+            const double locked=ttk::clamp_pitch(rest+80*deg*0.15); // the release update ends the hold
+            assert(std::abs(metric("\"pitch\":")-locked)<1e-6);  // stays
+            // A tap released before the next camera update is only a counted press.
+            ttk::input.look_press_total+=1;timed(1);
+            assert(std::strstr(ttk::controls_debug_json(),"\"taps\":1"));
+            timed(20);
+            assert(std::abs(metric("\"pitch\":")-rest)<1e-6 && metric("\"returns\":")==2);
+            // Mouse motion during the ease back keeps the view where it is.
+            ttk::input.held[ttk::look_down]=true;timed(3);ttk::input.held[ttk::look_down]=false;timed(1);
+            ttk::input.total_y+=1;timed(1);
+            assert(std::strstr(ttk::controls_debug_json(),"\"returning\":false"));
+            const double kept=metric("\"pitch\":");timed(10);
+            assert(std::abs(metric("\"pitch\":")-kept)<1e-9 && kept>rest+0.05);
+            ttk::input.recenter_total+=1;for(unsigned i=0;i<60;++i)frame();
+        }
+        // D10D keyboard turning: Duke 3D rates, 5 build units per 30 Hz tic for
+        // the first 1/8 s, then 15 (30 running); right turns yaw positive.
+        {
+            const double unit=30*6.2831853071795864769/2048;
+            auto timed=[&](unsigned n){for(unsigned i=0;i<n;++i){ttk::clock_ms+=50;frame();}};
+            auto held_angle=[&](double t,bool run){return t<0.125?5*unit*t:5*unit*0.125+15*unit*(run?2:1)*(t-0.125);};
+            const double yaw0=metric("\"yaw\":");
+            ttk::running=false;ttk::input.held[ttk::turn_right]=true;timed(4); // the first update takes the key
+            assert(std::abs(ttk::wrap_yaw(metric("\"yaw\":")-yaw0-held_angle(0.15,false)))<1e-6);
+            assert(std::strstr(ttk::controls_debug_json(),"\"key_turn\":{\"hold\":1,\"running\":false,\"turns\":1}"));
+            ttk::input.held[ttk::turn_right]=false;timed(1);              // the release update ends the hold
+            const double turned=metric("\"yaw\":");timed(5);
+            assert(std::abs(metric("\"yaw\":")-turned)<1e-9);
+            assert(std::abs(ttk::wrap_yaw(turned-yaw0-held_angle(0.2,false)))<1e-6);
+            // Running doubles the rate after the slow start; left turns back.
+            ttk::running=true;ttk::input.held[ttk::turn_left]=true;timed(7);
+            assert(std::abs(ttk::wrap_yaw(turned-metric("\"yaw\":")-held_angle(0.3,true)))<1e-6);
+            // The mouse adds on top of a held turn key.
+            const double before_mouse=metric("\"yaw\":");
+            ttk::input.total_x+=10;timed(1);
+            assert(std::abs(ttk::wrap_yaw(before_mouse-metric("\"yaw\":")-(held_angle(0.35,true)-held_angle(0.3,true))+10*metric("\"mouse_deg\":")*6.2831853071795864769/360))<1e-4);
+            ttk::input.held[ttk::turn_left]=false;ttk::running=false;timed(1);
+            // A turn key stops a V swing; pitch is untouched by turning.
+            ttk::input.recenter_total+=1;ttk::input.held[ttk::turn_right]=true;timed(1);
+            assert(std::strstr(ttk::controls_debug_json(),"\"recentering\":false"));
+            const double pitch0=metric("\"pitch\":");
+            ttk::input.held[ttk::turn_right]=false;timed(2);
+            assert(std::abs(metric("\"pitch\":")-pitch0)<1e-9);
+            ttk::input.recenter_total+=1;for(unsigned i=0;i<60;++i)frame();
+        }
+        psx_mod_write_half(p+0x1c,0);ttk::input.recenter_total=2;frame();
+        ttk::input.total_x+=40;frame();
+        assert(std::strstr(ttk::controls_debug_json(),"\"recentering\":false"));
+        const double moved=metric("\"yaw\":");assert(std::abs(moved)>0.01 && std::abs(moved-quarter)>0.01);
+        // Face +X again and settle so the right row is (0,0,-1).
+        ttk::input.recenter_total=3;psx_mod_write_half(p+0x1c,1024);
+        for(unsigned i=0;i<60;++i)frame();
+        char state[]="/tmp/ttk-d10-camera-XXXXXX";const int fd=mkstemp(state);assert(fd>=0);close(fd);std::remove(state);
+        setenv("DNTTK_CAMERA_STATE_FILE",state,1);
+        ttk::input.shoulder=1;
+        for(unsigned i=0;i<60;++i)frame();
+        const double radius_now=metric("\"radius\":"),offset=metric("\"shoulder_offset\":");
+        assert(std::abs(offset-std::clamp(0.22*radius_now,192.0,640.0))<1);
+        sp=0x801f0000-0xb8;
+        call(0x8003aa48,c,sp+0x18,0x8003aeb0,sp);
+        const int32_t z=(int32_t)psx_mod_read_word(sp+0x18+8)+(int32_t)psx_mod_read_word(c+0x6c);
+        const int32_t x=(int32_t)psx_mod_read_word(sp+0x18)+(int32_t)psx_mod_read_word(c+0x64);
+        const int32_t tz=(int32_t)psx_mod_read_word(p+0x7bc+8),tx=(int32_t)psx_mod_read_word(p+0x7bc);
+        assert(std::abs((tz-z)-offset)<2);             // eye moved to Duke's right
+        assert(x<tx);                                  // and still behind him along +X
+        assert(psx_mod_read_word(p+4)==0 && psx_mod_read_word(p+12)==0); // no position commits
+        std::ifstream saved(state);std::string text((std::istreambuf_iterator<char>(saved)),std::istreambuf_iterator<char>());
+        assert(text=="{\"camera_distance\": 6144, \"shoulder\": \"right\", \"view\": \"third\"}\n");
+        std::remove(state);ttk::input.shoulder=-1;frame();
+        assert(!std::ifstream(state)); // no write until the side has settled for 30 frames
+        for(unsigned i=0;i<31;++i)frame();
+        std::ifstream again(state);std::string left((std::istreambuf_iterator<char>(again)),std::istreambuf_iterator<char>());
+        assert(left.find("\"left\"")!=std::string::npos);
+        std::remove(state);unsetenv("DNTTK_CAMERA_STATE_FILE");
+        ttk::input.shoulder=0;for(unsigned i=0;i<60;++i)frame();
+        assert(std::abs(metric("\"shoulder_offset\":"))<1);
+        // Exercise the optional D10B comparison in a separate process run.
+        if(tight_enabled) {
+            const double preference=metric("\"preferred_radius\":");
+            frame();sp=0x801f0000-0xb8;
+            call(0x8003aa48,c,sp+0x18,0x8003aeb0,sp);
+            assert(psx_mod_read_word(0x800c3c48)==256);
+            const double y=metric("\"yaw\":"),pitch=metric("\"pitch\":");
+            const double forward[]={std::sin(y)*std::cos(pitch),std::sin(pitch),std::cos(y)*std::cos(pitch)};
+            for(int i=0;i<3;++i) {
+                double target=(int32_t)psx_mod_read_word(p+0x7bc+4*i);
+                if(i==1)target+=(int32_t)psx_mod_read_word(c+0x88);
+                psx_mod_write_word(sp+0x28+4*i,(int32_t)std::lround(target-forward[i]*2000));
+            }
+            psx_mod_write_word(sp+0x20,1500);
+            auto follow=[&](uint32_t ra,int delta) {
+                CPUState cpu{};cpu.gpr[4]=delta;cpu.gpr[5]=4;cpu.gpr[29]=sp;cpu.gpr[31]=ra;
+                hooks().at(0x8002a038)(&cpu,0x8002a038);return cpu;
+            };
+            assert(follow(0x8003af40,100).gpr[5]==1);
+            assert(psx_mod_read_word(0x800c3c48)==768);
+            assert(follow(0x8003af80,1500).gpr[5]==1);
+            assert(follow(0x8003af80,-100).gpr[4]==0);
+            for(int i=0;i<10;++i)frame();
+            assert(follow(0x8003af80,-100).gpr[5]>1);
+            assert(follow(0x80012345,-100).gpr[5]==4);
+            assert(metric("\"preferred_radius\":")==preference);
+            // End at a clear solve, so later camera fixtures have no obstruction.
+            psx_mod_write_word(sp+0x20,-5000);follow(0x8003af40,0);
+            call(0x800348d8,c,p,0x8003769c);
+            constexpr uint32_t ctx=0x800d67a8;
+            const uint32_t oldflags=psx_mod_read_word(p),old224=psx_mod_read_word(p+0x224);
+            const uint16_t effects[]={psx_mod_read_half(p+0x89c),psx_mod_read_half(p+0x89e),psx_mod_read_half(p+0x8a0)};
+            psx_mod_write_word(p,oldflags&~0x6040u);psx_mod_write_word(p+0x224,old224&~0x200000u);
+            for(int i=0;i<3;++i)psx_mod_write_half(p+0x89c+2*i,0);
+            auto native_fade=[&] {psx_mod_write_word(ctx+0x48,0x02000000);psx_mod_write_word(ctx+0x4c,0x600000);};
+            CPUState draw{};
+            call(0x8001ca4c,0,0,0x80012345); // nested list iteration cannot end Duke
+            assert(ttk::third_person_duke_drawing());
+            native_fade();ttk::third_person_mesh_begin(&draw);
+            assert(psx_mod_read_word(ctx+0x48)==0 && psx_mod_read_word(ctx+0x4c)==0);
+            call(0x8001ca4c,0,0,0x800376b4);
+            assert(psx_mod_read_word(ctx+0x48)==0x02000000);
+            call(0x800348d8,c,p,0x8003769c);
+            {
+                uint32_t eye[3];
+                for(int i=0;i<3;++i) {
+                    eye[i]=psx_mod_read_word(c+0x14+4*i);
+                    const int root=(int32_t)psx_mod_read_word(p+4+4*i)-(i==1?640:0);
+                    psx_mod_write_word(c+0x14+4*i,root-(int32_t)std::lround(forward[i]*1000));
+                }
+                const double opacity=ttk::third_person_body_coverage();assert(opacity>0 && opacity<1);
+                std::vector<uint8_t> image(ttk::render_state_size());ttk::render_state_save(image.data());
+                const pid_t child=fork();assert(child>=0);
+                if(child==0) {
+                    renderer_available=false;ttk::render_state_load(image.data());
+                    assert(ttk::third_person_camera_live());
+                    assert(std::abs(ttk::third_person_body_coverage()-opacity)<1e-9);
+                    // D17AY: a redraw between ticks moves Duke and the eye
+                    // together; the dissolve follows Duke's in-between position,
+                    // not the last tick's (which would read 300 units nearer).
+                    TestDrawPose duke{p,{},0};
+                    for(int i=0;i<3;++i) {
+                        duke.pos[i]=int32_t(psx_mod_read_word(p+4+4*i))+forward[i]*300;
+                        psx_mod_write_word(c+0x14+4*i,uint32_t(int32_t(psx_mod_read_word(c+0x14+4*i))+int32_t(std::lround(forward[i]*300))));
+                    }
+                    assert(std::abs(ttk::third_person_body_coverage()-opacity)>1e-3);
+                    test_draw_poses={duke};
+                    assert(std::abs(ttk::third_person_body_coverage()-opacity)<1e-3);
+                    test_draw_poses.clear();
+                    _exit(0);
+                }
+                int status=0;assert(waitpid(child,&status,0)==child && WIFEXITED(status) && WEXITSTATUS(status)==0);
+                for(int i=0;i<3;++i)psx_mod_write_word(c+0x14+4*i,eye[i]);
+            }
+            psx_mod_write_half(p+0x89c,1);native_fade();ttk::third_person_mesh_begin(&draw);
+            assert(psx_mod_read_word(ctx+0x48)==0x02000000);
+            assert(ttk::third_person_body_coverage()==1);
+            call(0x8001ca4c,0,0,0x800376b4);
+            psx_mod_write_word(p,oldflags);psx_mod_write_word(p+0x224,old224);
+            for(int i=0;i<3;++i)psx_mod_write_half(p+0x89c+2*i,effects[i]);
+            psx_mod_write_word(ctx+0x48,0);psx_mod_write_word(ctx+0x4c,0);
+            std::puts("PASS: D10B scoped minimum, inward solve, outward hold/recovery and saved-distance isolation");
+        } else {
+            // D10B1: ordinary launches leave native collision/fade decisions intact.
+            // D10F1: only the follow easing takes the clear-lens delta (rate 1).
+            const char* lens_env=std::getenv("DNTTK_CLEAR_LENS");
+            const bool lens_on=!lens_env || std::strcmp(lens_env,"0");
+            psx_mod_write_half(c+0x42,386);
+            frame();sp=0x801f0000-0xb8;
+            call(0x8003aa48,c,sp+0x18,0x8003aeb0,sp);
+            assert(psx_mod_read_word(0x800c3c48)==768);
+            for(uint32_t ra:{0x8003af40u,0x8003af60u,0x8003af80u}) {
+                CPUState cpu{};cpu.gpr[4]=(uint32_t)-100;cpu.gpr[5]=4;
+                cpu.gpr[29]=sp;cpu.gpr[31]=ra;
+                hooks().at(0x8002a038)(&cpu,0x8002a038);
+                if(lens_on) assert(cpu.gpr[5]==1);
+                else assert(cpu.gpr[4]==(uint32_t)-100 && cpu.gpr[5]==4);
+            }
+            assert(psx_mod_read_word(0x800c3c48)==768);
+            if(lens_on) {
+                // One camera update: frame, constraint, the three easing calls.
+                // Returns the eased view-space delta the update would apply.
+                auto lens_update=[&](double ms,int32_t* view) {
+                    ttk::clock_ms+=ms;frame();
+                    call(0x8003aa48,c,sp+0x18,0x8003aeb0,sp);
+                    for(int i=0;i<3;++i) {
+                        double t=(int32_t)psx_mod_read_word(p+0x7bc+4*i);if(i==1)t+=(int32_t)psx_mod_read_word(c+0x88);
+                        psx_mod_write_word(sp+0x28+4*i,(uint32_t)std::lround(t));
+                    }
+                    int axis=0;
+                    for(uint32_t ra:{0x8003af40u,0x8003af60u,0x8003af80u}) {
+                        CPUState cpu{};cpu.gpr[4]=psx_mod_read_word(sp+0x18+4*axis);cpu.gpr[5]=4;
+                        cpu.gpr[29]=sp;cpu.gpr[31]=ra;
+                        hooks().at(0x8002a038)(&cpu,0x8002a038);
+                        assert(cpu.gpr[5]==1);view[axis++]=(int32_t)cpu.gpr[4];
+                    }
+                };
+                int32_t view[3];
+                const double queries=ttk::camera_queries,declines=metric("\"declines\":");
+                lens_update(16,view);
+                assert(ttk::camera_queries>queries);
+                const double reach=metric("\"reach\":");const int32_t open_z=view[2];
+                assert(reach>800 && std::abs(metric("\"clear_lens\":{\"enabled\":true,\"live\":true,\"lens\":")-reach)<1e-6);
+                // Duke faces +X and the camera sits behind him: a wall across
+                // -X shortens the boom at once, in front of the wall.
+                const double tx=(int32_t)psx_mod_read_word(p+0x7bc);
+                ttk::camera_wall_axis=0;ttk::camera_wall=tx-700;
+                // A still camera reuses its probe for one update: two updates.
+                lens_update(16,view);lens_update(16,view);
+                const double lens=metric("\"lens\":");
+                assert(lens<700 && lens>=450 && lens<reach);
+                assert(view[2]>open_z); // the anchor lands forward of the open boom, toward Duke
+                // A wall inside the floor: the lens stops at the floor (450).
+                ttk::camera_wall=tx-300;lens_update(16,view);lens_update(16,view);
+                assert(std::abs(metric("\"lens\":")-450)<1);
+                // Clear again: hold briefly, then ease back out in host time.
+                ttk::camera_wall=0;lens_update(16,view);lens_update(16,view);
+                assert(std::abs(metric("\"lens\":")-450)<1);
+                lens_update(150,view);
+                const double easing=metric("\"lens\":");assert(easing>450 && easing<reach);
+                for(int i=0;i<90;++i)lens_update(1000.0/60,view);
+                assert(std::abs(metric("\"lens\":")-reach)<1e-6);
+                {
+                    // D08J3A: on a climb (ladder, mode 3) the floor is the
+                    // minimum, so the lens stays in front of the near wall.
+                    const uint8_t m0=psx_mod_read_byte(p+0x22c),m1=psx_mod_read_byte(p+0x22d);const uint16_t a0=psx_mod_read_half(p+0x60);
+                    psx_mod_write_byte(p+0x22c,3);psx_mod_write_byte(p+0x22d,3);psx_mod_write_half(p+0x60,187);
+                    ttk::camera_wall=tx-300;
+                    lens_update(16,view);lens_update(16,view);
+                    const double climb_lens=metric("\"lens\":");
+                    assert(metric("\"attached\":true")>=0 && climb_lens<300 && climb_lens>=96);
+                    psx_mod_write_byte(p+0x22c,m0);psx_mod_write_byte(p+0x22d,m1);psx_mod_write_half(p+0x60,a0);
+                    assert(metric("\"attached\":false")>=0);
+                    for(int i=0;i<90;++i)lens_update(1000.0/60,view);
+                    assert(std::abs(metric("\"lens\":")-450)<1); // back on the ground: eased out to the 450 floor
+                    ttk::camera_wall=0;for(int i=0;i<90;++i)lens_update(1000.0/60,view);
+                    assert(std::abs(metric("\"lens\":")-reach)<1e-6);
+                    std::puts("PASS: D08J3A clear lens: climbs use the minimum floor, the ground keeps 450");
+                }
+                assert(metric("\"declines\":")==declines);
+                assert(metric("\"preferred_radius\":")>=768); // the saved boom is never written
+                std::puts("PASS: D10F1 clear lens: rate-1 delta, instant pull-in in front of a wall, floor, hold and eased return");
+            }
+            assert(!ttk::third_person_camera_live());
+            assert(ttk::third_person_body_coverage()==1);
+            call(0x800348d8,c,p,0x8003769c);
+            constexpr uint32_t ctx=0x800d67a8;
+            psx_mod_write_word(ctx+0x48,0x02000000);
+            psx_mod_write_word(ctx+0x4c,0x600000);
+            CPUState draw{};ttk::third_person_mesh_begin(&draw);
+            assert(psx_mod_read_word(ctx+0x48)==0x02000000);
+            assert(psx_mod_read_word(ctx+0x4c)==0x600000);
+            std::vector<uint8_t> image(ttk::render_state_size());
+            ttk::render_state_save(image.data());
+            const pid_t child=fork();assert(child>=0);
+            if(child==0) {
+                ttk::render_state_load(image.data());
+                assert(!ttk::third_person_camera_live());
+                assert(ttk::third_person_body_coverage()==1);
+                _exit(0);
+            }
+            int status=0;assert(waitpid(child,&status,0)==child && WIFEXITED(status) && WEXITSTATUS(status)==0);
+            call(0x8001ca4c,0,0,0x800376b4);
+            psx_mod_write_word(ctx+0x48,0);psx_mod_write_word(ctx+0x4c,0);
+            std::puts("PASS: D10B1 native minimum/follow/fade retained, no body dissolve, replay gate off");
+        }
+        // D36H9: the ledge hang draw iterates a list (0x8001ca4c, ra 0x80075810)
+        // inside Duke's own draw, below the object loop's frame. Only the
+        // loop's own step at the actor-entry stack ends Duke's draw ownership.
+        call(0x800348d8,c,p,0x8003769c);assert(ttk::first_person_duke_drawing());
+        call(0x8001ca4c,0x800d0000,0,0x80075810,0x801effa0);assert(ttk::first_person_duke_drawing());
+        call(0x8001ca4c,0x800d0000,0,0x800376b4);assert(!ttk::first_person_duke_drawing());
+        std::puts("PASS: D36H9 nested list iteration keeps Duke's draw ownership until the loop step");
+        // D35N: only reflected Duke loses the native close-distance fade.
+        // Primary body, other actors, powers and Vanilla retain their policy.
+        {
+            constexpr uint32_t ctx=0x800d67a8,mirror=0x801ffe58;
+            const auto oldflags=psx_mod_read_word(p),old224=psx_mod_read_word(p+0x224);
+            const auto bright=psx_mod_read_byte(p+0x1b);
+            const uint16_t effects[]={psx_mod_read_half(p+0x89c),psx_mod_read_half(p+0x89e),psx_mod_read_half(p+0x8a0)};
+            psx_mod_write_word(p,0);psx_mod_write_word(p+0x224,0);psx_mod_write_byte(p+0x1b,0x90);
+            for(int i=0;i<3;++i)psx_mod_write_half(p+0x89c+2*i,0);
+            auto native=[&] {psx_mod_write_word(ctx+0x48,0x02000000);psx_mod_write_word(ctx+0x4c,0x600000);psx_mod_write_word(ctx+0x54,0x3c223344);};
+            CPUState draw{};draw.gpr[29]=0x801f0000;
+            draw.gte_ctrl[13]=10;draw.gte_ctrl[14]=20;draw.gte_ctrl[15]=30;
+            call(0x800348d8,mirror,p,0x8003816c);native();ttk::third_person_mesh_begin(&draw);
+            assert(psx_mod_read_word(ctx+0x48)==0 && psx_mod_read_word(ctx+0x4c)==0);
+            assert(psx_mod_read_word(ctx+0x54)==0x3c909090 && draw.gte_ctrl[13]==0x900);
+            assert(!ttk::third_person_duke_drawing() && !ttk::first_person_duke_drawing());
+            call(0x8001ca4c,0,0,0x80012345); // nested list calls cannot end the reflection
+            assert(psx_mod_read_word(ctx+0x48)==0);
+            draw.gpr[31]=0x80038184;hooks().at(0x8001ca4c)(&draw,0x8001ca4c);
+            assert(psx_mod_read_word(ctx+0x48)==0x02000000 && psx_mod_read_word(ctx+0x54)==0x3c223344);
+            assert(draw.gte_ctrl[13]==10 && draw.gte_ctrl[14]==20 && draw.gte_ctrl[15]==30);
+            for(unsigned effect=0;effect<7;++effect) {
+                psx_mod_write_word(p,effect<3?(1u<<(effect==0?6:effect==1?13:14)):0);
+                psx_mod_write_word(p+0x224,effect==3?0x200000:0);
+                for(int i=0;i<3;++i)psx_mod_write_half(p+0x89c+2*i,effect==unsigned(i+4)?1:0);
+                call(0x800348d8,mirror,p,0x8003816c);native();ttk::third_person_mesh_begin(&draw);
+                assert(psx_mod_read_word(ctx+0x48)==0x02000000);
+                call(0x8001ca4c,0,0,0x80038184);
+            }
+            psx_mod_write_word(p,0);psx_mod_write_word(p+0x224,0);
+            for(int i=0;i<3;++i)psx_mod_write_half(p+0x89c+2*i,0);
+            for(unsigned route=0;route<3;++route) {
+                ttk::modern=route!=2;
+                call(0x800348d8,mirror,route==0?p+0x100:p,route==1?0x80012345:0x8003816c);
+                native();ttk::third_person_mesh_begin(&draw);assert(psx_mod_read_word(ctx+0x48)==0x02000000);
+            }
+            ttk::modern=true;
+            // Another actor clears the draw-local lease.
+            call(0x800348d8,mirror,p,0x8003816c);native();ttk::third_person_mesh_begin(&draw);
+            call(0x800348d8,mirror,p+0x100,0x8003816c);assert(psx_mod_read_word(ctx+0x48)==0x02000000);
+            native();ttk::third_person_mesh_begin(&draw);assert(psx_mod_read_word(ctx+0x48)==0x02000000);
+            psx_mod_write_word(p,oldflags);psx_mod_write_word(p+0x224,old224);psx_mod_write_byte(p+0x1b,bright);
+            for(int i=0;i<3;++i)psx_mod_write_half(p+0x89c+2*i,effects[i]);
+            psx_mod_write_word(ctx+0x48,0);psx_mod_write_word(ctx+0x4c,0);
+            std::puts("PASS: D35N reflected Duke fade, color/GTE restore, actor/pass isolation, powers and Vanilla");
+        }
+        // D11 first-person: the eye follows the neck joint; the anchor sits half a
+        // projection distance ahead of it. The original minimum boom is relaxed
+        // only while the eye view blends in, and the head joint is flagged only
+        // between Duke's draw and the next object-list step.
+        {
+            const uint32_t desc=0x801d5820,mats=0x801d6000,record=desc+0x44+0x28*9;
+            psx_mod_write_word(p+0x40,desc);psx_mod_write_word(p+0x3c,mats);
+            // D11D/D12B: joint -> part per costume (records byte 1; the part ->
+            // joint table at +0x24), as dumped from the first map and LEVEL01.
+            static constexpr uint8_t first_map[19]={0x00,0x09,0x0a,0x0b,0x0c,0x0d,0x0e,0x0f,0x14,0x10,0x01,0x02,0x03,0x04,0x05,0x06,0x07,0x08,0x15};
+            static constexpr uint8_t cowboy[19]={0x00,0x01,0x02,0x03,0x04,0x05,0x06,0x07,0x08,0x15,0x09,0x0d,0x0e,0x0f,0x14,0x10,0x0a,0x0b,0x0c};
+            auto layout=[&](const uint8_t* parts){
+                for(unsigned i=0;i<0x20;++i) psx_mod_write_byte(desc+0x24+i,0xff);
+                for(unsigned j=0;j<19;++j) {
+                    psx_mod_write_byte(desc+0x24+parts[j],j);psx_mod_write_byte(desc+0x44+0x28*j+1,parts[j]);
+                    psx_mod_write_byte(desc+0x44+0x28*j+2,parts[j]==0x10 || parts[j]==0x15 ? 3 : 2);
+                    psx_mod_write_byte(desc+0x44+0x28*j,0);
+                }
+            };
+            psx_mod_write_byte(desc,19);layout(first_map);
+            const int32_t root[3]={1000,-500,2000},neck[3]={1010,-690,2005};
+            int32_t saved_root[3];
+            for(int i=0;i<3;++i) {
+                saved_root[i]=psx_mod_read_word(p+4+4*i);
+                psx_mod_write_word(p+4+4*i,root[i]);psx_mod_write_word(mats+0x20*9+0x14+4*i,neck[i]);
+            }
+            psx_mod_write_half(c+0x42,386);
+            assert(psx_mod_read_word(0x800c3c48)==768);
+            ttk::input.first_person=true;
+            for(unsigned i=0;i<40;++i)frame();
+            assert(metric("\"blend\":")==1);
+            sp=0x801f0000-0xb8;call(0x8003aa48,c,sp+0x18,0x8003aeb0,sp);
+            assert(psx_mod_read_word(0x800c3c48)==0);
+            // The relaxed boom never outlives the camera update (save states).
+            call(0x8002a038,0,1,0x8003af40,sp);assert(psx_mod_read_word(0x800c3c48)==768);
+            // The render's per-frame H load gets the eye view's shorter distance;
+            // camera[+0x42] itself is never written.
+            {
+                CPUState cpu{};cpu.gpr[4]=386;cpu.gpr[31]=0x8002e4d0;cpu.gpr[29]=0x801f0000;
+                hooks().at(0x800b4d9c)(&cpu,0x800b4d9c);assert(cpu.gpr[4]==256);
+                cpu.gpr[4]=386;cpu.gpr[31]=0x800255dc;hooks().at(0x800b4d9c)(&cpu,0x800b4d9c);assert(cpu.gpr[4]==386);
+                // D14A: degree conversion, strict validation and real guarded H.
+                assert(ttk::fp_fov_projection(64)==256);
+                assert(ttk::fp_fov_projection(ttk::fp_fov_default)==160);
+                assert(ttk::fp_fov_projection(120)==92);
+                assert(std::abs(ttk::fp_fov_degrees(256)-64.010766)<.00001);
+                double parsed=0;
+                for(const char* bad:{"", "nan", "inf", "90x", "59.9", "120.1"})
+                    assert(!ttk::fp_fov_parse(bad,parsed));
+                assert(ttk::fp_fov_parse("75",parsed) && parsed==75);
+                for(double degrees:{60.0,64.0,75.0,90.0,105.0,120.0}) {
+                    assert(ttk::first_person_set_fov(degrees));
+                    cpu.gpr[4]=386;cpu.gpr[31]=0x8002e4d0;
+                    hooks().at(0x800b4d9c)(&cpu,0x800b4d9c);
+                    assert(cpu.gpr[4]==unsigned(ttk::fp_fov_projection(degrees)));
+                    assert(psx_mod_read_half(c+0x42)==386);
+                    cpu.gpr[4]=386;cpu.gpr[31]=0x800255dc;
+                    hooks().at(0x800b4d9c)(&cpu,0x800b4d9c);assert(cpu.gpr[4]==386);
+                }
+                assert(!ttk::first_person_set_fov(NAN) && !ttk::first_person_set_fov(121));
+                assert(std::abs(ttk::first_person_fov_setting()-ttk::fp_fov_degrees(92))<.0001);
+                assert(ttk::first_person_set_fov(90));
+                ttk::modern=false;cpu.gpr[4]=386;cpu.gpr[31]=0x8002e4d0;
+                hooks().at(0x800b4d9c)(&cpu,0x800b4d9c);assert(cpu.gpr[4]==386);ttk::modern=true;
+                // Worker snapshot must retain 90 even after live selection is 60.
+                const pid_t child=fork();assert(child>=0);
+                if(!child) {
+                    std::vector<unsigned char> snapshot(ttk::render_state_size());
+                    ttk::render_state_save(snapshot.data());
+                    ttk::first_person_set_fov(60);ttk::render_state_load(snapshot.data());
+                    cpu.gpr[4]=386;cpu.gpr[31]=0x8002e4d0;
+                    hooks().at(0x800b4d9c)(&cpu,0x800b4d9c);assert(cpu.gpr[4]==160);
+                    _exit(0);
+                }
+                int status=0;waitpid(child,&status,0);assert(WIFEXITED(status) && WEXITSTATUS(status)==0);
+                ttk::input.first_person=false;for(unsigned i=0;i<40;++i)frame();
+                cpu.gpr[4]=386;cpu.gpr[31]=0x8002e4d0;
+                hooks().at(0x800b4d9c)(&cpu,0x800b4d9c);assert(cpu.gpr[4]==386);
+                ttk::first_person_set_fov(64);ttk::input.first_person=true;for(unsigned i=0;i<40;++i)frame();
+                std::puts("PASS: D14A FOV degrees, invalid values, exact default, scoped projection and replay snapshot");
+            }
+            double forward[3],anchor[3];
+            for(int i=0;i<3;++i) {
+                forward[i]=(int16_t)psx_mod_read_half(c+12+2*i)/4096.0;
+                anchor[i]=(int32_t)psx_mod_read_word(sp+0x18+4*i)+(int32_t)psx_mod_read_word(c+0x64+4*i);
+            }
+            const double flat=std::hypot(forward[0],forward[2]);
+            (void)flat;
+            const double eye[3]={(double)neck[0],neck[1]-96.0,(double)neck[2]};
+            // The anchor is half the camera's projection distance ahead of the eye.
+            assert((int16_t)psx_mod_read_half(c+0x42)==386);
+            for(int i=0;i<3;++i) assert(std::abs(anchor[i]-(eye[i]+forward[i]*193))<3);
+            assert(psx_mod_read_word(p+4)==(uint32_t)root[0]); // no position commits
+            call(0x800348d8,c,p,0x8003769c);assert(psx_mod_read_byte(record)&1);
+            call(0x8001ca4c,0x800d0000,0,0x800376b4);assert(!(psx_mod_read_byte(record)&1));
+            // D11C: a stale save-state hide in first person is adopted for this
+            // draw and released at the list step like our own.
+            psx_mod_write_byte(record,1);
+            call(0x800348d8,c,p,0x8003769c);assert(psx_mod_read_byte(record)&1);
+            call(0x8001ca4c,0x800d0000,0,0x800376b4);assert(!(psx_mod_read_byte(record)&1));
+            call(0x800348d8,c,0x800d8000,0x8003769c);assert(!(psx_mod_read_byte(record)&1)); // other actors
+            call(0x800348d8,c,p,0x80037718);assert(!(psx_mod_read_byte(record)&1));          // other draw loop
+            // D11D: the cowboy costume's neck is joint 15 (joint 9 sits at the
+            // hip). The eye follows joint 15 and joint 15 is hidden; a stale bit
+            // on joint 9 from an older build is reclaimed.
+            {
+                layout(cowboy);
+                const uint32_t record15=desc+0x44+0x28*15;
+                int32_t saved9[3];
+                for(int i=0;i<3;++i) {
+                    saved9[i]=psx_mod_read_word(mats+0x20*9+0x14+4*i);
+                    psx_mod_write_word(mats+0x20*9+0x14+4*i,root[i]+(i==1?89:0));
+                    psx_mod_write_word(mats+0x20*15+0x14+4*i,neck[i]);
+                }
+                psx_mod_write_byte(record,1);
+                for(unsigned i=0;i<40;++i)frame();
+                call(0x8003aa48,c,sp+0x18,0x8003aeb0,sp);
+                for(int i=0;i<3;++i) {
+                    const double a=(int32_t)psx_mod_read_word(sp+0x18+4*i)+(int32_t)psx_mod_read_word(c+0x64+4*i);
+                    assert(std::abs(a-(eye[i]+forward[i]*193))<3);
+                }
+                call(0x8002a038,0,1,0x8003af40,sp);
+                call(0x800348d8,c,p,0x8003769c);
+                assert(!(psx_mod_read_byte(record)&1) && (psx_mod_read_byte(record15)&1));
+                call(0x8001ca4c,0x800d0000,0,0x800376b4);assert(!(psx_mod_read_byte(record15)&1));
+                for(int i=0;i<3;++i) psx_mod_write_word(mats+0x20*9+0x14+4*i,saved9[i]);
+                layout(first_map);
+                for(unsigned i=0;i<40;++i)frame();
+            }
+            // D36H6: a 60-Hz direct unarmed load has never drawn a weapon or
+            // reserved replay scratch. Exercise that first draw in fresh children
+            // before the weapon tests below can accidentally warm the allocation.
+            for(const auto* costume:{first_map,cowboy}) {
+                const pid_t child=fork();assert(child>=0);
+                if(!child) {
+                    layout(costume);psx_mod_write_byte(p+0x3b8,0);
+                    for(unsigned j=0;j<19;++j) {
+                        for(unsigned k=0;k<9;++k)
+                            psx_mod_write_half(mats+32*j+2*k,k%4==0?4096:0);
+                        for(unsigned k=0;k<3;++k)
+                            psx_mod_write_word(mats+32*j+20+4*k,root[k]);
+                    }
+                    // Keep the synthetic pelvis beneath the actual eye so the
+                    // displaced-eye safety guard does not own this arm draw.
+                    for(unsigned k=0;k<3;++k)
+                        psx_mod_write_word(mats+20+4*k,psx_mod_read_word(c+20+4*k)+(k==1?294:0));
+                    const std::vector<uint8_t> original(ram+(mats&0x1fffff),ram+(mats&0x1fffff)+19*32);
+                    uint32_t scratch=0;
+                    for(unsigned j=0;j<19;++j) {
+                        if(costume[j]<10 || costume[j]>15)continue;
+                        call(0x800348d8,c,p,0x8003769c);
+                        CPUState cpu{};cpu.gpr[4]=c;cpu.gpr[5]=mats+32*j;
+                        cpu.gpr[20]=p;cpu.gpr[23]=j;cpu.gpr[29]=0x801f0000;cpu.gpr[31]=0x80034c6c;
+                        hooks().at(0x800292a0)(&cpu,0x800292a0);
+                        assert(ttk::first_person_limb_presentation().owner==ttk::LimbOwner::Body);
+                        assert(cpu.gpr[5]!=mats+32*j);
+                        if(scratch)assert(cpu.gpr[5]==scratch);
+                        scratch=cpu.gpr[5];
+                        for(unsigned k=0;k<0x14;k+=4)
+                            assert(psx_mod_read_word(scratch+k)==psx_mod_read_word(mats+32*j+k));
+                        for(unsigned k=0;k<3;++k) {
+                            const int32_t down=std::lround(120.0*int16_t(psx_mod_read_half(c+6+2*k))/4096.0);
+                            assert(psx_mod_read_word(scratch+20+4*k)==uint32_t(root[k]+down));
+                        }
+                        call(0x8001ca4c,0x800d0000,0,0x800376b4);
+                    }
+                    assert(std::equal(original.begin(),original.end(),ram+(mats&0x1fffff)));
+                    _exit(0);
+                }
+                int status=0;waitpid(child,&status,0);
+                assert(WIFEXITED(status) && WEXITSTATUS(status)==0);
+            }
+            std::puts("PASS: D36H6 cold unarmed arm lowering, both costume orders, shared scratch and native matrix preservation");
+            // D12 first-person weapon: only the draw loop's hand transform and its
+            // attached draws get the private matrix; arm joints get one at the eye;
+            // Duke's joint matrices are never written.
+            {
+                auto hook=[&](uint32_t address,uint32_t a0,uint32_t a1,uint32_t ra,uint32_t joint,uint32_t a3=0,uint32_t sp2=0x801f0000){
+                    CPUState cpu{};cpu.gpr[4]=a0;cpu.gpr[5]=a1;cpu.gpr[7]=a3;cpu.gpr[20]=p;cpu.gpr[23]=joint;
+                    cpu.gpr[31]=ra;cpu.gpr[29]=sp2;hooks().at(address)(&cpu,address);return cpu;
+                };
+                psx_mod_write_byte(desc+0x33,7);
+                for(unsigned j=0;j<19;++j) for(int i=0;i<9;++i) psx_mod_write_half(mats+0x20*j+2*i,i%4==0?4096:0);
+                // Synthetic skeletons need an actual pelvis beneath the eye.
+                for(int i=0;i<3;++i)psx_mod_write_word(mats+0x14+4*i,psx_mod_read_word(c+0x14+4*i)+(i==1?294:0));
+                for(int i=0;i<3;++i) psx_mod_write_word(mats+0x20*7+0x14+4*i,neck[i]+(i==2?250:120));
+                const uint8_t saved_state=psx_mod_read_byte(p+0x3b8),saved_slot=psx_mod_read_byte(p+0x3b9);
+                psx_mod_write_byte(p+0x3b8,2);psx_mod_write_byte(p+0x3b9,4);
+                std::vector<uint8_t> before(ram+(mats&0x1fffff),ram+(mats&0x1fffff)+0x20*19);
+                const uint32_t hand=mats+0x20*7;
+                call(0x800348d8,c,p,0x8003769c);
+                auto h=hook(0x800292a0,c,hand,0x80034c6c,7);
+                assert(h.gpr[5]!=hand && h.gpr[5]>=0x801e0000 && ttk::first_person_weapon_drawing());
+                const auto hand_owner=ttk::first_person_limb_presentation();
+                assert(hand_owner.owner==ttk::LimbOwner::DisplayHand && hand_owner.parts==(1u<<0x0f));
+                assert(hand_owner.space==ttk::LimbSpace::CameraRelative && hand_owner.depth==ttk::LimbDepth::Viewmodel);
+                assert(hand_owner.light==ttk::LimbLight::CorrectProximityFade && !hand_owner.bridge_joint_depth);
+                const uint32_t vm=h.gpr[5];
+                assert(hook(0x80033e40,hand,0,0x8003531c,7).gpr[4]==vm);          // weapon mesh
+                assert(hook(0x80033f5c,hand,4,0x80035250,7).gpr[4]==vm);          // held item
+                assert(hook(0x80033e40,hand,0,0x80035000,7).gpr[4]==hand);        // other caller
+                // Muzzle flash: placed from the same matrix, so it stays on the weapon.
+                assert(hook(0x800341e4,hand,4,0x80035348,7,0x801d7000).gpr[4]==vm);
+                // The flash's own transform (another caller) is left alone.
+                assert(hook(0x800292a0,c,0x801f0240,0x8003437c,7,0,0x801f0200).gpr[5]==0x801f0240);
+                // Arm joints go to a matrix at the eye (culled by the loop); others untouched.
+                auto arm=hook(0x800292a0,c,mats+0x20*3,0x80034c6c,3);
+                assert(arm.gpr[5]!=mats+0x20*3 && !ttk::first_person_weapon_drawing());
+                assert(ttk::first_person_limb_presentation().owner==ttk::LimbOwner::HiddenArm);
+                assert(!ttk::first_person_limb_presentation().bridge_joint_depth);
+                for(int i=0;i<3;++i) assert(psx_mod_read_word(arm.gpr[5]+0x14+4*i)==psx_mod_read_word(c+0x14+4*i));
+                // D36H: anatomically connected endpoints, using semantic parts
+                // in both costume orders. Only draw scratch changes, never the
+                // native matrices used for gameplay and attachment events.
+                uint8_t arm_camera[18];std::memcpy(arm_camera,ram+(c&0x1fffff),18);
+                for(unsigned i=0;i<9;++i)psx_mod_write_half(c+2*i,i%4==0?4096:0);
+                for(const auto* costume:{first_map,cowboy}) for(unsigned slot:{1u,2u,3u,4u,5u,6u,7u,8u,9u,10u,11u,12u,13u,14u,27u,28u,29u,32u}) {
+                    layout(costume);
+                    std::vector<uint8_t> saved_mats(ram+(mats&0x1fffff),ram+(mats&0x1fffff)+19*0x20);
+                    for(unsigned part=10;part<=15;++part) {
+                        const unsigned j=psx_mod_read_byte(desc+0x24+part);
+                        const int n=(part-10)%3;
+                        for(int k=0;k<3;++k)psx_mod_write_word(mats+32*j+0x14+4*k,
+                            k==0?(part<13?-100:100):k==1?100*n:400);
+                    }
+                    std::vector<uint8_t> native(ram+(mats&0x1fffff),ram+(mats&0x1fffff)+19*0x20);
+                    psx_mod_write_byte(p+0x3b8,slot==32?1:2);psx_mod_write_byte(p+0x3b9,slot==32?6:slot);
+                    const bool support=slot==3 || (slot>=5 && slot<=11) || (slot>=27 && slot<=29);
+                    call(0x800348d8,c,p,0x8003769c);
+                    uint8_t display[6][32];
+                    // Also exercise right-first costume traversal: the hand's
+                    // recoil advance must not detach later left-arm draws.
+                    for(unsigned part:{13u,14u,15u,10u,11u,12u}) {
+                        const unsigned j=psx_mod_read_byte(desc+0x24+part);
+                        auto result=hook(0x800292a0,c,mats+32*j,0x80034c6c,j);
+                        assert(result.gpr[5]!=mats+32*j);
+                        std::memcpy(display[part-10],ram+(result.gpr[5]&0x1fffff),32);
+                        const auto owner=ttk::first_person_limb_presentation();
+                        const bool visible=part>=13 || support;
+                        assert(owner.owner==(part==15?ttk::LimbOwner::DisplayHand:visible?ttk::LimbOwner::DisplayArm:ttk::LimbOwner::HiddenArm));
+                        assert(owner.viewmodel()==visible && owner.parts==(1u<<part));
+                        if(part!=15 && visible) {
+                            result.gpr[31]=0x80034c8c;result.gpr[16]=0;result.gte_ctrl[26]=256;
+                            psx_mod_write_word(result.gpr[29]+0x98,c);
+                            hooks().at(0x800b4d2c)(&result,0x800b4d2c);
+                            assert(result.gpr[16]==256);
+                        }
+                    }
+                    auto word=[](const uint8_t* b){int32_t v;std::memcpy(&v,b,4);return v;};
+                    auto half=[](const uint8_t* b){int16_t v;std::memcpy(&v,b,2);return v;};
+                    for(unsigned i:{0u,1u,3u,4u})for(int k=0;k<3;++k) {
+                        if(i<3 && !support)continue;
+                        // Source child offset is (0,100,0). Stored rotations
+                        // are world-to-joint, so the child uses the transpose.
+                        const double endpoint=word(display[i]+0x14+4*k)+100.0*half(display[i]+2*(3+k))/4096;
+                        if(std::abs(endpoint-word(display[i+1]+0x14+4*k))>=2)std::fprintf(stderr,"D36H endpoint part=%u axis=%d end=%.3f next=%d\n",i+10,k,endpoint,word(display[i+1]+0x14+4*k));
+                        assert(std::abs(endpoint-word(display[i+1]+0x14+4*k))<2);
+                    }
+                    assert(std::equal(native.begin(),native.end(),ram+(mats&0x1fffff)));
+                    call(0x8001ca4c,0x800d0000,0,0x800376b4);
+                    assert(ttk::first_person_limb_presentation().owner==ttk::LimbOwner::Native);
+                    std::copy(saved_mats.begin(),saved_mats.end(),ram+(mats&0x1fffff));
+                }
+                std::memcpy(ram+(c&0x1fffff),arm_camera,18);
+                layout(first_map);psx_mod_write_byte(p+0x3b8,2);psx_mod_write_byte(p+0x3b9,4);
+                call(0x800348d8,c,p,0x8003769c);
+                std::puts("PASS: D36H connected arm endpoints, costume semantic mapping, depth admission and untouched gameplay matrices");
+                assert(hook(0x800292a0,c,mats+0x20*9,0x80034c6c,9).gpr[5]==mats+0x20*9);
+                assert(hook(0x800292a0,c,hand,0x80034c6c,7,0).gpr[5]!=hand);
+                call(0x8001ca4c,0x800d0000,0,0x800376b4);
+                assert(!ttk::first_person_weapon_drawing());
+                // D36G: interrupted primary draw cannot lend its overlay to a
+                // reflection or a foreign actor. Re-entry reconstructs ownership.
+                for(uint32_t actor:{p,0x800d8000u}) {
+                    call(0x800348d8,c,p,0x8003769c);
+                    hook(0x800292a0,c,hand,0x80034c6c,7);
+                    assert(ttk::first_person_weapon_drawing());
+                    call(0x800348d8,c,actor,actor==p?0x8003816c:0x8003769c);
+                    assert(ttk::first_person_limb_presentation().owner==ttk::LimbOwner::Native);
+                    assert(hook(0x800292a0,c,hand,0x80034c6c,7).gpr[5]==hand);
+                }
+                call(0x8001ca4c,0x800d0000,0,0x800376b4);
+                // A replay snapshot describes simulation state, never an active
+                // joint's draw token. Loading it must not write old scope bytes.
+                const pid_t limb_child=fork();assert(limb_child>=0);
+                if(limb_child==0) {
+                    call(0x800348d8,c,p,0x8003769c);
+                    hook(0x800292a0,c,hand,0x80034c6c,7);
+                    std::vector<uint8_t> limb_state(ttk::render_state_size());
+                    ttk::render_state_save(limb_state.data());
+                    const uint32_t context=0x800d67a8;
+                    psx_mod_write_word(context+0x48,0x12345678);
+                    ttk::render_state_load(limb_state.data());
+                    assert(ttk::first_person_limb_presentation().owner==ttk::LimbOwner::Native);
+                    assert(psx_mod_read_word(context+0x48)==0x12345678);
+                    psx_mod_write_word(context+0x48,0);
+                    call(0x800348d8,c,p,0x8003769c);
+                    hook(0x800292a0,c,hand,0x80034c6c,7);
+                    assert(ttk::first_person_weapon_drawing());
+                    ++save_loads;
+                    call(0x800292a0,c,hand,0x80034c6c);
+                    assert(ttk::first_person_limb_presentation().owner==ttk::LimbOwner::Native);
+                    for(unsigned i=0;i<40;++i)frame();
+                    call(0x8001ca4c,0x800d0000,0,0x800376b4);
+                    _exit(0);
+                }
+                int limb_status=0;assert(waitpid(limb_child,&limb_status,0)==limb_child && WIFEXITED(limb_status) && WEXITSTATUS(limb_status)==0);
+                std::puts("PASS: D36G display/hidden/native limb owners, actor boundaries, replay and load token retirement");
+                // Outside Duke's draw or another actor: untouched. Empty hands
+                // use the lowered D36H4 body arm scratch inside the primary draw.
+                assert(hook(0x800292a0,c,hand,0x80034c6c,7).gpr[5]==hand);
+                call(0x800348d8,c,p,0x8003769c);psx_mod_write_byte(p+0x3b8,0);
+                assert(hook(0x800292a0,c,hand,0x80034c6c,7).gpr[5]!=hand);
+                assert(ttk::first_person_limb_presentation().owner==ttk::LimbOwner::Body);
+                assert(hook(0x800292a0,c,mats+0x20*3,0x80034c6c,3).gpr[5]!=mats+0x20*3);
+                psx_mod_write_byte(p+0x3b8,2);
+                {CPUState cpu{};cpu.gpr[4]=c;cpu.gpr[5]=hand;cpu.gpr[20]=0x800d8000;cpu.gpr[23]=7;cpu.gpr[31]=0x80034c6c;cpu.gpr[29]=0x801f0000;
+                 hooks().at(0x800292a0)(&cpu,0x800292a0);assert(cpu.gpr[5]==hand);}
+                call(0x8001ca4c,0x800d0000,0,0x800376b4);
+                assert(std::equal(before.begin(),before.end(),ram+(mats&0x1fffff)));
+                // D12D: resolved upgrade records must have the complete base
+                // viewmodel transform and mesh scale, before and after firing.
+                // Exercise the real draw hooks, leaving the guest record intact.
+                {
+                    auto framing=[&](unsigned slot,bool flash) {
+                        psx_mod_write_byte(p+0x3b9,slot);
+                        call(0x800348d8,c,p,0x8003769c);
+                        for(unsigned i=0;i<40;++i)hook(0x800292a0,c,hand,0x80034c6c,7);
+                        if(flash) {
+                            assert(hook(0x800341e4,hand,4,0x80035348,7).gpr[4]==vm);
+                            hook(0x800292a0,c,hand,0x80034c6c,7);
+                        }
+                        std::array<uint8_t,32> matrix{};
+                        std::copy(ram+(vm&0x1fffff),ram+(vm&0x1fffff)+32,matrix.begin());
+                        const auto mesh=hook(0x80033e40,hand,0,0x8003531c,7,4096);
+                        assert(psx_mod_read_byte(p+0x3b9)==slot);
+                        call(0x8001ca4c,0x800d0000,0,0x800376b4);
+                        return std::make_pair(matrix,mesh.gpr[7]);
+                    };
+                    for(bool flash:{false,true}) {
+                        assert(framing(9,flash)==framing(27,flash));
+                        assert(framing(7,flash)==framing(28,flash));
+                        assert(framing(8,flash)==framing(29,flash));
+                    }
+                    assert(std::equal(before.begin(),before.end(),ram+(mats&0x1fffff)));
+                    psx_mod_write_byte(p+0x3b9,4);
+                }
+                // D36H3: native run twist must be restrained at the draw boundary,
+                // with exact connected bones and an unchanged gameplay skeleton.
+                {
+                    const std::vector<uint8_t> saved_ram(ram,ram+sizeof ram);
+                    const uint32_t frm=0x801b0000,rot=0x801b2000;
+                    psx_mod_write_word(0x800d8324,frm);psx_mod_write_word(0x800d8320,rot);
+                    for(unsigned anim:{18u,19u,20u,29u})for(unsigned ch:{1u,2u}) {
+                        const unsigned clip=100+anim*2+ch,frame=anim*2+ch;
+                        psx_mod_write_half(0x800c2d64+8*anim+2*ch,clip);
+                        psx_mod_write_word(0x800d8328+4*clip,(1u<<16)|frame);
+                        psx_mod_write_word(frm+8*frame,100u<<16);
+                        psx_mod_write_word(frm+8*frame+4,((anim==29 && ch==1?2u:3u)<<16)|(ch==1?3:0));
+                    }
+                    for(unsigned part=10;part<=15;++part) {
+                        const unsigned j=psx_mod_read_byte(desc+0x24+part),n=(part-10)%3;
+                        const uint32_t rec=desc+0x44+0x28*j;
+                        psx_mod_write_byte(rec+2,3+n);
+                        for(unsigned k=0;k<3;++k) {
+                            psx_mod_write_word(rec+0x14+4*k,k==1?100:0);
+                            psx_mod_write_word(mats+32*j+0x14+4*k,k==1?100*n:0);
+                        }
+                        for(unsigned k=0;k<9;++k)psx_mod_write_half(mats+32*j+2*k,k%4==0?4096:0);
+                        psx_mod_write_word(rot+8*(part-10),0);
+                        psx_mod_write_word(rot+8*(part-10)+4,(part<<27)|(4095u<<14));
+                    }
+                    psx_mod_write_half(p+0x60,76);psx_mod_write_byte(p+0x22c,0);
+                    psx_mod_write_byte(p+0x3b8,2);psx_mod_write_byte(p+0x3b9,5);
+                    auto arms=[&](unsigned upper,unsigned prev,unsigned cur,unsigned left) {
+                        psx_mod_write_half(p+0x74,upper);psx_mod_write_half(p+0x78,prev);
+                        psx_mod_write_half(p+0x7a,cur);psx_mod_write_half(p+0x76,left);
+                        call(0x800348d8,c,p,0x8003769c);
+                        std::array<std::array<uint8_t,32>,6> out{};
+                        for(unsigned part=10;part<=15;++part) {
+                            const unsigned j=psx_mod_read_byte(desc+0x24+part);
+                            const auto result=hook(0x800292a0,c,mats+32*j,0x80034c6c,j);
+                            std::memcpy(out[part-10].data(),ram+(result.gpr[5]&0x1fffff),32);
+                        }
+                        call(0x8001ca4c,0x800d0000,0,0x800376b4);
+                        return out;
+                    };
+                    for(unsigned i=0;i<80;++i)arms(20,41,41,0); // settle earlier muzzle-flash recoil
+                    const auto rest=arms(20,41,41,0);
+                    const unsigned elbow=psx_mod_read_byte(desc+0x24+14);
+                    for(unsigned k:{0u,8u})psx_mod_write_half(mats+32*elbow+2*k,2896);
+                    psx_mod_write_half(mats+32*elbow+4,2896);psx_mod_write_half(mats+32*elbow+12,uint16_t(-2896));
+                    const std::vector<uint8_t> native(ram+(mats&0x1fffff),ram+(mats&0x1fffff)+19*32);
+                    const auto swung=arms(20,41,41,0),run=arms(18,37,37,0);
+                    auto distance=[](const auto& a,const auto& b) {
+                        double d=0;for(unsigned k=0;k<9;++k) {int16_t x,y;std::memcpy(&x,a[4].data()+2*k,2);std::memcpy(&y,b[4].data()+2*k,2);d+=double(x-y)*(x-y);}return d;
+                    };
+                    assert(distance(run,rest)<distance(swung,rest)/4);
+                    assert(run[5]==swung[5]); // right grip / weapon / muzzle unchanged
+                    assert(arms(18,41,37,100)==swung); // native transition begins at zero
+                    assert(arms(20,37,41,0)==swung); // and restores on its own last tick
+                    const auto middle=arms(18,41,37,50);
+                    assert(distance(middle,swung)>0 && distance(middle,run)>0);
+                    assert(arms(21,37,37,0)==swung); // firing never borrows run correction
+                    arms(18,37,37,0);
+                    std::vector<uint8_t> run_state(ttk::render_state_size()),idle_state(run_state.size());
+                    ttk::render_state_save(run_state.data());arms(20,41,41,0);ttk::render_state_save(idle_state.data());
+                    const pid_t run_child=fork();assert(run_child>=0);
+                    if(run_child==0) {
+                        ttk::render_state_load(run_state.data());assert(arms(20,41,41,0)==run);
+                        auto blend=run_state;ttk::render_state_blend_mask(blend.data(),idle_state.data(),.5);
+                        ttk::render_state_load(blend.data());const auto between=arms(20,41,41,0);
+                        assert(between!=run && between!=swung);
+                        ttk::render_state_load(idle_state.data());assert(arms(18,37,37,0)==swung);
+                        _exit(0);
+                    }
+                    int run_status=0;waitpid(run_child,&run_status,0);
+                    assert(WIFEXITED(run_status) && WEXITSTATUS(run_status)==0);
+                    // D36H2: Buffalo running must not roll its cuff through
+                    // the fixed trigger grip. Left-hand seating and the hand /
+                    // weapon anchor remain identical; attack/reload stay native.
+                    psx_mod_write_byte(p+0x3b9,6);
+                    const auto rifle_swung=arms(20,41,41,0),rifle_run=arms(18,37,37,0);
+                    assert(distance(rifle_swung,rifle_run)>0);
+                    for(unsigned n:{0u,1u,2u,5u})assert(rifle_swung[n]==rifle_run[n]);
+                    assert(arms(18,41,37,100)==rifle_swung);
+                    assert(arms(20,37,41,0)==rifle_swung);
+                    assert(arms(25,37,37,0)==rifle_swung);
+                    assert(arms(27,37,37,0)==rifle_swung);
+                    // A changing native elbow roll no longer changes the
+                    // displayed running cuff, without touching the native pose.
+                    psx_mod_write_half(mats+32*elbow,2048);
+                    assert(arms(18,37,37,0)==rifle_run);
+                    psx_mod_write_half(mats+32*elbow,2896);
+                    const unsigned ready_clip=psx_mod_read_half(0x800c2d64+8*20+2);
+                    const uint32_t ready_record=psx_mod_read_word(0x800d8328+4*ready_clip);
+                    psx_mod_write_word(0x800d8328+4*ready_clip,0);
+                    assert(arms(18,37,37,0)==rifle_swung); // incomplete reference falls back
+                    psx_mod_write_word(0x800d8328+4*ready_clip,ready_record);
+                    arms(18,37,37,0);ttk::render_state_save(run_state.data());
+                    arms(20,41,41,0);ttk::render_state_save(idle_state.data());
+                    const pid_t rifle_child=fork();assert(rifle_child>=0);
+                    if(rifle_child==0) {
+                        ttk::render_state_load(run_state.data());assert(arms(20,41,41,0)==rifle_run);
+                        auto blend=run_state;ttk::render_state_blend_mask(blend.data(),idle_state.data(),.5);
+                        ttk::render_state_load(blend.data());const auto between=arms(20,41,41,0);
+                        assert(between!=rifle_run && between!=rifle_swung);
+                        for(unsigned n:{0u,1u,2u,5u})assert(between[n]==rifle_run[n]);
+                        ttk::render_state_load(idle_state.data());assert(arms(18,37,37,0)==rifle_swung);
+                        _exit(0);
+                    }
+                    int rifle_status=0;waitpid(rifle_child,&rifle_status,0);
+                    assert(WIFEXITED(rifle_status) && WEXITSTATUS(rifle_status)==0);
+                    std::puts("PASS: D36H2 Buffalo running cuff stability, unchanged hands, native transitions, reload exclusion, fallback and replay restoration");
+                    for(unsigned slot:{5u,6u,7u,9u,10u,11u,27u,28u}) {
+                        psx_mod_write_byte(p+0x3b9,slot);const auto result=arms(18,37,37,0);
+                        for(unsigned n:{0u,1u,3u,4u})for(unsigned k=0;k<3;++k) {
+                            int32_t start,end;int16_t axis;
+                            std::memcpy(&start,result[n].data()+20+4*k,4);
+                            std::memcpy(&end,result[n+1].data()+20+4*k,4);
+                            std::memcpy(&axis,result[n].data()+2*(3+k),2);
+                            assert(std::abs(start+100.0*axis/4096-end)<2);
+                        }
+                    }
+                    auto same_support=[](const auto& a,const auto& b) {
+                        for(unsigned n=0;n<3;++n) {
+                            for(unsigned k=0;k<9;++k) {
+                                int16_t x,y;std::memcpy(&x,a[n].data()+2*k,2);std::memcpy(&y,b[n].data()+2*k,2);
+                                if(std::abs(int(x)-int(y))>2)return false;
+                            }
+                            for(unsigned k=0;k<3;++k) {
+                                int32_t x,y;std::memcpy(&x,a[n].data()+20+4*k,4);std::memcpy(&y,b[n].data()+20+4*k,4);
+                                if(std::abs(x-y)>2)return false;
+                            }
+                        }
+                        return true;
+                    };
+                    // Retail 29 omits the neutral right wrist. Both 29
+                    // families must still use their complete walking support
+                    // grip, independent of the native run's left-hand swing.
+                    for(unsigned slot:{7u,11u,28u}) {
+                        psx_mod_write_byte(p+0x3b9,slot);
+                        const auto walking=arms(29,59,59,0);
+                        for(unsigned part=10;part<=12;++part) {
+                            const unsigned j=psx_mod_read_byte(desc+0x24+part);
+                            psx_mod_write_word(mats+32*j+20,70);
+                        }
+                        const auto running=arms(18,37,37,0);
+                        assert(same_support(walking,running));
+                        for(unsigned part=10;part<=12;++part) {
+                            const unsigned j=psx_mod_read_byte(desc+0x24+part);
+                            psx_mod_write_word(mats+32*j+20,0);
+                        }
+                    }
+                    // Flame/Energy support uses the same firing reference at rest,
+                    // while running and while firing, including upgraded 27.
+                    for(unsigned ch:{1u,2u}) {
+                        const unsigned first=ch==1?70:73,clip=200+ch;
+                        psx_mod_write_half(0x800c2d64+8*24+2*ch,clip);
+                        psx_mod_write_word(0x800d8328+4*clip,(3u<<16)|first);
+                        for(unsigned n=0;n<3;++n) {
+                            psx_mod_write_word(frm+8*(first+n),100u<<16);
+                            psx_mod_write_word(frm+8*(first+n)+4,(3u<<16)|(ch==1?3:0));
+                        }
+                    }
+                    for(unsigned slot:{9u,10u,27u}) {
+                        psx_mod_write_byte(p+0x3b9,slot);
+                        const auto rest=arms(20,41,41,0);
+                        for(unsigned part=10;part<=12;++part) {
+                            const unsigned j=psx_mod_read_byte(desc+0x24+part);
+                            psx_mod_write_word(mats+32*j+20,90);
+                        }
+                        const auto moving=arms(18,37,37,0),firing=arms(24,70,71,0);
+                        assert(same_support(rest,moving) && same_support(rest,firing));
+                        for(unsigned part=10;part<=12;++part) {
+                            const unsigned j=psx_mod_read_byte(desc+0x24+part);
+                            psx_mod_write_word(mats+32*j+20,0);
+                        }
+                    }
+                    assert(std::equal(native.begin(),native.end(),ram+(mats&0x1fffff)));
+                    std::copy(saved_ram.begin(),saved_ram.end(),ram);
+                    std::puts("PASS: D36H3 run twist restrained, native-clock transitions, firing exclusion, connected base/upgrade arms and untouched grip/gameplay matrices");
+                }
+                // D08K10: crouch display comes from the arm channel, never the
+                // hunch-adjusted world hand. A synthetic arm checks independence
+                // from that matrix and that animated channel motion still plays.
+                {
+                    const std::vector<uint8_t> saved_ram(ram,ram+sizeof ram);
+                    const auto saved_input=ttk::input;
+                    const uint32_t frm=0x801d7000,rot=0x801d7100;
+                    psx_mod_write_word(0x800d8324,frm);psx_mod_write_word(0x800d8320,rot);
+                    psx_mod_write_word(frm,100u<<16);psx_mod_write_word(frm+4,3u<<16);
+                    for(unsigned j=13;j<=15;++j) {
+                        const unsigned index=psx_mod_read_byte(desc+0x24+j);
+                        const uint32_t rec=desc+0x44+0x28*index;
+                        psx_mod_write_byte(rec+2,j-10);
+                        for(unsigned i=0;i<3;++i)psx_mod_write_word(rec+0x14+4*i,i==j-13?100:0);
+                        psx_mod_write_word(rot+8*(j-13),0);
+                        psx_mod_write_word(rot+8*(j-13)+4,(j<<27)|(4095u<<14));
+                    }
+                    psx_mod_write_half(p+0x74,39);psx_mod_write_half(p+0x76,100);
+                    psx_mod_write_half(p+0x78,0);psx_mod_write_half(p+0x7a,0);
+                    ttk::input.held[ttk::crouch]=true;ttk::input.held[ttk::interact]=false;
+                    ttk::input.held[ttk::original_aim]=false;
+                    psx_mod_write_half(p+0x60,63);psx_mod_write_word(p+0x224,0);
+                    psx_mod_write_byte(p+0x22c,0);psx_mod_write_byte(p+0x22d,0);
+                    call(0x8003ade4,c,p,0x80025ee8);
+                    call(0x8005a210,p,0x800c2754,0x80041b34);
+                    assert(psx_mod_read_half(p+0x60)==176);
+                    auto displayed=[&]() {
+                        call(0x800348d8,c,p,0x8003769c);
+                        const auto result=hook(0x800292a0,c,hand,0x80034c6c,7);
+                        assert(result.gpr[5]!=hand);
+                        std::array<uint8_t,32> bytes{};
+                        std::copy(ram+(result.gpr[5]&0x1fffff),ram+(result.gpr[5]&0x1fffff)+32,bytes.begin());
+                        call(0x8001ca4c,0x800d0000,0,0x800376b4);
+                        return bytes;
+                    };
+                    // D36H rifle follow-up: only record 6 / upper 27 releases
+                    // the seeded grip. Use native clip timing in every stance,
+                    // never a compensated world hand or a new animation clock.
+                    const unsigned rifle_clip=psx_mod_read_half(0x800c2d64+8*27+2);
+                    psx_mod_write_word(0x800d8328+4*rifle_clip,2u<<16);
+                    psx_mod_write_word(frm+8,100u<<16);psx_mod_write_word(frm+12,(3u<<16)|3u);
+                    for(unsigned j=13;j<=15;++j) {
+                        psx_mod_write_word(rot+24+8*(j-13),0);
+                        psx_mod_write_word(rot+28+8*(j-13),(j<<27)|(4095u<<14));
+                    }
+                    psx_mod_write_word(rot,1567);psx_mod_write_word(rot+4,(13u<<27)|(3784u<<14));
+                    psx_mod_write_byte(p+0x3b8,2);psx_mod_write_byte(p+0x3b9,6);
+                    psx_mod_write_half(p+0x74,20);for(unsigned i=0;i<40;++i)displayed();
+                    const auto rifle_ready=displayed();
+                    psx_mod_write_half(p+0x74,27);psx_mod_write_half(p+0x76,0);const auto rifle_reload=displayed();
+                    assert(rifle_reload!=rifle_ready);
+                    // Last native reload key returns to the accepted grip
+                    // (one fixed-point rounding unit is not a pose change).
+                    psx_mod_write_half(p+0x78,1);psx_mod_write_half(p+0x7a,1);
+                    const auto rifle_end=displayed();
+                    for(unsigned i=0;i<9;++i) {
+                        int16_t a,b;std::memcpy(&a,rifle_end.data()+2*i,2);std::memcpy(&b,rifle_ready.data()+2*i,2);
+                        assert(std::abs(int(a)-int(b))<=2);
+                    }
+                    for(unsigned i=0;i<3;++i) {
+                        int32_t a,b;std::memcpy(&a,rifle_end.data()+20+4*i,4);std::memcpy(&b,rifle_ready.data()+20+4*i,4);
+                        assert(std::abs(a-b)<=1);
+                    }
+                    psx_mod_write_half(p+0x78,0);psx_mod_write_half(p+0x7a,0);
+                    psx_mod_write_word(hand+0x14,psx_mod_read_word(hand+0x14)+600);
+                    assert(displayed()==rifle_reload);
+                    setenv("DNTTK_CROUCH","original",1);assert(displayed()==rifle_reload);
+                    psx_mod_write_half(p+0x60,63);assert(displayed()==rifle_reload);
+                    psx_mod_write_word(rot,2896);psx_mod_write_word(rot+4,(13u<<27)|(2896u<<14));
+                    assert(displayed()==rifle_reload); // wrist roll does not drive the eye pose
+                    psx_mod_write_half(p+0x76,90);assert(displayed()!=rifle_reload);
+                    psx_mod_write_half(p+0x76,0);
+                    std::vector<uint8_t> reload_state(ttk::render_state_size()),ready_state(reload_state.size());
+                    ttk::render_state_save(reload_state.data());
+                    psx_mod_write_half(p+0x74,20);assert(displayed()==rifle_ready);
+                    ttk::render_state_save(ready_state.data());
+                    const pid_t reload_child=fork();assert(reload_child>=0);
+                    if(reload_child==0) {
+                        // Worker draw uses the captured pose, not its older RAM
+                        // channel. In-between replay images cannot snap back.
+                        ttk::render_state_load(reload_state.data());assert(displayed()==rifle_reload);
+                        auto middle=reload_state;
+                        ttk::render_state_blend_mask(middle.data(),ready_state.data(),.5);
+                        ttk::render_state_load(middle.data());const auto halfway=displayed();
+                        assert(halfway!=rifle_reload && halfway!=rifle_ready);
+                        ttk::render_state_load(ready_state.data());assert(displayed()==rifle_ready);
+                        _exit(0);
+                    }
+                    int reload_status=0;waitpid(reload_child,&reload_status,0);
+                    assert(WIFEXITED(reload_status) && WEXITSTATUS(reload_status)==0);
+                    psx_mod_write_half(p+0x74,27);psx_mod_write_half(p+0x7a,0xffff);
+                    assert(displayed()==rifle_ready); // missing channel safely keeps the seed
+                    psx_mod_write_half(p+0x7a,0);
+                    for(unsigned slot:{4u,5u,7u,8u,9u,10u,11u,27u,28u,29u}) {
+                        psx_mod_write_byte(p+0x3b9,slot);const auto fixed=displayed();
+                        psx_mod_write_word(rot,0);psx_mod_write_word(rot+4,(13u<<27)|(4095u<<14));
+                        assert(displayed()==fixed);
+                        psx_mod_write_half(p+0x74,20);assert(displayed()==fixed);psx_mod_write_half(p+0x74,27);
+                    }
+                    unsetenv("DNTTK_CROUCH");psx_mod_write_half(p+0x60,178);psx_mod_write_half(p+0x74,39);psx_mod_write_half(p+0x76,100);
+                    std::puts("PASS: D36H Buffalo reload follows channel 27 timing, stance/world-hand independence, idle/other weapons unchanged, missing-data fallback");
+                    for(unsigned slot:{1u,2u,3u,12u,13u,14u,32u}) {
+                        psx_mod_write_byte(p+0x3b8,slot==32?1:2);
+                        psx_mod_write_byte(p+0x3b9,slot==32?12:slot);
+                        const auto neutral=displayed();
+                        psx_mod_write_word(hand+0x14,psx_mod_read_word(hand+0x14)+600);
+                        assert(displayed()==neutral);
+                        // Original crouch and standing retain D12's live path.
+                        setenv("DNTTK_CROUCH","original",1);assert(displayed()!=neutral);
+                        unsetenv("DNTTK_CROUCH");assert(displayed()==neutral);
+                        psx_mod_write_half(p+0x60,63);assert(displayed()!=neutral);
+                        psx_mod_write_half(p+0x60,178);assert(displayed()==neutral);
+                        // Rotate the shoulder in its animation frame, as a throw
+                        // does. Its display must animate even though the world
+                        // hand has not changed.
+                        psx_mod_write_word(rot,2896);
+                        psx_mod_write_word(rot+4,(13u<<27)|(2896u<<14));
+                        assert(displayed()!=neutral);
+                        psx_mod_write_word(rot,0);psx_mod_write_word(rot+4,(13u<<27)|(4095u<<14));
+                        assert(displayed()==neutral);
+                    }
+                    // D11E uses the same arm animation in water, even with
+                    // Original crouch selected. Worker snapshots must carry
+                    // swim eligibility in both directions independently of it.
+                    {
+                        const auto water=psx_mod_read_word(p+0x834),flag=psx_mod_read_word(p+0x20c),floor=psx_mod_read_word(p+0x1c8);
+                        setenv("DNTTK_CROUCH","original",1);
+                        psx_mod_write_word(p+0x834,root[1]-198);psx_mod_write_word(p+0x20c,1);psx_mod_write_word(p+0x1c8,root[1]+2000);
+                        psx_mod_write_byte(p+0x22c,5);psx_mod_write_half(p+0x60,128);
+                        for(unsigned slot:{3u,12u,32u}) {
+                            psx_mod_write_byte(p+0x3b8,slot==32?1:2);psx_mod_write_byte(p+0x3b9,slot==32?12:slot);
+                            const auto corrected=displayed();
+                            psx_mod_write_word(hand+0x14,psx_mod_read_word(hand+0x14)+600);assert(displayed()==corrected);
+                            std::vector<uint8_t> active(ttk::render_state_size()),inactive(active.size());
+                            ttk::render_state_save(active.data());
+                            psx_mod_write_word(p+0x834,0x40000000);psx_mod_write_word(p+0x20c,0);psx_mod_write_byte(p+0x22c,0);
+                            const auto original=displayed();assert(original!=corrected);ttk::render_state_save(inactive.data());
+                            const pid_t child=fork();assert(child>=0);
+                            if(child==0) {
+                                ttk::render_state_load(active.data());assert(displayed()==corrected);
+                                ttk::render_state_load(inactive.data());assert(displayed()==original);
+                                ttk::render_state_load(active.data());assert(displayed()==corrected);_exit(0);
+                            }
+                            int status=0;assert(waitpid(child,&status,0)==child && WIFEXITED(status) && WEXITSTATUS(status)==0);
+                            psx_mod_write_word(p+0x834,root[1]-198);psx_mod_write_word(p+0x20c,1);psx_mod_write_byte(p+0x22c,5);
+                            psx_mod_write_word(rot,2896);psx_mod_write_word(rot+4,(13u<<27)|(2896u<<14));assert(displayed()!=corrected);
+                            psx_mod_write_word(rot,0);psx_mod_write_word(rot+4,(13u<<27)|(4095u<<14));assert(displayed()==corrected);
+                        }
+                        psx_mod_write_word(p+0x834,water);psx_mod_write_word(p+0x20c,flag);psx_mod_write_word(p+0x1c8,floor);
+                        psx_mod_write_byte(p+0x22c,0);psx_mod_write_half(p+0x60,178);unsetenv("DNTTK_CROUCH");
+                        std::puts("PASS: D11E animated swim weapons ignore compensated world hand, retain animation, publish worker eligibility and restore ground framing");
+                    }
+                    // D12's seeded guns keep exactly their existing matrices.
+                    for(unsigned slot=4;slot<=11;++slot) {
+                        psx_mod_write_byte(p+0x3b8,2);psx_mod_write_byte(p+0x3b9,slot);
+                        const auto seeded=displayed();
+                        setenv("DNTTK_CROUCH","original",1);assert(displayed()==seeded);
+                        unsetenv("DNTTK_CROUCH");assert(displayed()==seeded);
+                    }
+                    psx_mod_write_byte(p+0x3b9,1);
+                    // A replay worker redraws with fork-time stance statics.
+                    // Publish eligibility with each frame, including disabling it
+                    // again for Original/standing frames in the same worker.
+                    {
+                        const auto corrected=displayed();
+                        std::vector<uint8_t> active(ttk::render_state_size()),inactive(active.size());
+                        ttk::render_state_save(active.data());
+                        setenv("DNTTK_CROUCH","original",1);
+                        const auto original=displayed();ttk::render_state_save(inactive.data());
+                        unsetenv("DNTTK_CROUCH");assert(original!=corrected);
+                        const pid_t child=fork();assert(child>=0);
+                        if(child==0) {
+                            // Simulate a worker forked before crouch began.
+                            ttk::input.held[ttk::crouch]=false;psx_mod_write_half(p+0x60,63);
+                            call(0x8005a210,p,0x800c2754,0x80041b34);
+                            psx_mod_write_half(p+0x60,178);
+                            assert(displayed()==original);
+                            ttk::render_state_load(active.data());assert(displayed()==corrected);
+                            ttk::render_state_load(inactive.data());assert(displayed()==original);
+                            ttk::render_state_load(active.data());assert(displayed()==corrected);
+                            _exit(0);
+                        }
+                        int status=0;assert(waitpid(child,&status,0)==child);
+                        assert(WIFEXITED(status) && WEXITSTATUS(status)==0);
+                    }
+                    // Missing hand data falls back instead of inventing a pose.
+                    const auto neutral=displayed();psx_mod_write_word(frm+4,2u<<16);
+                    assert(displayed()!=neutral);
+                    std::copy(saved_ram.begin(),saved_ram.end(),ram);++g_dirty_ram_code_gen;
+                    ttk::input=saved_input;
+                    psx_mod_write_half(p+0x60,63);
+                    call(0x8005a210,p,0x800c2754,0x80041b34);
+                    std::puts("PASS: D08K10 crouched viewmodel (six weapons and held item, channel motion, live-matrix independence, Original/standing and missing-data fallback)");
+                }
+                psx_mod_write_byte(p+0x3b8,saved_state);psx_mod_write_byte(p+0x3b9,saved_slot);
+                ttk::input.first_person=false;for(unsigned i=0;i<40;++i)frame();
+                // Third person and Vanilla: upgraded records keep the original
+                // hand, attached mesh scale and muzzle-flash transform.
+                for(bool modern:{true,false}) {
+                    ttk::modern=modern;
+                    for(unsigned slot:{4u,5u,10u,27u,28u,29u}) {
+                        call(0x800348d8,c,p,0x8003769c);
+                        psx_mod_write_byte(p+0x3b8,2);psx_mod_write_byte(p+0x3b9,slot);
+                        assert(hook(0x800292a0,c,hand,0x80034c6c,7).gpr[5]==hand);
+                        const auto mesh=hook(0x80033e40,hand,0,0x8003531c,7,4096);
+                        assert(mesh.gpr[4]==hand && mesh.gpr[7]==4096);
+                        assert(hook(0x800341e4,hand,4,0x80035348,7).gpr[4]==hand);
+                        call(0x8001ca4c,0x800d0000,0,0x800376b4);
+                    }
+                }
+                ttk::modern=true;
+                psx_mod_write_byte(p+0x3b8,saved_state);psx_mod_write_byte(p+0x3b9,saved_slot);
+                ttk::input.first_person=true;for(unsigned i=0;i<40;++i)frame();
+                std::puts("PASS: D12D upgraded first-person framing (base-equivalent pose/recoil/scale, held record preserved, third-person and Vanilla exclusion)");
+            }
+            // D36J5: ordinary legs share display FOV, never the torso, and
+            // retain native poses/world depth in both costume layouts.
+            for(const auto* costume:{first_map,cowboy}) {
+                layout(costume);
+                const uint32_t oldeye[3]={psx_mod_read_word(c+20),psx_mod_read_word(c+24),psx_mod_read_word(c+28)};
+                for(int k=0;k<3;++k)psx_mod_write_word(c+20+4*k,psx_mod_read_word(mats+20+4*k)+(k==1?-294:0));
+                const std::vector<uint8_t> original(ram+(mats&0x1fffff),ram+(mats&0x1fffff)+19*32);
+                for(const char* option:{(const char*)nullptr,"on","off"}) {
+                    if(option)setenv("DNTTK_FP_LEGS",option,1);else unsetenv("DNTTK_FP_LEGS");
+                    for(unsigned h:{277u,256u,191u,160u}) for(unsigned j=0;j<19;++j) {
+                        const int part=costume[j];
+                        if(!((part>=0 && part<=9) || part==20 || part==21))continue;
+                        call(0x800348d8,c,p,0x8003769c);
+                        CPUState draw{};draw.gpr[4]=c;draw.gpr[5]=mats+32*j;
+                        draw.gpr[20]=p;draw.gpr[23]=j;draw.gpr[29]=0x801f0000;draw.gpr[31]=0x80034c6c;draw.gte_ctrl[26]=h;
+                        hooks().at(0x800292a0)(&draw,0x800292a0);
+                        const auto limb=ttk::first_person_limb_presentation();
+                        const bool visible=(!option || std::strcmp(option,"off")) && ((part>=1 && part<=8) || part==21);
+                        assert(limb.owner==(visible?ttk::LimbOwner::Legs:ttk::LimbOwner::HiddenBody));
+                        assert(limb.fixed_projection()==visible && limb.world_clip()==visible && !limb.viewmodel());
+                        assert(draw.gte_ctrl[26]==h);
+                        if(visible) {
+                            const auto native=mats+32*j;
+                            assert(draw.gpr[5]!=native);
+                            for(unsigned k=0;k<20;++k)assert(psx_mod_read_byte(draw.gpr[5]+k)==psx_mod_read_byte(native+k));
+                            assert(psx_mod_read_word(draw.gpr[5]+24)==psx_mod_read_word(native+24));
+                            const double x=int16_t(psx_mod_read_half(c+12)),z=int16_t(psx_mod_read_half(c+16));
+                            const double length=std::hypot(x,z);
+                            assert(int32_t(psx_mod_read_word(draw.gpr[5]+20)-psx_mod_read_word(native+20))==-std::lround(48*x/length));
+                            assert(int32_t(psx_mod_read_word(draw.gpr[5]+28)-psx_mod_read_word(native+28))==-std::lround(48*z/length));
+                        } else assert(draw.gpr[5]==c);
+                        call(0x8001ca4c,0x800d0000,0,0x800376b4);
+                        assert(ttk::first_person_limb_presentation().owner==ttk::LimbOwner::Native);
+                    }
+                }
+                assert(std::equal(original.begin(),original.end(),ram+(mats&0x1fffff)));
+                for(int k=0;k<3;++k)psx_mod_write_word(c+20+4*k,oldeye[k]);
+            }
+            layout(first_map);setenv("DNTTK_FP_LEGS","off",1);
+            std::puts("PASS: D36J5 default/on/off legs, hidden torso, costume mappings, native matrices and draw-scope cleanup");
+            // D36J5: low/forward crouch eyes remain inside the actual leaned
+            // body, while displaced cameras and upright poses still reject.
+            {
+                const auto pose=psx_mod_read_half(p+0x60);
+                const auto mode=psx_mod_read_byte(p+0x22c),history=psx_mod_read_byte(p+0x22d);
+                const std::vector<uint8_t> saved(ram+(mats&0x1fffff),ram+(mats&0x1fffff)+19*32);
+                uint8_t old_camera[32];std::memcpy(old_camera,ram+(c&0x1fffff),32);
+                setenv("DNTTK_FP_LEGS","on",1);
+                psx_mod_write_byte(p+0x22c,0);psx_mod_write_byte(p+0x22d,0);
+                for(const auto* costume:{first_map,cowboy}) {
+                    layout(costume);
+                    const auto neck=mats+32*psx_mod_read_byte(desc+0x34)+20;
+                    for(int k=0;k<3;++k)psx_mod_write_word(neck+4*k,psx_mod_read_word(mats+20+4*k)+(k==0?140:k==1?-80:0));
+                    const std::vector<uint8_t> before(ram+(mats&0x1fffff),ram+(mats&0x1fffff)+19*32);
+                    for(unsigned anim:{63u,176u,178u})for(unsigned h:{160u,256u})
+                    for(const auto delta:{std::array<int,3>{0,-100,0},{140,-150,0},{70,-110,80},{140,-150,97},{237,-150,0},{0,-63,0},{0,-353,0}}) {
+                        psx_mod_write_half(p+0x60,anim);
+                        for(int k=0;k<3;++k)psx_mod_write_word(c+20+4*k,psx_mod_read_word(mats+20+4*k)+delta[k]);
+                        const bool inside=anim!=63 && delta[2]!=97 && delta[0]!=237 && delta[1]!=-63 && delta[1]!=-353;
+                        for(unsigned part:{0u,1u,5u,9u,20u,21u}) {
+                            call(0x800348d8,c,p,0x8003769c);
+                            CPUState draw{};draw.gpr[4]=c;draw.gpr[20]=p;draw.gpr[23]=psx_mod_read_byte(desc+0x24+part);
+                            draw.gpr[5]=mats+32*draw.gpr[23];draw.gpr[29]=0x801f0000;draw.gpr[31]=0x80034c6c;draw.gte_ctrl[26]=h;
+                            hooks().at(0x800292a0)(&draw,0x800292a0);
+                            const bool leg=inside && (part==1 || part==5 || part==21);
+                            assert(ttk::first_person_limb_presentation().owner==(leg?ttk::LimbOwner::Legs:ttk::LimbOwner::HiddenBody));
+                            call(0x8001ca4c,0x800d0000,0,0x800376b4);
+                        }
+                    }
+                    assert(std::equal(before.begin(),before.end(),ram+(mats&0x1fffff)));
+                    std::copy(saved.begin(),saved.end(),ram+(mats&0x1fffff));
+                }
+                std::memcpy(ram+(c&0x1fffff),old_camera,32);layout(first_map);
+                psx_mod_write_half(p+0x60,pose);psx_mod_write_byte(p+0x22c,mode);psx_mod_write_byte(p+0x22d,history);
+                setenv("DNTTK_FP_LEGS","off",1);
+                std::puts("PASS: D36J5 crouch low-eye/lean admission, displaced-camera rejection, torso hiding and native-matrix preservation");
+            }
+            setenv("DNTTK_FP_BODY","visible",1); // diagnostic body comparison
+            // D36J: world-space lower-body admission is semantic across
+            // costume orderings, with no native matrix edits or arm takeover.
+            {
+                for(const auto* costume:{first_map,cowboy}) {
+                    layout(costume);
+                    const std::vector<uint8_t> original(ram+(mats&0x1fffff),ram+(mats&0x1fffff)+19*0x20);
+                    for(unsigned j=0;j<19;++j) {
+                        call(0x800348d8,c,p,0x8003769c);
+                        CPUState cpu{};cpu.gpr[4]=c;cpu.gpr[5]=mats+0x20*j;
+                        cpu.gpr[20]=p;cpu.gpr[23]=j;cpu.gpr[29]=0x801f0000;cpu.gpr[31]=0x80034c6c;
+                        hooks().at(0x800292a0)(&cpu,0x800292a0);
+                        const int part=costume[j];const bool body=(part>=0 && part<=9)||part==21;
+                        const auto limb=ttk::first_person_limb_presentation();
+                        assert((limb.owner==ttk::LimbOwner::Body)==body);
+                        if(body) {
+                            assert((cpu.gpr[5]!=mats+0x20*j)==(part==9));
+                            assert(limb.world_clip() && !limb.viewmodel() && !limb.fixed_projection() && limb.bridge_joint_depth);
+                            for(int axis=0;axis<3;++axis)
+                                assert(psx_mod_read_word(cpu.gpr[5]+0x14+4*axis)==psx_mod_read_word(mats+0x20*j+0x14+4*axis));
+                            assert(limb.parts==(1u<<part) && limb.light==ttk::LimbLight::CorrectProximityFade);
+                            cpu.gpr[31]=0x80034c8c;cpu.gte_ctrl[26]=256;psx_mod_write_word(cpu.gpr[29]+0x98,c);
+                            for(int z:{-100,0,255,256,400}) {
+                                cpu.gpr[16]=z;hooks().at(0x800b4d2c)(&cpu,0x800b4d2c);
+                                assert(int32_t(cpu.gpr[16])==std::max(z,256));
+                            }
+                            for(int bad=0;bad<3;++bad) {
+                                auto wrong=cpu;wrong.gpr[16]=0;
+                                if(bad==0)wrong.gpr[31]+=4;
+                                if(bad==1)wrong.gpr[20]+=4;
+                                if(bad==2)psx_mod_write_word(wrong.gpr[29]+0x98,c+4);
+                                hooks().at(0x800b4d2c)(&wrong,0x800b4d2c);assert(wrong.gpr[16]==0);
+                            }
+                            psx_mod_write_word(cpu.gpr[29]+0x98,c);
+                        }
+                        call(0x8001ca4c,0x800d0000,0,0x800376b4);
+                        assert(ttk::first_person_limb_presentation().owner==ttk::LimbOwner::Native);
+                    }
+                    assert(std::equal(original.begin(),original.end(),ram+(mats&0x1fffff)));
+                }
+                layout(first_map);
+                const uint32_t context=0x800d67a8,flags=psx_mod_read_word(p);
+                const uint32_t command=psx_mod_read_word(context+0x48),page=psx_mod_read_word(context+0x4c),flat=psx_mod_read_word(context+0x54);
+                for(uint32_t effect:{0u,0x40u,0x2000u,0x4000u}) {
+                    call(0x800348d8,c,p,0x8003769c);
+                    psx_mod_write_word(p,(flags&~0x6040u)|effect);
+                    psx_mod_write_word(context+0x48,0x2000000);psx_mod_write_word(context+0x4c,0x600000);psx_mod_write_word(context+0x54,0x12345678);
+                    CPUState cpu{};cpu.gpr[4]=c;cpu.gpr[5]=mats+0x20*14;cpu.gpr[20]=p;cpu.gpr[23]=14;cpu.gpr[31]=0x80034c6c;cpu.gpr[29]=0x801f0000;
+                    psx_mod_write_word(cpu.gpr[29]+0x98,c);
+                    cpu.gpr[18]=24; // native root proximity brightness at wide FOV
+                    for(int i=13;i<=15;++i)cpu.gte_ctrl[i]=i*17;
+                    hooks().at(0x800292a0)(&cpu,0x800292a0);
+                    assert(psx_mod_read_word(context+0x48)==(effect?0x2000000u:0u));
+                    // The native per-joint shader runs AFTER the transform hook.
+                    // It must consume environment brightness, including when it
+                    // adds a joint tint, rather than overwrite our correction.
+                    assert(cpu.gpr[18]==(effect?24u:psx_mod_read_byte(p+0x1b)));
+                    // An unrelated transform retires native-body admission and
+                    // restores the complete context/GTE, not just the token.
+                    cpu.gpr[18]=0x12345678; // another callee's s2 is not ours
+                    cpu.gpr[31]=0x80012340;hooks().at(0x800292a0)(&cpu,0x800292a0);
+                    assert(cpu.gpr[18]==0x12345678);
+                    assert(ttk::first_person_limb_presentation().owner==ttk::LimbOwner::Native);
+                    assert(psx_mod_read_word(context+0x48)==0x2000000 && psx_mod_read_word(context+0x4c)==0x600000);
+                    assert(psx_mod_read_word(context+0x54)==0x12345678);
+                    for(int i=13;i<=15;++i)assert(cpu.gte_ctrl[i]==unsigned(i*17));
+                    // Return to the same actor loop at an unowned head joint.
+                    // Its original brightness is restored before classification.
+                    cpu.gpr[18]=effect?24u:psx_mod_read_byte(p+0x1b);
+                    cpu.gpr[23]=9;cpu.gpr[5]=mats+0x20*9;cpu.gpr[31]=0x80034c6c;
+                    hooks().at(0x800292a0)(&cpu,0x800292a0);
+                    assert(cpu.gpr[18]==24);
+                    call(0x8001ca4c,0x800d0000,0,0x800376b4);
+                }
+                psx_mod_write_word(p,flags);psx_mod_write_word(context+0x48,command);psx_mod_write_word(context+0x4c,page);psx_mod_write_word(context+0x54,flat);
+                std::puts("PASS: D36J native lower-body clipping, semantic costume ownership, fade/effect restoration and draw-boundary guards");
+            }
+            // D14E: torso fit follows eye clearance, not world projection;
+            // replay draws derive it anew and the waist/gameplay skeleton stay put.
+            {
+                const uint32_t eye_y=psx_mod_read_word(c+0x18),ctx=0x800d67a8;
+                const uint32_t eye_x=psx_mod_read_word(c+20),eye_z=psx_mod_read_word(c+28);
+                const uint32_t pelvis[3]={psx_mod_read_word(mats+20),psx_mod_read_word(mats+24),psx_mod_read_word(mats+28)};
+                for(const auto* costume:{first_map,cowboy}) {
+                    layout(costume);
+                    const unsigned spine=psx_mod_read_byte(desc+0x24+9);
+                    const uint32_t native=mats+32*spine;
+                    psx_mod_write_word(c+20,psx_mod_read_word(native+20));psx_mod_write_word(c+28,psx_mod_read_word(native+28));
+                    // Position the synthetic pelvis under this synthetic waist.
+                    for(int k=0;k<3;++k)psx_mod_write_word(mats+20+4*k,psx_mod_read_word(native+20+4*k));
+                    const std::vector<uint8_t> original(ram+(mats&0x1fffff),ram+(mats&0x1fffff)+19*32);
+                    int previous=5000;
+                    for(int height:{320,282,247,212,180}) {
+                        psx_mod_write_word(c+0x18,psx_mod_read_word(native+0x18)-height);
+                        std::vector<uint8_t> reference;
+                        for(unsigned h:{277u,256u,191u,160u,128u}) {
+                            call(0x800348d8,c,p,0x8003769c);
+                            CPUState draw{};draw.gpr[4]=c;draw.gpr[5]=native;draw.gpr[20]=p;
+                            draw.gpr[23]=spine;draw.gpr[29]=0x801f0000;draw.gpr[31]=0x80034c6c;draw.gte_ctrl[26]=h;
+                            hooks().at(0x800292a0)(&draw,0x800292a0);
+                            assert(draw.gpr[5]!=native && draw.gte_ctrl[26]==h);
+                            const auto posed=draw.gpr[5];
+                            for(unsigned k=0;k<3;++k)assert(psx_mod_read_word(posed+20+4*k)==psx_mod_read_word(native+20+4*k));
+                            const int yy=(int16_t)psx_mod_read_half(posed+8);
+                            if(h==277) {assert(yy<=previous);previous=yy;}
+                            const std::vector<uint8_t> matrix(ram+(posed&0x1fffff),ram+(posed&0x1fffff)+32);
+                            if(reference.empty())reference=matrix;else assert(reference==matrix);
+                            call(0x8001ca4c,0x800d0000,0,0x800376b4);
+                        }
+                    }
+                    assert(std::equal(original.begin(),original.end(),ram+(mats&0x1fffff)));
+                }
+                for(int k=0;k<3;++k)psx_mod_write_word(mats+20+4*k,pelvis[k]);
+                layout(first_map);psx_mod_write_word(c+0x18,eye_y);psx_mod_write_word(c+20,eye_x);psx_mod_write_word(c+28,eye_z);
+                const uint32_t saved_mesh=psx_mod_read_word(desc+0x68),flags=psx_mod_read_word(p);
+                const uint32_t cmd=psx_mod_read_word(ctx+0x48),page=psx_mod_read_word(ctx+0x4c),flat=psx_mod_read_word(ctx+0x54);
+                psx_mod_write_word(desc+0x68,0x80110000);
+                for(unsigned effect:{0u,0x40u,0x2000u,0x4000u})for(int bad=0;bad<5;++bad) {
+                    call(0x800348d8,c,p,0x8003769c);
+                    psx_mod_write_word(p,(flags&~0x6040u)|effect);
+                    psx_mod_write_word(ctx+0x48,0);psx_mod_write_word(ctx+0x4c,0);
+                    CPUState draw{};draw.gpr[4]=c;draw.gpr[5]=mats;draw.gpr[20]=p;draw.gpr[23]=0;
+                    draw.gpr[29]=0x801f0000;draw.gpr[31]=0x80034c6c;
+                    hooks().at(0x800292a0)(&draw,0x800292a0);
+                    // Reproduce fade installed AFTER the root transform.
+                    psx_mod_write_word(ctx+0x48,0x2000000);psx_mod_write_word(ctx+0x4c,0x600000);psx_mod_write_word(ctx+0x54,0x222222);
+                    for(int k=13;k<16;++k)draw.gte_ctrl[k]=544;
+                    draw.gpr[4]=0x80110000;draw.gpr[31]=0x800351f4;psx_mod_write_word(draw.gpr[29]+0x98,c);
+                    if(bad==1)draw.gpr[31]+=4;
+                    if(bad==2)draw.gpr[20]+=4;
+                    if(bad==3)draw.gpr[4]+=4;
+                    if(bad==4)psx_mod_write_word(draw.gpr[29]+0x98,c+4);
+                    ttk::first_person_mesh_begin(&draw);
+                    const bool correct=!effect && !bad;
+                    assert(psx_mod_read_word(ctx+0x48)==(correct?0u:0x2000000u));
+                    assert(draw.gte_ctrl[13]==(correct?(psx_mod_read_byte(p+0x1b)<<4):544u));
+                    draw.gpr[31]=0x80012340;hooks().at(0x800292a0)(&draw,0x800292a0);
+                    assert(psx_mod_read_word(ctx+0x48)==0x2000000 && draw.gte_ctrl[13]==544);
+                    call(0x8001ca4c,0x800d0000,0,0x800376b4);
+                }
+                psx_mod_write_word(desc+0x68,saved_mesh);psx_mod_write_word(p,flags);
+                psx_mod_write_word(ctx+0x48,cmd);psx_mod_write_word(ctx+0x4c,page);psx_mod_write_word(ctx+0x54,flat);
+                std::puts("PASS: D14E waist continuity, clearance fit, FOV-independent matrices, untouched native skeleton and guarded root fade restoration");
+            }
+            // D14E1: a displaced eye must never expose the incomplete world
+            // body. The suppression is FOV-independent, allocation-free and
+            // relinquished immediately on recovery or a draw boundary.
+            {
+                const uint32_t eye[3]={psx_mod_read_word(c+0x14),psx_mod_read_word(c+0x18),psx_mod_read_word(c+0x1c)};
+                const auto equip=psx_mod_read_byte(p+0x3b8);
+                for(const auto* costume:{first_map,cowboy}) {
+                    layout(costume);
+                    // D36H8: keep the neck clear of every displaced eye below,
+                    // so only the pelvis envelope decides these cases.
+                    const uint32_t neck=mats+32*psx_mod_read_byte(desc+0x24+0x10)+0x14;
+                    uint32_t saved_neck[3];
+                    auto place_neck=[&](int x,int y,int z){const int d[3]={x,y,z};
+                        for(int k=0;k<3;++k)psx_mod_write_word(neck+4*k,psx_mod_read_word(mats+0x14+4*k)+d[k]);};
+                    for(int k=0;k<3;++k)saved_neck[k]=psx_mod_read_word(neck+4*k);
+                    place_neck(400,0,0);
+                    const std::vector<uint8_t> original(ram+(mats&0x1fffff),ram+(mats&0x1fffff)+19*32);
+                    for(const auto delta: {std::array<int,3>{0,-294,0}, {0,-224,0}, {97,-294,0}, {-97,-294,0},
+                                          {0,-294,97}, {0,-294,-97}, {0,-353,0}, {0,-127,0}, {52,-464,-184}}) {
+                        const bool safe=delta[0]==0 && delta[2]==0 && (delta[1]==-294 || delta[1]==-224);
+                        for(int k=0;k<3;++k)psx_mod_write_word(c+0x14+4*k,psx_mod_read_word(mats+0x14+4*k)+delta[k]);
+                        for(const char* body:{(const char*)nullptr,"visible","hidden","invalid",""}) for(unsigned h:{277u,256u,191u,160u,128u}) for(unsigned equipment:{0u,2u}) {
+                            if(body)setenv("DNTTK_FP_BODY",body,1);else unsetenv("DNTTK_FP_BODY");
+                            psx_mod_write_byte(p+0x3b8,equipment);
+                            for(unsigned part:{0u,1u,5u,9u,20u,21u,10u,15u}) {
+                                call(0x800348d8,c,p,0x8003769c);
+                                CPUState draw{};draw.gpr[4]=c;draw.gpr[20]=p;draw.gpr[23]=psx_mod_read_byte(desc+0x24+part);
+                                const uint32_t native=mats+32*draw.gpr[23];draw.gpr[5]=native;
+                                draw.gpr[29]=0x801f0000;draw.gpr[31]=0x80034c6c;draw.gte_ctrl[26]=h;
+                                hooks().at(0x800292a0)(&draw,0x800292a0);
+                                const bool hidden=((!body || std::strcmp(body,"visible")) && (part<=9 || part>=20)) ||
+                                    (!safe && (part<=9 || part>=20 || equipment==0));
+                                const auto owner=ttk::first_person_limb_presentation();
+                                assert((owner.owner==ttk::LimbOwner::HiddenBody)==hidden);
+                                if(hidden) {
+                                    assert(draw.gpr[5]==c && !owner.bridge_joint_depth && !owner.world_clip() && !owner.viewmodel());
+                                    draw.gpr[16]=0;draw.gpr[31]=0x80034c8c;psx_mod_write_word(draw.gpr[29]+0x98,c);
+                                    hooks().at(0x800b4d2c)(&draw,0x800b4d2c);assert(draw.gpr[16]==0 && draw.gte_ctrl[26]==h);
+                                }
+                                call(0x8001ca4c,0x800d0000,0,0x800376b4);
+                                assert(ttk::first_person_limb_presentation().owner==ttk::LimbOwner::Native);
+                            }
+                        }
+                    }
+                    assert(std::equal(original.begin(),original.end(),ram+(mats&0x1fffff)));
+                    // D36H8: the airborne reach leans the eye about 116 ahead
+                    // of the pelvis but over the neck. Empty arms stay drawn
+                    // there; the body stays hidden, armed arms keep their owner
+                    // and an eye away from the neck still hides the arms.
+                    unsetenv("DNTTK_FP_BODY");
+                    for(const auto& reach:{std::array<int,4>{100,-156,0,1},{-60,-156,0,0},{100,-156,160,0},{100,-20,0,0}}) {
+                        place_neck(reach[0],reach[1],reach[2]);
+                        const int delta[3]={116,-250,0};
+                        for(int k=0;k<3;++k)psx_mod_write_word(c+0x14+4*k,psx_mod_read_word(mats+0x14+4*k)+delta[k]);
+                        for(unsigned h:{256u,160u}) for(unsigned equipment:{0u,2u}) {
+                            psx_mod_write_byte(p+0x3b8,equipment);
+                            for(unsigned part:{0u,9u,21u,10u,12u,13u,15u}) {
+                                call(0x800348d8,c,p,0x8003769c);
+                                CPUState draw{};draw.gpr[4]=c;draw.gpr[20]=p;draw.gpr[23]=psx_mod_read_byte(desc+0x24+part);
+                                draw.gpr[5]=mats+32*draw.gpr[23];draw.gpr[29]=0x801f0000;draw.gpr[31]=0x80034c6c;draw.gte_ctrl[26]=h;
+                                hooks().at(0x800292a0)(&draw,0x800292a0);
+                                const bool arm=part>=10 && part<=15;
+                                const bool hidden=!arm || (equipment==0 && !reach[3]);
+                                assert((ttk::first_person_limb_presentation().owner==ttk::LimbOwner::HiddenBody)==hidden);
+                                if(arm && equipment==0 && reach[3])
+                                    assert(ttk::first_person_limb_presentation().owner==ttk::LimbOwner::Body && draw.gpr[5]!=c);
+                                call(0x8001ca4c,0x800d0000,0,0x800376b4);
+                            }
+                        }
+                    }
+                    for(int k=0;k<3;++k)psx_mod_write_word(neck+4*k,saved_neck[k]);
+                }
+                unsetenv("DNTTK_FP_BODY");
+                for(int k=0;k<3;++k)psx_mod_write_word(c+0x14+4*k,eye[k]);
+                psx_mod_write_byte(p+0x3b8,equip);layout(first_map);
+                std::puts("PASS: D36J2 default/explicit/invalid no-body, D14E1 displaced-eye body rejection and D36H8 reaching arms over the neck across costumes, FOVs, armed/unarmed draws and immediate scope restoration");
+            }
+            // D36H4: empty-handed locomotion retains native connected chains,
+            // including costumes with different joint ordering. Armed/held-item
+            // paths must not acquire world-body arm ownership.
+            {
+                const unsigned equipment=psx_mod_read_byte(p+0x3b8);
+                for(const auto* costume:{first_map,cowboy}) {
+                    layout(costume);
+                    const std::vector<uint8_t> original(ram+(mats&0x1fffff),ram+(mats&0x1fffff)+19*0x20);
+                    for(unsigned equip:{0u,1u,2u}) for(unsigned j=0;j<19;++j) {
+                        const int part=costume[j];if(part<10 || part>15)continue;
+                        psx_mod_write_byte(p+0x3b8,equip);
+                        call(0x800348d8,c,p,0x8003769c);
+                        CPUState cpu{};cpu.gpr[4]=c;cpu.gpr[5]=mats+0x20*j;
+                        cpu.gpr[20]=p;cpu.gpr[23]=j;cpu.gpr[29]=0x801f0000;cpu.gpr[31]=0x80034c6c;
+                        hooks().at(0x800292a0)(&cpu,0x800292a0);
+                        const auto limb=ttk::first_person_limb_presentation();
+                        assert((limb.owner==ttk::LimbOwner::Body)==(equip==0));
+                        if(equip==0) {
+                            assert(cpu.gpr[5]!=mats+0x20*j && limb.world_clip() && !limb.viewmodel());
+                            for(unsigned i=0;i<0x14;i+=4)
+                                assert(psx_mod_read_word(cpu.gpr[5]+i)==psx_mod_read_word(mats+0x20*j+i));
+                            for(unsigned i=0;i<3;++i) {
+                                const int32_t down=std::lround(120.0*(int16_t)psx_mod_read_half(c+6+2*i)/4096.0);
+                                assert(psx_mod_read_word(cpu.gpr[5]+0x14+4*i)==
+                                    psx_mod_read_word(mats+0x20*j+0x14+4*i)+down);
+                            }
+                            assert(limb.parts==(1u<<part) && limb.bridge_joint_depth);
+                            cpu.gpr[31]=0x80034c8c;cpu.gte_ctrl[26]=256;
+                            psx_mod_write_word(cpu.gpr[29]+0x98,c);cpu.gpr[16]=0;
+                            hooks().at(0x800b4d2c)(&cpu,0x800b4d2c);assert(cpu.gpr[16]==256);
+                        }
+                        call(0x8001ca4c,0x800d0000,0,0x800376b4);
+                        assert(ttk::first_person_limb_presentation().owner==ttk::LimbOwner::Native);
+                    }
+                    assert(std::equal(original.begin(),original.end(),ram+(mats&0x1fffff)));
+                }
+                layout(first_map);psx_mod_write_byte(p+0x3b8,equipment);
+                std::puts("PASS: D36H4 unarmed semantic arm continuity, world depth, held-equipment exclusion and native matrix preservation");
+            }
+            // D12A quick kick: an original boot request (112..115, not yet
+            // initialized) becomes the quick kick at the lower-body initializer;
+            // its sphere runs along the view on each player update while the leg
+            // is out; the right leg joints get private matrices; Duke's own
+            // joint matrices are never written.
+            {
+                auto hook=[&](uint32_t address,uint32_t a0,uint32_t a1,uint32_t ra,uint32_t joint){
+                    CPUState cpu{};cpu.gpr[4]=a0;cpu.gpr[5]=a1;cpu.gpr[20]=p;cpu.gpr[23]=joint;
+                    cpu.gpr[31]=ra;cpu.gpr[29]=0x801f0000;hooks().at(address)(&cpu,address);return cpu;
+                };
+                auto update=[&](){call(0x80058120,p,0,0x80041c44,0x801fff00);};
+                const uint32_t saved_delta=psx_mod_read_word(0x800d21fc);psx_mod_write_word(0x800d21fc,10);
+                const uint16_t saved_power=psx_mod_read_half(p+0x364);psx_mod_write_half(p+0x364,0);
+                std::vector<uint8_t> before(ram+(mats&0x1fffff),ram+(mats&0x1fffff)+0x20*19);
+                const double converts=metric("\"converts\":");
+                // Initialized (track set), another caller, or another actor: untouched.
+                psx_mod_write_half(p+0x60,114);psx_mod_write_half(p+0x68,1);
+                call(0x800493a4,p,0,0x8005a490,0x801fff00);assert(psx_mod_read_half(p+0x60)==114);
+                psx_mod_write_half(p+0x68,0);
+                call(0x800493a4,p,0,0x8005a000,0x801fff00);assert(psx_mod_read_half(p+0x60)==114);
+                call(0x800493a4,0x800d8000,0,0x8005a490,0x801fff00);assert(psx_mod_read_half(p+0x60)==114);
+                assert(metric("\"converts\":")==converts);
+                // The request keeps the eye view's lease until its initializer.
+                frame();assert(metric("\"blend\":")==1);
+                // From E (Action, no attack held): idle restarts, no kick.
+                const double suppressed=metric("\"suppressed\":");
+                call(0x800493a4,p,0,0x8005a490,0x801fff00);
+                assert(psx_mod_read_half(p+0x60)==63 && psx_mod_read_half(p+0x68)==0);
+                assert(metric("\"suppressed\":")==suppressed+1 && metric("\"converts\":")==converts);
+                assert(std::strstr(ttk::controls_debug_json(),"\"kick\":{\"active\":false"));
+                // With the attack held: the quick kick.
+                psx_mod_write_half(p+0x60,113);psx_mod_write_half(p+0x68,0);frame();
+                ttk::input.held[ttk::fire]=true;
+                call(0x800493a4,p,0,0x8005a490,0x801fff00);
+                ttk::input.held[ttk::fire]=false;
+                assert(psx_mod_read_half(p+0x60)==63 && psx_mod_read_half(p+0x68)==0 && metric("\"converts\":")==converts+1);
+                // D36J3: the no-body leg must enter/leave below the viewport,
+                // rather than reveal its resting thigh on the first/last frame.
+                // Exercise actual draw hooks, both costume maps, default strike
+                // framing at every world FOV. Sampling must not run hit updates.
+                {
+                    const auto sequence=ttk::input.sequence;
+                    for(const auto& map:{first_map,cowboy}) {
+                        layout(map);
+                        for(double fov:{60.,64.,75.,80.,90.,105.,120.}) for(unsigned phase:{0u,13u,26u}) {
+                            assert(ttk::first_person_set_fov(fov));
+                            ttk::input.sequence=sequence+phase;
+                            call(0x800348d8,c,p,0x8003769c);
+                            const unsigned joint=map==first_map?10u:1u;
+                            auto hip=hook(0x800292a0,c,mats+0x20*joint,0x80034c6c,joint);
+                            assert(ttk::first_person_limb_presentation().owner==ttk::LimbOwner::Kick);
+                            assert(ttk::first_person_limb_presentation().fixed_projection());
+                            double view[3]={};
+                            for(int r=0;r<3;++r) for(int k=0;k<3;++k)
+                                view[r]+=int16_t(psx_mod_read_half(c+2*(3*r+k)))/4096.0*
+                                    (double(int32_t(psx_mod_read_word(hip.gpr[5]+0x14+4*k)))-int32_t(psx_mod_read_word(c+0x14+4*k)));
+                            if(phase==13) {
+                                assert(std::abs(view[0]+140.8)<2 && std::abs(view[1]-127)<2 && std::abs(view[2]-141.6)<2);
+                            } else assert(view[1]>view[2]+80); // hip clearance; full retail mesh checked in game
+                            call(0x8001ca4c,0x800d0000,0,0x800376b4);
+                        }
+                    }
+                    ttk::input.sequence=sequence;layout(first_map);ttk::first_person_set_fov(64);
+                    assert(std::equal(before.begin(),before.end(),ram+(mats&0x1fffff)));
+                    std::puts("PASS: D36J3 Q entry/recovery, FOV-independent pose and native matrices across costume maps");
+                }
+                kick_calls.clear();
+                for(unsigned i=0;i<6;++i){frame();update();}
+                assert(kick_calls.empty());                         // chamber: no sound or hit yet
+                frame();update();
+                assert(kick_calls.size()==1 && kick_calls[0].address==0x8006b270 &&
+                       kick_calls[0].a[0]==0x1000 && kick_calls[0].a[1]==p+4 && kick_calls[0].a[2]==0x800);
+                frame();update();assert(kick_calls.size()==2);       // hit window opens
+                const KickCall& k=kick_calls[1];
+                assert(k.address==0x800a979c && k.a[1]==96 && k.a[2]==10 && k.a[3]==200 && k.stack[0]==p && k.stack[1]==0);
+                for(int i=0;i<3;++i) {
+                    const double forward=(int16_t)psx_mod_read_half(c+12+2*i)/4096.0;
+                    assert(std::abs(k.point[i]-((int32_t)psx_mod_read_word(c+0x14+4*i)+forward*340))<2);
+                }
+                // Where the crosshair ray meets something within the foot's
+                // reach, the sphere goes just short of that point; a farther
+                // hit leaves the default point along the view.
+                {
+                    double eye[3],fwd[3];
+                    for(int i=0;i<3;++i){fwd[i]=(int16_t)psx_mod_read_half(c+12+2*i)/4096.0;eye[i]=(int32_t)psx_mod_read_word(c+0x14+4*i);}
+                    const double flat=std::hypot(fwd[0],fwd[2]);assert(flat>0.3);
+                    for(int i=0;i<3;++i)ttk::segment_point[i]=eye[i]+fwd[i]*200/flat;
+                    ttk::segment_hit=true;const size_t n=kick_calls.size();
+                    frame();update();assert(kick_calls.size()==n+1);
+                    for(int i=0;i<3;++i)assert(std::abs(kick_calls.back().point[i]-(ttk::segment_point[i]-fwd[i]*24))<2);
+                    for(int i=0;i<3;++i)ttk::segment_point[i]=eye[i]+fwd[i]*900/flat;
+                    frame();update();assert(kick_calls.size()==n+2);
+                    for(int i=0;i<3;++i)assert(std::abs(kick_calls.back().point[i]-(eye[i]+fwd[i]*340))<2);
+                    ttk::segment_hit=false;
+                }
+                // The leg is drawn in front of the eye during the kick.
+                setenv("DNTTK_FP_BODY","visible",1);
+                call(0x800348d8,c,p,0x8003769c);
+                auto leg=hook(0x800292a0,c,mats+0x20*12,0x80034c6c,12);
+                assert(leg.gpr[5]!=mats+0x20*12 && ttk::first_person_weapon_drawing());
+                assert(ttk::first_person_limb_presentation().owner==ttk::LimbOwner::Kick);
+                assert(ttk::first_person_limb_presentation().parts==(1u<<3));
+                // D36J2: default no-body must not consume active Q.
+                const std::vector<uint8_t> shown(ram+(leg.gpr[5]&0x1fffff),ram+(leg.gpr[5]&0x1fffff)+32);
+                unsetenv("DNTTK_FP_BODY");
+                auto no_body_leg=hook(0x800292a0,c,mats+0x20*12,0x80034c6c,12);
+                assert(ttk::first_person_limb_presentation().owner==ttk::LimbOwner::Kick);
+                assert(std::equal(shown.begin(),shown.end(),ram+(no_body_leg.gpr[5]&0x1fffff)));
+                auto no_body_other=hook(0x800292a0,c,mats+0x20*16,0x80034c6c,16);
+                assert(no_body_other.gpr[5]==c && ttk::first_person_limb_presentation().owner==ttk::LimbOwner::HiddenBody);
+                unsetenv("DNTTK_FP_BODY");
+                // D36J: the thigh starts at the hip, not at a reversed/dropped
+                // knee. Its complete chain reaches polygon clipping below H.
+                {
+                    auto thigh=hook(0x800292a0,c,mats+0x20*10,0x80034c6c,10);
+                    assert(thigh.gpr[5]!=mats+0x20*10);
+                    assert(ttk::first_person_limb_presentation().bridge_joint_depth);
+                    int32_t origin[3];
+                    for(int i=0;i<3;++i)origin[i]=int32_t(psx_mod_read_word(thigh.gpr[5]+0x14+4*i));
+                    thigh.gpr[31]=0x80034c8c;thigh.gte_ctrl[26]=256;
+                    psx_mod_write_word(thigh.gpr[29]+0x98,c);
+                    for(int z:{-100,0,100,255,256,400}) {
+                        thigh.gpr[16]=z;hooks().at(0x800b4d2c)(&thigh,0x800b4d2c);
+                        assert(int32_t(thigh.gpr[16])==std::max(z,256));
+                    }
+                    auto knee=hook(0x800292a0,c,mats+0x20*11,0x80034c6c,11);
+                    double distance=0;
+                    for(int i=0;i<3;++i)distance+=std::pow(double(origin[i])-int32_t(psx_mod_read_word(knee.gpr[5]+0x14+4*i)),2);
+                    assert(distance>200*200 && distance<250*250);
+                    // Default no-body suppresses the opposite leg/holster without moving native matrices.
+                    for(unsigned joint:{14u,15u,16u,17u,18u}) {
+                        auto native=hook(0x800292a0,c,mats+0x20*joint,0x80034c6c,joint);
+                        assert(native.gpr[5]==c);
+                        assert(ttk::first_person_limb_presentation().owner!=ttk::LimbOwner::Kick);
+                    }
+                }
+                assert(hook(0x800292a0,c,mats+0x20*16,0x80034c6c,16).gpr[5]==c); // hidden right leg
+                // D12B: the cowboy costume's left leg is joints 1..4; its joints
+                // 14 (neck) is suppressed here; 15 (head) retains its separate hide owner.
+                layout(cowboy);
+                for(unsigned j=1;j<=4;++j) assert(hook(0x800292a0,c,mats+0x20*j,0x80034c6c,j).gpr[5]!=mats+0x20*j);
+                for(unsigned j=14;j<=15;++j) assert(hook(0x800292a0,c,mats+0x20*j,0x80034c6c,j).gpr[5]==(j==14?c:mats+0x20*j));
+                layout(first_map);
+                assert(!ttk::first_person_weapon_drawing());
+                assert(hook(0x800292a0,c,mats+0x20*9,0x80034c6c,9).gpr[5]==mats+0x20*9);
+                call(0x8001ca4c,0x800d0000,0,0x800376b4);
+                for(unsigned i=0;i<12;++i){frame();update();}
+                const size_t hits=std::count_if(kick_calls.begin(),kick_calls.end(),[](const KickCall& x){return x.address==0x800a979c;});
+                assert(hits==13);                         // each update in frames 8..20
+                kick_calls.clear();
+                for(unsigned i=0;i<10;++i){frame();update();}
+                assert(kick_calls.empty());                         // finished
+                call(0x800348d8,c,p,0x8003769c);
+                assert(hook(0x800292a0,c,mats+0x20*12,0x80034c6c,12).gpr[5]==c);
+                call(0x8001ca4c,0x800d0000,0,0x800376b4);
+                assert(std::equal(before.begin(),before.end(),ram+(mats&0x1fffff)));
+                // Boot selected: a held attack starts the kick (moving too).
+                {
+                    const uint32_t eq=psx_mod_read_word(p+0x3b8);psx_mod_write_word(p+0x3b8,eq&~0x00ff00ffu);
+                    const double starts=metric("\"fire_starts\":");
+                    ttk::input.held[ttk::fire]=true;frame();update();
+                    assert(metric("\"fire_starts\":")==starts+1 && std::strstr(ttk::controls_debug_json(),"\"kick\":{\"active\":true"));
+                    for(unsigned i=0;i<30;++i){frame();update();}
+                    assert(metric("\"fire_starts\":")==starts+2);   // still held: the next kick follows
+                    ttk::input.held[ttk::fire]=false;for(unsigned i=0;i<30;++i){frame();update();}
+                    assert(std::strstr(ttk::controls_debug_json(),"\"kick\":{\"active\":false"));
+                    // A weapon selected: holding fire does not kick.
+                    psx_mod_write_word(p+0x3b8,(eq&~0x00ff00ffu)|0x00040002u);
+                    ttk::input.held[ttk::fire]=true;frame();update();assert(metric("\"fire_starts\":")==starts+2);
+                    ttk::input.held[ttk::fire]=false;psx_mod_write_word(p+0x3b8,eq);kick_calls.clear();
+                }
+                // D12C: a quick kick plays the wall-bump thud 0x2007 once, at the
+                // first contact the sphere reports or a wall (world) where the
+                // boot reaches; nothing for empty air or an actor the ray sees
+                // but the sphere does not touch.
+                auto thuds=[&](){return std::count_if(kick_calls.begin(),kick_calls.end(),[&](const KickCall& x){
+                    return x.address==0x8006b73c && x.a[0]==0x2007 && x.a[1]==p+4 && x.a[2]==0x800 && x.a[3]==48;});};
+                auto spheres=[&](){return std::count_if(kick_calls.begin(),kick_calls.end(),[](const KickCall& x){return x.address==0x800a979c;});};
+                auto quick=[&](unsigned frames){
+                    psx_mod_write_half(p+0x60,113);psx_mod_write_half(p+0x68,0);ttk::input.held[ttk::fire]=true;
+                    call(0x800493a4,p,0,0x8005a490,0x801fff00);ttk::input.held[ttk::fire]=false;kick_calls.clear();
+                    for(unsigned i=0;i<frames;++i){frame();update();}
+                };
+                {
+                    const double played=metric("\"played\":");
+                    quick(30);assert(spheres()>=4 && thuds()==0);                  // empty air
+                    ttk::segment_hit=true;ttk::segment_kind=2;
+                    for(int i=0;i<3;++i)ttk::segment_point[i]=(int32_t)psx_mod_read_word(c+0x14+4*i)+(int16_t)psx_mod_read_half(c+12+2*i)/4096.0*200;
+                    quick(30);assert(thuds()==0);                                  // an actor in view, not struck
+                    ttk::segment_hit=false;sphere_strike=true;quick(30);sphere_strike=false;
+                    assert(thuds()==1 && spheres()>=4);                           // struck: once, at the first contact
+                    assert(psx_mod_read_half(0x801e1000+0x6a)==3*5192);            // that sound at three times its table volume
+                    {
+                        size_t first_sphere=kick_calls.size(),thud=kick_calls.size();
+                        for(size_t i=0;i<kick_calls.size();++i){
+                            if(kick_calls[i].address==0x800a979c && first_sphere==kick_calls.size())first_sphere=i;
+                            if(kick_calls[i].address==0x8006b73c && kick_calls[i].a[0]==0x2007)thud=i;
+                        }
+                        assert(thud==first_sphere+1);
+                    }
+                    ttk::segment_hit=true;ttk::segment_kind=1;quick(30);assert(thuds()==1);   // a wall in reach
+                    ttk::segment_hit=false;ttk::segment_kind=2;
+                    assert(metric("\"played\":")==played+2);
+                    setenv("DNTTK_KICK_IMPACT","off",1);                          // read once: still on
+                    sphere_strike=true;quick(30);sphere_strike=false;assert(thuds()==1);unsetenv("DNTTK_KICK_IMPACT");
+                }
+                // Third person. D12E1 KICK QUICK (the default): an original Boot
+                // request (no Q or attack held) restarts idle 63 and starts no kick.
+                ttk::input.first_person=false;for(unsigned i=0;i<40;++i)frame();
+                psx_mod_write_half(p+0x60,112);psx_mod_write_half(p+0x68,0);
+                call(0x800493a4,p,0,0x8005a490,0x801fff00);assert(psx_mod_read_half(p+0x60)==63);
+                assert(std::strstr(ttk::controls_debug_json(),"\"tp_kick\":{\"quick\":true"));
+                assert(std::strstr(ttk::controls_debug_json(),"\"suppressed\":1,"));
+                // KICK ORIGINAL: the original request plays as before.
+                setenv("DNTTK_TP_KICK","original",1);
+                psx_mod_write_half(p+0x60,112);psx_mod_write_half(p+0x68,0);
+                call(0x800493a4,p,0,0x8005a490,0x801fff00);assert(psx_mod_read_half(p+0x60)==112);
+                // D12C: the original kick's sphere call (ra 0x80049098) is made by
+                // the host with the same arguments; the original call is left a
+                // radius that touches nothing. One thud per kick animation.
+                {
+                    constexpr uint32_t foot=0x801e7000,ssp=0x801fe000;
+                    psx_mod_write_word(foot,100);psx_mod_write_word(foot+4,-200);psx_mod_write_word(foot+8,300);
+                    auto sphere=[&](uint32_t ra){
+                        CPUState cpu{};cpu.gpr[4]=foot;cpu.gpr[5]=96;cpu.gpr[6]=10;cpu.gpr[7]=200;cpu.gpr[29]=ssp;cpu.gpr[31]=ra;
+                        psx_mod_write_word(ssp+0x10,p);psx_mod_write_word(ssp+0x14,0);
+                        hooks().at(0x800a979c)(&cpu,0x800a979c);return cpu;
+                    };
+                    kick_calls.clear();
+                    auto miss=sphere(0x80049098);
+                    assert(miss.gpr[5]==0xf0000000u && spheres()==1 && thuds()==0);
+                    const KickCall& k=kick_calls[0];
+                    assert(k.a[0]==foot && k.a[1]==96 && k.a[2]==10 && k.a[3]==200 && k.stack[0]==p && k.stack[1]==0);
+                    sphere_strike=true;
+                    sphere(0x80049098);sphere(0x80049098);assert(spheres()==3 && thuds()==1);
+                    update();psx_mod_write_half(p+0x60,115);sphere(0x80049098);assert(thuds()==2); // next kick
+                    psx_mod_write_half(p+0x60,63);update();psx_mod_write_half(p+0x60,115);
+                    sphere(0x80049098);assert(thuds()==3);
+                    kick_calls.clear();
+                    assert(sphere(0x800a0000).gpr[5]==96 && kick_calls.empty());   // another caller
+                    ttk::modern=false;
+                    assert(sphere(0x80049098).gpr[5]==96 && kick_calls.empty());   // Vanilla
+                    ttk::modern=true;sphere_strike=false;
+                    psx_mod_write_half(p+0x60,112);
+                }
+                unsetenv("DNTTK_TP_KICK");
+                psx_mod_write_half(p+0x60,63);
+                psx_mod_write_word(0x800d21fc,saved_delta);psx_mod_write_half(p+0x364,saved_power);
+                ttk::input.first_person=true;for(unsigned i=0;i<40;++i)frame();
+            }
+            ttk::input.first_person=false;
+            for(unsigned i=0;i<40;++i)frame();
+            assert(metric("\"blend\":")==0);
+            call(0x8003aa48,c,sp+0x18,0x8003aeb0,sp);
+            assert(psx_mod_read_word(0x800c3c48)==(tight_enabled?256u:768u) && (int16_t)psx_mod_read_half(c+0x42)==386);
+            call(0x8002a038,0,1,0x8003af40,sp);assert(psx_mod_read_word(0x800c3c48)==768);
+            call(0x800348d8,c,p,0x8003769c);assert(!(psx_mod_read_byte(record)&1));
+            // D11C: a head hide captured by a save state (bit 0 set, host owns
+            // nothing after the load) is reclaimed at Duke's next draw in third
+            // person, keeping the record's other flag bits; other actors and
+            // draw loops leave it alone.
+            {
+                const double reclaims0=metric("\"head_reclaims\":");
+                psx_mod_write_byte(record,0x11);
+                call(0x800348d8,c,0x800d8000,0x8003769c);assert(psx_mod_read_byte(record)==0x11);
+                call(0x800348d8,c,p,0x80037718);assert(psx_mod_read_byte(record)==0x11);
+                call(0x800348d8,c,p,0x8003769c);assert(psx_mod_read_byte(record)==0x10);
+                call(0x8001ca4c,0x800d0000,0,0x800376b4);assert(psx_mod_read_byte(record)==0x10);
+                assert(metric("\"head_reclaims\":")==reclaims0+1);
+                psx_mod_write_byte(record,0);
+            }
+            // A relaxed word captured by a save state is repaired, not adopted.
+            psx_mod_write_word(0x800c3c48,0);frame();
+            assert(psx_mod_read_word(0x800c3c48)==768);
+            // D26B: console/focus/input epochs and guest pause retain the
+            // eye, orientation and head policy without granting movement.
+            ttk::input.first_person=true;for(unsigned i=0;i<40;++i)frame();
+            const double owned_yaw=metric("\"yaw\":"),owned_pitch=metric("\"pitch\":");
+            for(unsigned paused:{0u,1u}) {
+                ttk::input.active=false;++ttk::input.epoch;
+                ttk::input.total_x=ttk::input.total_y=0;
+                psx_mod_write_half(0x800be568,paused);
+                ttk::input.sequence+=50; // paused redraw before another camera update
+                call(0x800348d8,c,p,0x8003769c);assert(psx_mod_read_byte(record)&1);
+                call(0x8001ca4c,0x800d0000,0,0x800376b4);
+                for(unsigned i=0;i<8;++i)frame();
+                assert(metric("\"blend\":")==1 && !ttk::movement_ready());
+                assert(metric("\"yaw\":")==owned_yaw && metric("\"pitch\":")==owned_pitch);
+                call(0x8003aa48,c,sp+0x18,0x8003aeb0,sp);
+                assert(psx_mod_read_word(0x800c3c48)==0);
+                call(0x8002a038,0,1,0x8003af40,sp);
+                call(0x800348d8,c,p,0x8003769c);assert(psx_mod_read_byte(record)&1);
+                call(0x8001ca4c,0x800d0000,0,0x800376b4);assert(!(psx_mod_read_byte(record)&1));
+                CPUState cpu{};cpu.gpr[4]=386;cpu.gpr[31]=0x8002e4d0;cpu.gpr[29]=0x801f0000;
+                hooks().at(0x800b4d9c)(&cpu,0x800b4d9c);assert(cpu.gpr[4]==256);
+            }
+            psx_mod_write_half(0x800be568,0);
+            ttk::input.active=true;++ttk::input.epoch;frame();
+            assert(metric("\"blend\":")==1 && ttk::movement_ready());
+            assert(metric("\"yaw\":")==owned_yaw);
+            // Load a different stored heading while input is suspended: adopt
+            // that world's direction, but immediately use our selected view.
+            ttk::input.active=false;
+            call(0x800348d8,c,p,0x8003769c);assert(psx_mod_read_byte(record)&1);
+            ++save_loads;psx_mod_write_byte(record,0x11);
+            call(0x800b4d9c,386,0,0x8002e4d0); // load resumes inside a draw
+            assert(psx_mod_read_byte(record)==0x11 && metric("\"blend\":")==0);
+            psx_mod_write_half(c+12,4096);psx_mod_write_half(c+14,0);psx_mod_write_half(c+16,0);
+            frame();assert(metric("\"blend\":")==1);
+            assert(std::abs(metric("\"yaw\":")-quarter)<1e-6);
+            // A load may start in an unowned jump; camera acquisition must
+            // not depend on input/flight state from before that save.
+            for(unsigned a:{96u,97u,98u,103u,104u,105u,109u}) {
+                ++save_loads;psx_mod_write_half(p+0x60,a);
+                psx_mod_write_byte(p+0x22c,9);psx_mod_write_byte(p+0x22d,9);
+                ++ttk::input.epoch;frame();
+                assert(metric("\"blend\":")==1 && !ttk::movement_ready());
+            }
+            psx_mod_write_half(p+0x60,63);psx_mod_write_byte(p+0x22c,0);psx_mod_write_byte(p+0x22d,0);frame();
+            // Explicit Legacy owns the original camera; the first-person
+            // preference is dormant and returns when Modern is selected.
+            setenv("DNTTK_CONTROL_SCHEME","legacy",1);frame();
+            assert(metric("\"blend\":")==0 && ttk::input.first_person);
+            unsetenv("DNTTK_CONTROL_SCHEME");frame();assert(metric("\"blend\":")==1);
+            // Unknown code and an actual camera-owner change still revoke
+            // presentation, even though the request itself remains first.
+            poke(0x43eb8);frame();assert(metric("\"blend\":")==0);poke(0x43eb8);
+            frame();assert(metric("\"blend\":")==1);
+            psx_mod_write_word(c+0xa4,0);frame();assert(metric("\"blend\":")==0);
+            psx_mod_write_word(c+0xa4,p);frame();assert(metric("\"blend\":")==1);
+            // Same-level teardown cannot inherit the old orbit either.
+            call(0x8002b9f4,0,0,0x80025474);assert(metric("\"blend\":")==1);
+            call(0x8002b9f4,1,0,0x80025478);assert(metric("\"blend\":")==1);
+            call(0x8002b9f4,1,0,0x80025474);assert(metric("\"blend\":")==0);
+            frame();assert(metric("\"blend\":")==1 && ttk::input.first_person);
+            std::puts("PASS: D26B view ownership across input suspension, pause, capture epochs, load, explicit scheme and camera ownership; movement and identity gates retained");
+            // Replay must restore policy, not inherit a later live view choice.
+            {
+                std::vector<uint8_t> eye(ttk::render_state_size()),orbit(eye.size());
+                ttk::render_state_save(eye.data());
+                ttk::input.first_person=false;for(unsigned i=0;i<40;++i)frame();
+                ttk::render_state_save(orbit.data());
+                ttk::render_state_load(eye.data());
+                assert(std::strstr(ttk::controls_debug_json(),"\"effective\":true,\"requested\":true"));
+                ttk::render_state_load(orbit.data());
+                assert(std::strstr(ttk::controls_debug_json(),"\"effective\":false,\"requested\":false"));
+                ttk::input.first_person=true;frame();
+            }
+            // D36I: native contact arms cross the joint-origin cutoff as a
+            // connected chain, but retain matrices, world depth and lighting.
+            // D36J5: shared leg admission for all authenticated action eyes.
+            auto action_legs=[&]() {
+                const std::vector<uint8_t> original(ram+(mats&0x1fffff),ram+(mats&0x1fffff)+19*32);
+                for(bool on:{false,true}) for(unsigned h:{160u,256u}) for(unsigned part:{0u,1u,2u,3u,4u,5u,6u,7u,8u,9u,20u,21u}) {
+                    setenv("DNTTK_FP_LEGS",on?"on":"off",1);
+                    call(0x800348d8,c,p,0x8003769c);
+                    CPUState draw{};draw.gpr[4]=c;draw.gpr[20]=p;draw.gpr[23]=psx_mod_read_byte(desc+0x24+part);
+                    const uint32_t native=mats+32*draw.gpr[23];draw.gpr[5]=native;
+                    draw.gpr[29]=0x801f0000;draw.gpr[31]=0x80034c6c;draw.gte_ctrl[26]=h;
+                    hooks().at(0x800292a0)(&draw,0x800292a0);
+                    const auto owner=ttk::first_person_limb_presentation();
+                    // The native door attachment remains under its kick owner.
+                    if(owner.owner!=ttk::LimbOwner::Kick) {
+                        const bool leg=on && ((part>=1 && part<=8) || part==21);
+                        assert(owner.owner==(leg?ttk::LimbOwner::Legs:ttk::LimbOwner::HiddenBody));
+                        assert(owner.fixed_projection()==leg && owner.world_clip()==leg && !owner.viewmodel());
+                        if(leg) {
+                            for(unsigned k=0;k<20;++k)assert(psx_mod_read_byte(draw.gpr[5]+k)==psx_mod_read_byte(native+k));
+                            assert(psx_mod_read_word(draw.gpr[5]+24)==psx_mod_read_word(native+24));
+                        } else assert(draw.gpr[5]==c);
+                    }
+                    assert(draw.gte_ctrl[26]==h);
+                    call(0x8001ca4c,0x800d0000,0,0x800376b4);
+                }
+                assert(std::equal(original.begin(),original.end(),ram+(mats&0x1fffff)));
+                setenv("DNTTK_FP_LEGS","off",1);
+            };
+            auto contact_arms=[&](bool eligible,bool unarmed_body=false) {
+                const auto equip=psx_mod_read_byte(p+0x3b8);
+                psx_mod_write_byte(p+0x3b8,0);
+                const std::vector<uint8_t> before(ram+(mats&0x1fffff),ram+(mats&0x1fffff)+19*0x20);
+                for(unsigned part:{0u,9u,10u,11u,12u,13u,14u,15u,16u,20u,21u}) {
+                    const bool arm=(eligible || unarmed_body) && part>=10 && part<=15;
+                    call(0x800348d8,c,p,0x8003769c);
+                    CPUState joint{};joint.gpr[4]=c;joint.gpr[20]=p;joint.gpr[29]=0x801f0000;
+                    joint.gpr[23]=psx_mod_read_byte(desc+0x24+part);
+                    const auto matrix=mats+0x20*joint.gpr[23];
+                    joint.gpr[5]=matrix;joint.gpr[31]=0x80034c6c;
+                    hooks().at(0x800292a0)(&joint,0x800292a0);
+                    const auto limb=ttk::first_person_limb_presentation();
+                    const bool hidden=ttk::modern && ttk::first_person_view_live() && (part<=9 || part>=20);
+                    assert((limb.owner==ttk::LimbOwner::HiddenBody)==hidden);
+                    assert(limb.bridge_joint_depth==arm && !limb.viewmodel());
+                    if(arm)assert(limb.owner==(unarmed_body?ttk::LimbOwner::Body:ttk::LimbOwner::Interaction) &&
+                        limb.parts==(1u<<part) && limb.space==ttk::LimbSpace::NativeWorld &&
+                        limb.light==(unarmed_body?ttk::LimbLight::CorrectProximityFade:ttk::LimbLight::Native));
+                    assert((joint.gpr[5]!=matrix)==(hidden || (unarmed_body && arm)));
+                    const auto displayed=joint.gpr[5];
+                    joint.gpr[31]=0x80034c8c;joint.gte_ctrl[26]=256;
+                    psx_mod_write_word(joint.gpr[29]+0x98,c);
+                    for(int depth:{-120,0,80,255,256,400}) {
+                        joint.gpr[16]=depth;
+                        hooks().at(0x800b4d2c)(&joint,0x800b4d2c);
+                        assert((int32_t)joint.gpr[16]==(arm?std::max(depth,256):depth));
+                        assert(joint.gte_ctrl[26]==256 && joint.gpr[5]==displayed);
+                    }
+                    for(int bad=0;bad<3;++bad) {
+                        CPUState wrong=joint;wrong.gpr[16]=40;
+                        if(bad==0)wrong.gpr[20]=p+4;
+                        if(bad==1)wrong.gpr[31]+=4;
+                        if(bad==2)psx_mod_write_word(wrong.gpr[29]+0x98,c+4);
+                        hooks().at(0x800b4d2c)(&wrong,0x800b4d2c);assert(wrong.gpr[16]==40);
+                    }
+                    psx_mod_write_word(joint.gpr[29]+0x98,c);
+                    call(0x8001ca4c,0x800d0000,0,0x800376b4);
+                    joint.gpr[16]=40;hooks().at(0x800b4d2c)(&joint,0x800b4d2c);
+                    assert(joint.gpr[16]==40 && !ttk::first_person_interaction_drawing());
+                    // D14A: wide projection can expose the root's native fade.
+                    // Contact limbs keep world depth and environment light; only
+                    // the exact proximity effect is scoped out, never power-ups.
+                    if(eligible && !unarmed_body && part==15) {
+                        const uint32_t ctx=0x800d67a8,flags=psx_mod_read_word(p);
+                        const uint32_t cmd=psx_mod_read_word(ctx+0x48),page=psx_mod_read_word(ctx+0x4c),flat=psx_mod_read_word(ctx+0x54);
+                        for(unsigned h:{256u,209u,160u,123u,92u,91u})for(unsigned effect:{0u,0x40u,0x2000u,0x4000u}) {
+                            call(0x800348d8,c,p,0x8003769c);
+                            psx_mod_write_word(p,(flags&~0x6040u)|effect);
+                            psx_mod_write_word(ctx+0x48,0x2000000);psx_mod_write_word(ctx+0x4c,0x600000);psx_mod_write_word(ctx+0x54,0x12345678);
+                            joint.gte_ctrl[26]=h;for(int k=13;k<16;++k)joint.gte_ctrl[k]=321;
+                            joint.gpr[4]=c;joint.gpr[5]=matrix;joint.gpr[31]=0x80034c6c;
+                            hooks().at(0x800292a0)(&joint,0x800292a0);
+                            assert(psx_mod_read_word(ctx+0x48)==(h>=92 && h<256 && !effect?0u:0x2000000u));
+                            const auto owner=ttk::first_person_limb_presentation();
+                            assert(owner.owner==ttk::LimbOwner::Interaction && owner.world_clip() && !owner.viewmodel());
+                            assert(joint.gpr[5]==matrix && joint.gte_ctrl[26]==h);
+                            joint.gpr[31]=0x80012340;hooks().at(0x800292a0)(&joint,0x800292a0);
+                            assert(psx_mod_read_word(ctx+0x48)==0x2000000 && psx_mod_read_word(ctx+0x4c)==0x600000);
+                            assert(psx_mod_read_word(ctx+0x54)==0x12345678 && joint.gte_ctrl[13]==321);
+                        }
+                        psx_mod_write_word(p,flags);psx_mod_write_word(ctx+0x48,cmd);psx_mod_write_word(ctx+0x4c,page);psx_mod_write_word(ctx+0x54,flat);
+                    }
+                }
+                assert(std::equal(before.begin(),before.end(),ram+(mats&0x1fffff)));
+                psx_mod_write_byte(p+0x3b8,equip);
+            };
+            // D36H5: exercise the actual draw hook, not only IK arithmetic.
+            // The fixture's local child offset is (0,100,0). Both costume maps
+            // must meet at the elbow/wrist while all native matrices stay exact.
+            auto contact_rig=[&](bool enabled) {
+                auto hook=[&](uint32_t address,uint32_t cam,uint32_t matrix,uint32_t caller,unsigned j) {
+                    CPUState cpu{};cpu.gpr[4]=cam;cpu.gpr[5]=matrix;cpu.gpr[20]=p;
+                    cpu.gpr[23]=j;cpu.gpr[29]=0x801f0000;cpu.gpr[31]=caller;
+                    hooks().at(address)(&cpu,address);return cpu;
+                };
+                const std::vector<uint8_t> old_desc(ram+(desc&0x1fffff),ram+(desc&0x1fffff)+0x400);
+                const std::vector<uint8_t> old_mats(ram+(mats&0x1fffff),ram+(mats&0x1fffff)+19*32);
+                uint8_t old_camera[32];std::memcpy(old_camera,ram+(c&0x1fffff),32);
+                const auto held=psx_mod_read_byte(p+0x3b8);psx_mod_write_byte(p+0x3b8,0);
+                // D36H9: ledge shoulders follow Duke's heading; face the identity camera.
+                const auto heading=psx_mod_read_half(p+0x1c);psx_mod_write_half(p+0x1c,0);
+                for(const auto* costume:{first_map,cowboy})for(unsigned distance:{100u,300u,550u}) {
+                    layout(costume);
+                    for(unsigned i=0;i<9;++i)psx_mod_write_half(c+2*i,i%4==0?4096:0);
+                    for(unsigned i=0;i<3;++i)psx_mod_write_word(c+20+4*i,0);
+                    for(unsigned part=10;part<=15;++part) {
+                        const unsigned j=psx_mod_read_byte(desc+0x24+part),n=(part-10)%3;
+                        for(unsigned i=0;i<9;++i)psx_mod_write_half(mats+32*j+2*i,i%4==0?4096:0);
+                        psx_mod_write_word(mats+32*j+20,part<13?-100:100);
+                        psx_mod_write_word(mats+32*j+24,n*100);
+                        psx_mod_write_word(mats+32*j+28,distance);
+                    }
+                    if(enabled)action_legs();
+                    const std::vector<uint8_t> native(ram+(mats&0x1fffff),ram+(mats&0x1fffff)+19*32);
+                    for(bool comparison:{false,true}) {
+                        if(comparison)setenv("DNTTK_FP_CONTACT_ARMS","native",1);
+                        else unsetenv("DNTTK_FP_CONTACT_ARMS");
+                        call(0x800348d8,c,p,0x8003769c);
+                        uint8_t output[6][32];
+                        for(unsigned part:{13u,14u,15u,10u,11u,12u}) {
+                            const unsigned j=psx_mod_read_byte(desc+0x24+part);
+                            auto result=hook(0x800292a0,c,mats+32*j,0x80034c6c,j);
+                            const bool solved=enabled && !comparison && part!=12 && part!=15;
+                            assert((result.gpr[5]!=mats+32*j)==solved);
+                            std::memcpy(output[part-10],ram+(result.gpr[5]&0x1fffff),32);
+                            if(enabled) {
+                                const auto owner=ttk::first_person_limb_presentation();
+                                assert(owner.owner==ttk::LimbOwner::Interaction && owner.world_clip() && !owner.viewmodel());
+                            }
+                        }
+                        auto word=[](const uint8_t* b){int32_t v;std::memcpy(&v,b,4);return v;};
+                        auto half=[](const uint8_t* b){int16_t v;std::memcpy(&v,b,2);return v;};
+                        for(unsigned i:{0u,1u,3u,4u})for(unsigned k=0;k<3;++k) {
+                            const double end=word(output[i]+20+4*k)+100.0*half(output[i]+6+2*k)/4096;
+                            assert(std::abs(end-word(output[i+1]+20+4*k))<2);
+                        }
+                        if(enabled && !comparison)for(unsigned i:{0u,3u}) {
+                            const double x=word(output[i]+20),y=word(output[i]+24),z=word(output[i]+28);
+                            const double anchor=i==0?-200:200;
+                            assert(y-.8*z>=94.5);
+                            assert(std::sqrt((x-anchor)*(x-anchor)+(y-150)*(y-150)+(z+64)*(z+64))<=97);
+                            const double old_distance=std::sqrt(10000+2500+(distance+64.0)*(distance+64.0));
+                            const double dx=word(output[i+2]+20)-x,dy=word(output[i+2]+24)-y,dz=word(output[i+2]+28)-z;
+                            assert(std::sqrt(dx*dx+dy*dy+dz*dz)<old_distance-1);
+                        }
+                        assert(std::equal(native.begin(),native.end(),ram+(mats&0x1fffff)));
+                        call(0x8001ca4c,0x800d0000,0,0x800376b4);
+                    }
+                    unsetenv("DNTTK_FP_CONTACT_ARMS");
+                    // Reflected actor submission must retain the world rig.
+                    call(0x800348d8,c,p,0x8003816c);
+                    for(unsigned part=10;part<=15;++part) {
+                        const unsigned j=psx_mod_read_byte(desc+0x24+part);
+                        assert(hook(0x800292a0,c,mats+32*j,0x80034c6c,j).gpr[5]==mats+32*j);
+                    }
+                    call(0x8001ca4c,0x800d0000,0,0x800376b4);
+                }
+                std::copy(old_desc.begin(),old_desc.end(),ram+(desc&0x1fffff));
+                std::copy(old_mats.begin(),old_mats.end(),ram+(mats&0x1fffff));
+                std::memcpy(ram+(c&0x1fffff),old_camera,32);psx_mod_write_byte(p+0x3b8,held);psx_mod_write_half(p+0x1c,heading);
+            };
+            // D35J/M: presentation-only transient leases. Native state, action
+            // lockouts and ownership/death/script guards must survive them.
+            {
+                const auto flags=psx_mod_read_word(p+0x224),actor=psx_mod_read_word(p);
+                const auto upper=psx_mod_read_half(p+0x74);
+                for(unsigned pose:{64u,65u,66u,67u,68u,69u,116u,118u,266u,267u,268u,270u,275u,277u,279u,63u}) {
+                    const bool use=pose==116 || pose==118 || pose==266 || pose==267 || pose==268 || pose==270 || pose==275 || pose==277 || pose==279;
+                    const uint32_t bits=use?0x40u:pose==63?0x200u:0u;
+                    psx_mod_write_half(p+0x60,pose);psx_mod_write_half(p+0x74,pose);
+                    psx_mod_write_byte(p+0x22c,0);psx_mod_write_byte(p+0x22d,0);
+                    psx_mod_write_word(p+0x224,bits);++save_loads;frame();
+                    assert(metric("\"blend\":")==1);
+                    assert(!ttk::movement_ready() && !ttk::locomotion_input_ready());
+                    assert(psx_mod_read_half(p+0x60)==pose && psx_mod_read_word(p+0x224)==bits);
+                    if(use)assert(std::strstr(ttk::controls_debug_json(),"\"action\":\"use\""));
+                    contact_arms(use,!use);
+                    if(use)contact_rig(true);
+                    if(pose==270 || pose==275 || pose==279) {
+                        for(unsigned offset:{0x22cu,0x22du}) {
+                            psx_mod_write_byte(p+offset,1);frame();assert(metric("\"blend\":")==0);
+                            psx_mod_write_byte(p+offset,0);frame();assert(metric("\"blend\":")==1);
+                        }
+                    }
+                    if(pose==116) {
+                        // Door kick is a right-leg viewmodel driven by native
+                        // animation progress, without quick-kick attacks/events.
+                        const uint32_t table=0x800d8328+4*600,frames=0x801b0000;
+                        const auto saved_rec=psx_mod_read_word(table),saved_frm=psx_mod_read_word(0x800d8324);
+                        std::vector<uint8_t> saved_frames(ram+(frames&0x1fffff),ram+(frames&0x1fffff)+6*8);
+                        std::vector<uint8_t> channel(ram+(p&0x1fffff)+0x62,ram+(p&0x1fffff)+0x68);
+                        std::vector<uint8_t> joints(ram+(mats&0x1fffff),ram+(mats&0x1fffff)+0x20*19);
+                        psx_mod_write_word(table,6u<<16);psx_mod_write_word(0x800d8324,frames);
+                        for(unsigned i=0;i<6;++i)psx_mod_write_word(frames+8*i,50u<<16);
+                        auto draw=[&](unsigned part) {
+                            call(0x800348d8,c,p,0x8003769c);
+                            CPUState cpu{};cpu.gpr[4]=c;cpu.gpr[20]=p;cpu.gpr[29]=0x801f0000;
+                            cpu.gpr[23]=psx_mod_read_byte(desc+0x24+part);
+                            cpu.gpr[5]=mats+0x20*cpu.gpr[23];cpu.gpr[31]=0x80034c6c;
+                            hooks().at(0x800292a0)(&cpu,0x800292a0);
+                            const bool changed=ttk::first_person_limb_presentation().owner==ttk::LimbOwner::Kick;
+                            if(changed) assert(ttk::first_person_limb_presentation().fixed_projection());
+                            std::array<int32_t,3> pos{};
+                            for(unsigned i=0;i<3;++i)pos[i]=psx_mod_read_word(cpu.gpr[5]+0x14+4*i);
+                            call(0x8001ca4c,0x800d0000,0,0x800376b4);
+                            return std::make_pair(changed,pos);
+                        };
+                        const auto attacks=kick_calls.size();
+                        for(unsigned key=0;key<6;++key) {
+                            psx_mod_write_half(p+0x64,key);psx_mod_write_half(p+0x66,key);psx_mod_write_half(p+0x62,0);
+                            for(unsigned part:{5u,6u,7u,8u,21u})assert(draw(part).first);
+                            assert(!draw(3).first); // other leg untouched
+                        }
+                        psx_mod_write_half(p+0x64,2);psx_mod_write_half(p+0x66,3);
+                        psx_mod_write_half(p+0x62,50);auto chamber=draw(7).second;
+                        psx_mod_write_half(p+0x62,0);auto strike=draw(7).second;
+                        assert(chamber!=strike);
+                        double right=0;
+                        for(unsigned i=0;i<3;++i)right+=(int16_t)psx_mod_read_half(c+2*i)/4096.0*(strike[i]-(int32_t)psx_mod_read_word(c+0x14+4*i));
+                        assert(right>0); // rises on the right, unlike the quick kick
+                        assert(draw(7).second==strike); // no host-frame timer
+                        setenv("DNTTK_FP_BODY","visible",1);
+                        assert(draw(7).second==strike); // diagnostic body retains the same door presentation
+                        unsetenv("DNTTK_FP_BODY");
+                        psx_mod_write_half(p+0x66,6);assert(!draw(7).first); // malformed/outside clip
+                        psx_mod_write_half(p+0x66,3);
+                        setenv("DNTTK_USE_VIEW","legacy-third",1);frame();assert(draw(7).first);
+                        unsetenv("DNTTK_USE_VIEW");frame();assert(draw(7).first);
+                        ttk::modern=false;frame();assert(!draw(7).first);
+                        ttk::modern=true;frame();assert(draw(7).first);
+                        assert(kick_calls.size()==attacks);
+                        assert(std::equal(joints.begin(),joints.end(),ram+(mats&0x1fffff)));
+                        psx_mod_write_word(table,saved_rec);psx_mod_write_word(0x800d8324,saved_frm);
+                        std::copy(saved_frames.begin(),saved_frames.end(),ram+(frames&0x1fffff));
+                        std::copy(channel.begin(),channel.end(),ram+(p&0x1fffff)+0x62);
+                        std::puts("PASS: D35K native-timed right-leg door presentation, no attack, immutable joints, view and Vanilla gates");
+                    }
+                    ttk::input.active=false;frame();assert(metric("\"blend\":")==1);
+                    ttk::input.active=true;
+                    std::vector<uint8_t> snapshot(ttk::render_state_size());ttk::render_state_save(snapshot.data());
+                    ttk::input.first_person=false;++save_loads;frame();assert(metric("\"blend\":")==0);
+                    // D10F2: third person keeps the orbit (and clear lens) through the action.
+                    if(pose!=63) {
+                        const double cameras=metric("\"cameras\":");frame();
+                        assert(metric("\"cameras\":")>cameras && !ttk::movement_ready() && !ttk::locomotion_input_ready());
+                        assert(psx_mod_read_half(p+0x60)==pose && psx_mod_read_word(p+0x224)==bits);
+                    }
+                    ttk::render_state_load(snapshot.data());assert(metric("\"blend\":")==1);
+                    ttk::input.first_person=true;
+                    for(uint32_t bad:{0x20000000u}) {
+                        psx_mod_write_word(p+0x224,bits|bad);frame();assert(metric("\"blend\":")==0);
+                    }
+                    // D42: the dead flag alone (health left) still drops the eye; dying
+                    // with no health in a one-player game keeps the floor-level death eye.
+                    {
+                        const uint16_t health=psx_mod_read_half(p+0x32);const uint32_t seats=psx_mod_read_word(0x800c27bc);
+                        psx_mod_write_word(0x800c27bc,1);psx_mod_write_half(p+0x32,100);
+                        psx_mod_write_word(p+0x224,bits);psx_mod_write_word(p,actor|2u);frame();assert(metric("\"blend\":")==0);
+                        psx_mod_write_half(p+0x32,0);frame();frame();frame();assert(metric("\"blend\":")==1);
+                        assert(std::strstr(ttk::controls_debug_json(),"\"action\":\"death\""));
+                        psx_mod_write_word(0x800c27bc,2);frame();assert(metric("\"blend\":")==0); // two players: original
+                        ttk::input.first_person=false;psx_mod_write_word(0x800c27bc,1);frame();assert(metric("\"blend\":")==0); // third person
+                        ttk::input.first_person=true;
+                        psx_mod_write_half(p+0x32,health);psx_mod_write_word(0x800c27bc,seats);
+                        psx_mod_write_word(p,actor);frame();frame();frame();
+                        std::puts("PASS: D42 first-person death eye (dead with no health, one player, first person only)");
+                    }
+                    psx_mod_write_word(p,actor|2u);psx_mod_write_half(p+0x32,100);frame();assert(metric("\"blend\":")==0);
+                    psx_mod_write_half(p+0x32,0);
+                    psx_mod_write_word(p,actor);psx_mod_write_word(c+0xa4,0);frame();assert(metric("\"blend\":")==0);
+                    psx_mod_write_word(c+0xa4,p);frame();assert(metric("\"blend\":")==1);
+                    if(use) {
+                        setenv("DNTTK_USE_VIEW","legacy-third",1);frame();assert(metric("\"blend\":")==1);contact_arms(true);
+                        unsetenv("DNTTK_USE_VIEW");frame();assert(metric("\"blend\":")==1);
+                        psx_mod_write_word(p+0x224,0);frame();assert(metric("\"blend\":")==0);
+                    }
+                }
+                // Adjacent unknown/death poses are not granted a range lease.
+                for(unsigned pose:{62u,117u,269u,276u,280u}) {
+                    psx_mod_write_half(p+0x60,pose);psx_mod_write_word(p+0x224,0x40);
+                    frame();assert(metric("\"blend\":")==0);
+                }
+                psx_mod_write_word(p+0x224,flags);psx_mod_write_half(p+0x60,63);
+                psx_mod_write_half(p+0x74,upper);++save_loads;frame();assert(metric("\"blend\":")==1);
+                std::puts("PASS: D35J/M transient eye, action isolation, choice, pause, load, replay and safety guards");
+            }
+            // D35J5: a live freeze is presentation-only, read directly from
+            // native state. Thaw/death/load/choice cannot retain the exception.
+            {
+                const auto actor=psx_mod_read_word(p),bits=psx_mod_read_word(p+0x224);
+                const auto timer=psx_mod_read_word(p+0x214);
+                const auto health=psx_mod_read_half(p+0x32);
+                psx_mod_write_word(p,0x22000);psx_mod_write_word(p+0x214,3000);
+                psx_mod_write_half(p+0x32,100);psx_mod_write_word(p+0x224,0x100);
+                ++save_loads;frame();assert(metric("\"blend\":")==1);
+                assert(!ttk::movement_ready() && !ttk::locomotion_input_ready());
+                const double frozen_yaw=metric("\"yaw\":");
+                ttk::input.total_x+=100;frame();
+                assert(metric("\"yaw\":")==frozen_yaw);
+                assert(psx_mod_read_word(p)==0x22000 && psx_mod_read_word(p+0x214)==3000);
+                assert(psx_mod_read_word(p+0x224)==0x100 && psx_mod_read_half(p+0x32)==100);
+                std::vector<uint8_t> state(ttk::render_state_size());ttk::render_state_save(state.data());
+                ttk::input.first_person=false;++save_loads;frame();assert(metric("\"blend\":")==0);
+                ttk::input.first_person=true;ttk::render_state_load(state.data());
+                assert(metric("\"blend\":")==1);frame();
+                ttk::input.active=false;frame();assert(metric("\"blend\":")==1);ttk::input.active=true;
+                for(unsigned rejection=0;rejection<5;++rejection) {
+                    if(rejection==0)psx_mod_write_half(p+0x32,0);
+                    if(rejection==1)psx_mod_write_word(p,0x22002);
+                    if(rejection==2)psx_mod_write_word(p+0x214,0);
+                    if(rejection==3)psx_mod_write_word(p+0x224,0x20000100);
+                    if(rejection==4)psx_mod_write_word(c+0xa4,0);
+                    frame();assert(metric("\"blend\":")==0);
+                    psx_mod_write_half(p+0x32,100);psx_mod_write_word(p,0x22000);
+                    psx_mod_write_word(p+0x214,3000);psx_mod_write_word(p+0x224,0x100);
+                    psx_mod_write_word(c+0xa4,p);frame();assert(metric("\"blend\":")==1);
+                }
+                ttk::modern=false;frame();assert(!ttk::first_person_view_live());
+                ttk::modern=true;++save_loads;frame();assert(metric("\"blend\":")==1);
+                psx_mod_write_word(p,actor);psx_mod_write_word(p+0x224,bits);
+                psx_mod_write_word(p+0x214,timer);psx_mod_write_half(p+0x32,health);
+                frame();assert(metric("\"blend\":")==1);
+                std::puts("PASS: D35J5 frozen eye/input separation, native state, thaw/death/choice/load/replay/Vanilla guards");
+            }
+            // D19V: retired mirror/use overrides cannot defeat the global view.
+            {
+                const auto flags=psx_mod_read_word(p+0x224);
+                psx_mod_write_half(p+0x60,278);psx_mod_write_word(p+0x224,0x40);
+                for(const char* choice:{"first","legacy-third"}) {
+                    const bool eye=true; // both retired values retain first person
+                    setenv("DNTTK_MIRROR_VIEW",choice,1);setenv("DNTTK_USE_VIEW",eye?"legacy-third":"first",1);
+                    ++save_loads;frame();assert(metric("\"blend\":")==int(eye));
+                    assert(!ttk::movement_ready() && !ttk::locomotion_input_ready());
+                    if(eye)assert(std::strstr(ttk::controls_debug_json(),"\"action\":\"mirror\""));
+                    // D36I1: mirror grooming uses the native contact-arm chain,
+                    // including origins behind the eye. Reflections never own it.
+                    contact_arms(true);
+                    contact_rig(true);
+                    const auto equip=psx_mod_read_byte(p+0x3b8);
+                    psx_mod_write_byte(p+0x3b8,0);
+                    for(unsigned part=0;part<=21;++part) {
+                        constexpr uint32_t reflected=0x801ffe58;
+                        call(0x800348d8,reflected,p,0x8003816c);
+                        CPUState joint{};joint.gpr[4]=reflected;joint.gpr[20]=p;
+                        joint.gpr[23]=psx_mod_read_byte(desc+0x24+part);
+                        joint.gpr[5]=mats+0x20*joint.gpr[23];joint.gpr[31]=0x80034c6c;
+                        hooks().at(0x800292a0)(&joint,0x800292a0);
+                        assert(!ttk::first_person_limb_presentation().bridge_joint_depth);
+                        assert(!ttk::first_person_interaction_drawing());
+                        assert(joint.gpr[5]==mats+0x20*joint.gpr[23]);
+                        call(0x8001ca4c,0x800d0000,0,0x800376b4);
+                    }
+                    psx_mod_write_byte(p+0x3b8,equip);
+                    ttk::input.first_person=false;++save_loads;frame();contact_arms(false);
+                    ttk::input.first_person=true;++save_loads;frame();
+                    ttk::modern=false;frame();contact_arms(false);
+                    ttk::modern=true;++save_loads;frame();
+
+                    ttk::input.active=false;frame();assert(metric("\"blend\":")==int(eye));ttk::input.active=true;
+                    std::vector<uint8_t> state(ttk::render_state_size());ttk::render_state_save(state.data());
+                    ttk::input.first_person=false;++save_loads;frame();assert(metric("\"blend\":")==0);
+                    ttk::render_state_load(state.data());assert(metric("\"blend\":")==int(eye));ttk::input.first_person=true;
+                }
+                unsetenv("DNTTK_MIRROR_VIEW");unsetenv("DNTTK_USE_VIEW");
+                for(uint32_t bits:{0u,0x20000040u}) {
+                    psx_mod_write_word(p+0x224,bits);frame();assert(metric("\"blend\":")==0);
+                }
+                psx_mod_write_word(p+0x224,flags);psx_mod_write_half(p+0x60,63);++save_loads;frame();
+                assert(metric("\"blend\":")==1);
+                std::puts("PASS: D19V mirror follows global view, ignores retired overrides, pause/load/replay");
+            }
+            // D35D: authenticated push poses retain the eye without granting
+            // locomotion. Choice/global view, load, pause and replay ownership.
+            {
+                const uint32_t object=0x801ea000,table=0x801e8000;
+                const auto saved_table=psx_mod_read_word(0x800d2660);
+                psx_mod_write_word(0x800d2660,table);
+                const auto old_object=psx_mod_read_word(p+0x290);
+                const auto flags=psx_mod_read_word(table+28*165);
+                const auto equip=psx_mod_read_byte(p+0x3b8);
+                psx_mod_write_half(object+0x2c,165);
+                psx_mod_write_word(table+28*165,0x081090e2);
+                psx_mod_write_word(p+0x290,object);psx_mod_write_byte(p+0x3b8,0);
+                for(unsigned pose:{119u,120u,121u}) {
+                    psx_mod_write_half(p+0x60,pose);
+                    for(const char* choice:{"first","legacy-third"}) {
+                        setenv("DNTTK_PUSH_VIEW",choice,1);++save_loads;frame();
+                        const bool eye=!std::strcmp(choice,"first");
+                        assert(metric("\"blend\":")==int(eye));
+                        assert(!ttk::movement_ready() && !ttk::locomotion_input_ready());
+                        assert(std::strstr(ttk::controls_debug_json(),"\"action\":\"push\""));
+                        contact_arms(eye);
+                        contact_rig(eye);
+                        ttk::modern=false;frame();contact_arms(false);
+                        ttk::modern=true;frame();
+                        if(eye) {
+                            for(int i=0;i<30;++i)frame();
+                            for(unsigned part:{0x09u,0x0au,0x0bu,0x0cu,0x0du,0x0eu,0x0fu,0x10u}) {
+                                call(0x800348d8,c,p,0x8003769c);
+                                CPUState joint{};joint.gpr[4]=c;joint.gpr[20]=p;joint.gpr[29]=0x801f0000;
+                                joint.gpr[23]=psx_mod_read_byte(desc+0x24+part);
+                                joint.gpr[5]=mats+0x20*joint.gpr[23];joint.gpr[31]=0x80034c6c;
+                                hooks().at(0x800292a0)(&joint,0x800292a0);
+                                assert(ttk::first_person_interaction_drawing()==(part>=0x0a && part<=0x0f));
+                                assert(joint.gpr[5]==(part==9?c:mats+0x20*joint.gpr[23])); // hidden torso, native contact arms
+                                const auto limb=ttk::first_person_limb_presentation();
+                                assert(limb.bridge_joint_depth==(part>=0x0a && part<=0x0f) && !limb.viewmodel());
+                                if(part>=0x0a && part<=0x0f) {
+                                    assert(limb.parts==(1u<<part) && limb.space==ttk::LimbSpace::NativeWorld);
+                                    assert(limb.light==ttk::LimbLight::Native && limb.depth==ttk::LimbDepth::WorldClip);
+                                }
+                                call(0x8001ca4c,0x800d0000,0,0x800376b4);
+                                assert(!ttk::first_person_interaction_drawing());
+                            }
+                        }
+                        ttk::input.active=false;frame();assert(metric("\"blend\":")==int(eye));
+                        ttk::input.active=true;
+                        std::vector<uint8_t> state(ttk::render_state_size());ttk::render_state_save(state.data());
+                        ttk::input.first_person=false;for(int i=0;i<40;++i)frame();
+                        assert(metric("\"blend\":")==0);
+                        ttk::render_state_load(state.data());assert(metric("\"blend\":")==int(eye));
+                        ttk::input.first_person=true;
+                    }
+                }
+                // D35D1: the first-person grip replaces the turn-and-shove arms.
+                // Hands sit on the held object's near face, mirrored about the
+                // body, independent of the native 119/120 pose; 121 blends by
+                // nearness to the hold; native matrices, third person and the
+                // one-launch native comparison stay untouched. Both costumes.
+                {
+                    const std::vector<uint8_t> old_desc(ram+(desc&0x1fffff),ram+(desc&0x1fffff)+0x400);
+                    const std::vector<uint8_t> old_mats(ram+(mats&0x1fffff),ram+(mats&0x1fffff)+19*32);
+                    const std::vector<uint8_t> old_object_bytes(ram+(object&0x1fffff),ram+(object&0x1fffff)+0x48);
+                    const auto yaw=psx_mod_read_half(p+0x1c);
+                    const uint32_t list=0x801eb000,box=0x801eb100;
+                    const int32_t px=psx_mod_read_word(p+4),py=psx_mod_read_word(p+8),pz=psx_mod_read_word(p+12);
+                    psx_mod_write_half(p+0x1c,1024); // forward +X, body right -Z
+                    uint8_t old_camera[32];std::memcpy(old_camera,ram+(c&0x1fffff),32);
+                    for(unsigned i=0;i<3;++i)psx_mod_write_word(object+4+4*i,uint32_t(i==0?px+600:i==1?py:pz));
+                    psx_mod_write_half(object+0x1c,0);psx_mod_write_word(object+0x44,list);
+                    psx_mod_write_word(list+8,box);
+                    auto set_box=[&](int16_t top) {
+                        const int16_t b[8]={-200,top,-400,0,200,512,400,0};
+                        for(unsigned i=0;i<8;++i)psx_mod_write_half(box+2*i,uint16_t(b[i]));
+                    };
+                    auto word=[](const uint8_t* b){int32_t v;std::memcpy(&v,b,4);return v;};
+                    auto half=[](const uint8_t* b){int16_t v;std::memcpy(&v,b,2);return v;};
+                    // Draw parts 10..15; returns each drawn matrix.
+                    auto draw=[&](uint8_t (&out)[6][32],bool (&moved)[6],int dx=0,int dy=0) {
+                        // Eye at the standing push eye, looking along +X.
+                        const int16_t rows[9]={0,0,-4096,0,4096,0,4096,0,0};
+                        for(unsigned i=0;i<9;++i)psx_mod_write_half(c+2*i,uint16_t(rows[i]));
+                        psx_mod_write_word(c+20,uint32_t(px+dx));psx_mod_write_word(c+24,uint32_t(py-295+dy));
+                        psx_mod_write_word(c+28,uint32_t(pz));
+                        call(0x800348d8,c,p,0x8003769c);
+                        for(unsigned part:{13u,14u,15u,10u,11u,12u}) {
+                            const unsigned j=psx_mod_read_byte(desc+0x24+part);
+                            CPUState cpu{};cpu.gpr[4]=c;cpu.gpr[5]=mats+32*j;cpu.gpr[20]=p;
+                            cpu.gpr[23]=j;cpu.gpr[29]=0x801f0000;cpu.gpr[31]=0x80034c6c;
+                            hooks().at(0x800292a0)(&cpu,0x800292a0);
+                            moved[part-10]=cpu.gpr[5]!=mats+32*j;
+                            std::memcpy(out[part-10],ram+(cpu.gpr[5]&0x1fffff),32);
+                        }
+                        call(0x8001ca4c,0x800d0000,0,0x800376b4);
+                    };
+                    // Rigid native arm fixture; `swing` moves the chains as 119/120 do.
+                    auto pose_arms=[&](int swing) {
+                        for(unsigned part=10;part<=15;++part) {
+                            const unsigned j=psx_mod_read_byte(desc+0x24+part),n=(part-10)%3;
+                            for(unsigned i=0;i<9;++i)psx_mod_write_half(mats+32*j+2*i,i%4==0?4096:0);
+                            const int side=part<13?1:-1;
+                            psx_mod_write_word(mats+32*j+20,uint32_t(px+swing+n*60));
+                            psx_mod_write_word(mats+32*j+24,uint32_t(py-140+n*50));
+                            psx_mod_write_word(mats+32*j+28,uint32_t(pz+side*(100+n*20)-swing));
+                        }
+                    };
+                    setenv("DNTTK_PUSH_VIEW","first",1);
+                    for(const auto* costume:{first_map,cowboy})for(int16_t top:{int16_t(-512),int16_t(-100)}) {
+                        layout(costume);set_box(top);
+                        const int32_t grip_y=py+std::max(-150,top+60);
+                        for(unsigned pose:{120u,119u}) {
+                            psx_mod_write_half(p+0x60,pose);++save_loads;for(int i=0;i<30;++i)frame();
+                            assert(metric("\"blend\":")==1);
+                            uint8_t first[6][32]={};
+                            for(int swing:{0,-180,240}) {
+                                pose_arms(swing);
+                                const std::vector<uint8_t> native(ram+(mats&0x1fffff),ram+(mats&0x1fffff)+19*32);
+                                uint8_t out[6][32];bool moved[6];draw(out,moved);
+                                for(bool m:moved)assert(m);
+                                assert(std::equal(native.begin(),native.end(),ram+(mats&0x1fffff)));
+                                // Face at +400 along X, 85 inset; sides on -Z/+Z.
+                                for(unsigned h:{2u,5u}) {
+                                    assert(std::abs(word(out[h]+20)-(px+315))<=1);
+                                    assert(std::abs(word(out[h]+24)-grip_y)<=1);
+                                    assert(std::abs(word(out[h]+28)-(pz+(h==2?150:-150)))<=1);
+                                }
+                                // Mirrored hands about the body plane (world Z here):
+                                // row 0 keeps Z and flips X/Y, rows 1/2 flip Z.
+                                for(unsigned r=0;r<3;++r)for(unsigned k=0;k<3;++k) {
+                                    const int a=half(out[2]+6*r+2*k),b=half(out[5]+6*r+2*k);
+                                    const bool flip=r==0?k!=2:k==2;
+                                    assert(std::abs(a-(flip?-b:b))<=2);
+                                }
+                                // Connected chain: each bone's fixture offset
+                                // (60,50,+-20) in its local frame reaches the next joint.
+                                for(unsigned i:{0u,1u,3u,4u}) {
+                                    const double local[3]={60,50,i<3?20.0:-20.0};
+                                    for(unsigned k=0;k<3;++k) {
+                                        double end=word(out[i]+20+4*k);
+                                        for(unsigned r=0;r<3;++r)end+=local[r]*half(out[i]+6*r+2*k)/4096;
+                                        assert(std::abs(end-word(out[i+1]+20+4*k))<3);
+                                    }
+                                }
+                                // Steady: the native swing never moves the result.
+                                if(swing==0)std::memcpy(first,out,sizeof out);
+                                else assert(!std::memcmp(first,out,sizeof out));
+                            }
+                        }
+                        // 121: native hands at the hold blend fully, far away stay native.
+                        psx_mod_write_half(p+0x60,121);++save_loads;for(int i=0;i<30;++i)frame();
+                        pose_arms(0);
+                        for(unsigned part:{12u,15u}) {
+                            const unsigned j=psx_mod_read_byte(desc+0x24+part);
+                            const int hold[3]={part==12?-152:176,part==12?-36:-18,part==12?277:201};
+                            psx_mod_write_word(mats+32*j+20,uint32_t(px+hold[2]));
+                            psx_mod_write_word(mats+32*j+24,uint32_t(py+hold[1]));
+                            psx_mod_write_word(mats+32*j+28,uint32_t(pz-hold[0])); // body right is -Z
+                        }
+                        {
+                            uint8_t out[6][32];bool moved[6];draw(out,moved);
+                            assert(moved[2] && moved[5]);
+                            assert(std::abs(word(out[2]+20)-(px+315))<=1 && std::abs(word(out[5]+28)-(pz-150))<=1);
+                        }
+                        pose_arms(-900);
+                        {
+                            uint8_t out[6][32];bool moved[6];draw(out,moved);
+                            assert(!moved[2] && !moved[5]);
+                        }
+                        // One-launch native comparison and the third-person choice.
+                        psx_mod_write_half(p+0x60,120);pose_arms(0);
+                        setenv("DNTTK_FP_PUSH_GRIP","native",1);
+                        {
+                            uint8_t out[6][32];bool moved[6];draw(out,moved);
+                            assert(!moved[2] && !moved[5] && moved[0] && moved[3]);
+                        }
+                        unsetenv("DNTTK_FP_PUSH_GRIP");
+                        setenv("DNTTK_PUSH_VIEW","legacy-third",1);++save_loads;for(int i=0;i<30;++i)frame();
+                        {
+                            uint8_t out[6][32];bool moved[6];draw(out,moved);
+                            for(bool m:moved)assert(!m);
+                        }
+                        setenv("DNTTK_PUSH_VIEW","first",1);
+                    }
+                    // D17AY: a redraw between ticks shows Duke, the object and
+                    // the eye in between (here 40 further along and 30 up a
+                    // slope); the grip moves with them, not with the last tick.
+                    {
+                        psx_mod_write_half(p+0x60,120);++save_loads;for(int i=0;i<30;++i)frame();
+                        pose_arms(0);
+                        uint8_t live[6][32],between[6][32],tick[6][32];bool moved[6];
+                        draw(live,moved);
+                        test_draw_poses={{p,{px+40.0,py-30.0,double(pz)},1024},{object,{px+640.0,py-30.0,double(pz)},0}};
+                        draw(between,moved,40,-30);
+                        test_draw_poses.clear();
+                        draw(tick,moved,40,-30);
+                        for(unsigned h:{2u,5u}) {
+                            assert(std::abs(word(between[h]+20)-(word(live[h]+20)+40))<=1);
+                            assert(std::abs(word(between[h]+24)-(word(live[h]+24)-30))<=1);
+                            assert(std::abs(word(between[h]+28)-word(live[h]+28))<=1);
+                            assert(std::abs(word(tick[h]+24)-word(live[h]+24))<=1);   // the old step
+                            assert(!std::memcmp(between[h],live[h],18));               // same rows
+                        }
+                        std::puts("PASS: D17AY push grip follows the in-between Duke and object in a redraw");
+                    }
+                    std::copy(old_desc.begin(),old_desc.end(),ram+(desc&0x1fffff));
+                    std::copy(old_mats.begin(),old_mats.end(),ram+(mats&0x1fffff));
+                    std::copy(old_object_bytes.begin(),old_object_bytes.end(),ram+(object&0x1fffff));
+                    psx_mod_write_half(p+0x1c,yaw);std::memcpy(ram+(c&0x1fffff),old_camera,32);
+                    std::puts("PASS: D35D1 first-person push grip (face/top/width placement, mirrored hands, steady through 119/120, 121 hold blend, native comparison, third person, both costumes, native matrices)");
+                }
+                unsetenv("DNTTK_PUSH_VIEW");psx_mod_write_word(p+0x290,old_object);
+                psx_mod_write_word(0x800d2660,saved_table);
+                psx_mod_write_word(table+28*165,flags);psx_mod_write_byte(p+0x3b8,equip);
+                psx_mod_write_half(p+0x60,63);++save_loads;frame();
+                assert(metric("\"blend\":")==1);
+                std::puts("PASS: D35D push/pull/grab presentation, choice, pause, load, replay and movement isolation");
+            }
+            // D35H: overhead object ownership takes precedence over Mantle,
+            // without changing attachment/body state or movement permissions.
+            {
+                const uint32_t object=0x801ea000,table=0x801e8000;
+                const auto old_table=psx_mod_read_word(0x800d2660),old_owner=psx_mod_read_word(p+0x17c);
+                const auto equip=psx_mod_read_byte(p+0x3b8);psx_mod_write_byte(p+0x3b8,0);
+                const auto flags=psx_mod_read_word(table+28*759);
+                psx_mod_write_word(0x800d2660,table);psx_mod_write_half(object+0x2c,759);
+                psx_mod_write_word(p+0x17c,object);
+                for(unsigned kind:{0x101092u,0xc0u,0u}) {
+                    psx_mod_write_word(table+28*759,kind);
+                    for(unsigned pose:{149u,150u,151u}) {
+                        psx_mod_write_half(p+0x60,pose);
+                        psx_mod_write_byte(p+0x22c,7);psx_mod_write_byte(p+0x22d,7);
+                        for(const char* choice:{"first","legacy-third"}) {
+                            const bool eye=!std::strcmp(choice,"first");
+                            setenv("DNTTK_OVERHEAD_VIEW",choice,1);
+                            setenv("DNTTK_MANTLE_VIEW",eye?"legacy-third":"first",1);
+                            ++save_loads;frame();
+                            assert(metric("\"blend\":")==int(kind==0x101092u?eye:!eye));
+                            assert(std::strstr(ttk::controls_debug_json(),kind==0x101092u?"\"action\":\"overhead\"":"\"action\":\"mantle\""));
+                            contact_rig(kind==0x101092u?eye:!eye);
+                            assert(psx_mod_read_word(p+0x17c)==object && psx_mod_read_half(p+0x60)==pose);
+                            assert(!ttk::movement_ready() && !ttk::locomotion_input_ready());
+                            ttk::input.active=false;frame();assert(metric("\"blend\":")==int(kind==0x101092u?eye:!eye));
+                            ttk::input.active=true;ttk::input.first_person=false;++save_loads;frame();assert(metric("\"blend\":")==0);
+                            ttk::input.first_person=true;
+                        }
+                    }
+                }
+                unsetenv("DNTTK_OVERHEAD_VIEW");unsetenv("DNTTK_MANTLE_VIEW");
+                psx_mod_write_word(0x800d2660,old_table);psx_mod_write_word(p+0x17c,old_owner);
+                psx_mod_write_word(table+28*759,flags);psx_mod_write_byte(p+0x3b8,equip);
+                psx_mod_write_half(p+0x60,63);psx_mod_write_byte(p+0x22c,0);psx_mod_write_byte(p+0x22d,0);
+                ++save_loads;frame();assert(metric("\"blend\":")==1);
+                std::puts("PASS: D35H overhead versus ledge/crate ownership, independent choices, pause, load, global view and unchanged attachment");
+            }
+            // D35I: wall object ownership takes precedence over Mantle,
+            // without changing attachment/body state or movement permissions.
+            {
+                const uint32_t object=0x801ea000,table=0x801e8000;
+                const auto old_table=psx_mod_read_word(0x800d2660),old_owner=psx_mod_read_word(p+0x17c);
+                const auto equip=psx_mod_read_byte(p+0x3b8);psx_mod_write_byte(p+0x3b8,0);
+                const auto flags=psx_mod_read_word(table+28*759);
+                psx_mod_write_word(0x800d2660,table);psx_mod_write_half(object+0x2c,759);
+                psx_mod_write_word(p+0x17c,object);
+                for(unsigned kind:{0x108102u,0x200u,0x400u}) {
+                    psx_mod_write_word(table+28*759,kind);
+                    for(unsigned pose:{147u,148u,155u,198u,199u,200u,201u,202u,203u,204u,205u}) {
+                        psx_mod_write_half(p+0x60,pose);
+                        psx_mod_write_byte(p+0x22c,3);psx_mod_write_byte(p+0x22d,3);
+                        for(const char* choice:{"first","legacy-third"}) {
+                            const bool eye=!std::strcmp(choice,"first");
+                            setenv("DNTTK_WALL_VIEW",choice,1);
+                            setenv("DNTTK_LADDER_VIEW","legacy-third",1);setenv("DNTTK_POLE_VIEW","legacy-third",1);
+                            ++save_loads;frame();
+                            assert(metric("\"blend\":")==int(kind==0x108102u && eye));
+                            if(kind==0x108102u)assert(std::strstr(ttk::controls_debug_json(),"\"action\":\"wall\""));
+                            contact_rig(kind==0x108102u && eye);
+                            assert(psx_mod_read_word(p+0x17c)==object && psx_mod_read_half(p+0x60)==pose);
+                            assert(!ttk::movement_ready() && !ttk::locomotion_input_ready());
+                            ttk::input.active=false;frame();assert(metric("\"blend\":")==int(kind==0x108102u && eye));
+                            ttk::input.active=true;ttk::input.first_person=false;++save_loads;frame();assert(metric("\"blend\":")==0);
+                            ttk::input.first_person=true;
+                        }
+                    }
+                }
+                // Continuous axes use native probes, normalized diagonal speed,
+                // query-only shifted hand poses, rollback and no residual motion.
+                psx_mod_write_word(table+28*759,0x108102);
+                const auto model=psx_mod_read_word(p+0x40),mats=psx_mod_read_word(p+0x3c);
+                const auto up=psx_mod_read_half(p+0x74),yaw=psx_mod_read_half(p+0x1c);
+                const auto block=psx_mod_read_word(p+0x224),ticks=psx_mod_read_word(0x800d21fc);
+                uint32_t xyz[3];for(int k=0;k<3;++k)xyz[k]=psx_mod_read_word(p+4+4*k);
+                psx_mod_write_word(p+0x40,0x801e3000);psx_mod_write_byte(0x801e3000,2);
+                psx_mod_write_word(p+0x3c,0x801e4000);psx_mod_write_word(0x801e4018,100);
+                psx_mod_write_half(p+0x74,63);
+                psx_mod_write_half(p+0x1c,0);psx_mod_write_word(p+0x224,0);psx_mod_write_word(0x800d21fc,10);
+                ttk::input.move_x=ttk::input.move_y=1;
+                psx_mod_write_half(p+0x60,198);wall_queries.clear();
+                call(0x80043eb8,p,0,0x8004b60c,0x801ff000);
+                assert(wall_queries.size()==2 && wall_queries[0][0]==0 && wall_queries[1][0]==3);
+                assert(wall_queries[0][2]==-7 && wall_queries[1][1]==7 && wall_queries[1][4]==93);
+                assert(psx_mod_read_word(p+4)==xyz[0]+7 && psx_mod_read_word(p+8)==xyz[1]-7);
+                assert(psx_mod_read_word(0x801e4018)==100 && psx_mod_read_half(p+0xfc)==0 && psx_mod_read_half(p+0xfe)==0);
+                ttk::input.move_x=ttk::input.move_y=0;wall_queries.clear();
+                call(0x80043eb8,p,0,0x8004b60c,0x801ff000);
+                assert(wall_queries.empty() && psx_mod_read_word(p+4)==xyz[0]+7);
+                ttk::input.move_x=1;wall_results[3]=3;
+                const auto touch=psx_mod_read_word(p+0x174),floor=psx_mod_read_word(p+0x1c8);
+                call(0x80043eb8,p,0,0x8004b60c,0x801ff000);
+                assert(psx_mod_read_word(p+4)==xyz[0]+7 && psx_mod_read_word(p+0x174)==touch && psx_mod_read_word(p+0x1c8)==floor);
+                wall_results[3]=0;wall_queries.clear();ttk::modern=false;
+                call(0x80043eb8,p,0,0x8004b60c,0x801ff000);assert(wall_queries.empty());ttk::modern=true;
+                ttk::input.active=false;call(0x80043eb8,p,0,0x8004b60c,0x801ff000);assert(wall_queries.empty());ttk::input.active=true;
+                for(unsigned family:{0x200u,0x400u}) {
+                    psx_mod_write_word(table+28*759,family);call(0x80043eb8,p,0,0x8004b60c,0x801ff000);assert(wall_queries.empty());
+                }
+                ttk::input.move_x=0;psx_mod_write_word(p+0x40,model);psx_mod_write_word(p+0x3c,mats);
+                psx_mod_write_half(p+0x74,up);psx_mod_write_half(p+0x1c,yaw);psx_mod_write_word(p+0x224,block);psx_mod_write_word(0x800d21fc,ticks);
+                for(int k=0;k<3;++k)psx_mod_write_word(p+4+4*k,xyz[k]);
+                unsetenv("DNTTK_WALL_VIEW");unsetenv("DNTTK_LADDER_VIEW");unsetenv("DNTTK_POLE_VIEW");
+                psx_mod_write_word(0x800d2660,old_table);psx_mod_write_word(p+0x17c,old_owner);
+                psx_mod_write_word(table+28*759,flags);psx_mod_write_byte(p+0x3b8,equip);
+                psx_mod_write_half(p+0x60,63);psx_mod_write_byte(p+0x22c,0);psx_mod_write_byte(p+0x22d,0);
+                ++save_loads;frame();assert(metric("\"blend\":")==1);
+                std::puts("PASS: D35I wall versus ledge/crate ownership, independent choices, pause, load, global view and unchanged attachment");
+            }
+            // D35G: every native ledge lifecycle pose, independent choices,
+            // save acquisition and paused presentation. No movement permission.
+            {
+                const auto equip=psx_mod_read_byte(p+0x3b8);
+                psx_mod_write_byte(p+0x3b8,0);
+                for(unsigned mode:{0u,6u,7u,8u,9u}) {
+                    const unsigned lo=(mode==0 || mode==8)?134:mode==9?108:mode==6?147:149;
+                    const unsigned hi=(mode==0 || mode==8)?142:mode==9?108:153;
+                    for(unsigned pose=lo;pose<=hi;++pose) {
+                        psx_mod_write_half(p+0x60,pose);
+                        psx_mod_write_byte(p+0x22c,mode);psx_mod_write_byte(p+0x22d,mode==9?6:mode);
+                        for(const char* choice:{"first","legacy-third"}) {
+                            setenv("DNTTK_MANTLE_VIEW",choice,1);++save_loads;frame();
+                            const bool eye=!std::strcmp(choice,"first");
+                            assert(metric("\"blend\":")==int(eye));
+                            if(eye || (mode!=0 && mode!=9))assert(std::strstr(ttk::controls_debug_json(),"\"action\":\"mantle\""));
+                        contact_rig(eye);
+                            assert(!ttk::movement_ready() && !ttk::locomotion_input_ready());
+                            ttk::input.active=false;frame();assert(metric("\"blend\":")==int(eye));ttk::input.active=true;
+                            ttk::input.first_person=false;++save_loads;frame();assert(metric("\"blend\":")==0);
+                            ttk::input.first_person=true;
+                        }
+                    }
+                }
+                unsetenv("DNTTK_MANTLE_VIEW");psx_mod_write_byte(p+0x3b8,equip);
+                psx_mod_write_half(p+0x60,63);psx_mod_write_byte(p+0x22c,0);psx_mod_write_byte(p+0x22d,0);
+                ++save_loads;frame();assert(metric("\"blend\":")==1);
+                std::puts("PASS: D35G mantle/hang/shimmy/drop lifecycle, choices, pause, load and ground return");
+            }
+            // D35G1: an armed edge step-up (134) still uses the pistol
+            // viewmodel. Hidden native arms must not be revived by the mantle
+            // near-cull bridge. Unarmed E-mantle arms keep their real matrices.
+            {
+                const auto equip=psx_mod_read_byte(p+0x3b8);
+                psx_mod_write_half(p+0x60,134);
+                psx_mod_write_byte(p+0x22c,8);psx_mod_write_byte(p+0x22d,8);
+                for(unsigned held:{0u,2u}) {
+                    psx_mod_write_byte(p+0x3b8,held);++save_loads;frame();
+                    assert(metric("\"blend\":")==1);
+                    for(unsigned part=0x0a;part<=0x0e;++part) {
+                        call(0x800348d8,c,p,0x8003769c);
+                        CPUState joint{};joint.gpr[4]=c;joint.gpr[20]=p;joint.gpr[29]=0x801f0000;
+                        joint.gpr[23]=psx_mod_read_byte(desc+0x24+part);
+                        const uint32_t native=mats+0x20*joint.gpr[23];
+                        joint.gpr[5]=native;joint.gpr[31]=0x80034c6c;
+                        hooks().at(0x800292a0)(&joint,0x800292a0);
+                        assert((joint.gpr[5]!=native)==bool(held));
+                        joint.gpr[31]=0x80034c8c;joint.gpr[16]=0;joint.gte_ctrl[26]=256;
+                        psx_mod_write_word(joint.gpr[29]+0x98,c);
+                        hooks().at(0x800b4d2c)(&joint,0x800b4d2c);
+                        assert(joint.gpr[16]==(held?0u:256u));
+                        assert(ttk::first_person_interaction_drawing()==!held);
+                        call(0x8001ca4c,0x800d0000,0,0x800376b4);
+                    }
+                }
+                psx_mod_write_byte(p+0x3b8,equip);psx_mod_write_half(p+0x60,63);
+                psx_mod_write_byte(p+0x22c,0);psx_mod_write_byte(p+0x22d,0);++save_loads;frame();
+                std::puts("PASS: D35G1 hidden armed step-up limbs stay culled; native mantle hands remain visible");
+            }
+            // D08J7D: in the armed sidearm hang (and the one-handed pull-up) the
+            // off hand on the lip takes the contact rig instead of hiding for the
+            // viewmodel; its drawn height is pinned to the lip. Off the lip, at
+            // the eye or with another weapon it stays hidden. Native matrices
+            // are never written.
+            {
+                const auto equip=psx_mod_read_byte(p+0x3b8),weapon=psx_mod_read_byte(p+0x3b9);
+                const auto upper=psx_mod_read_half(p+0x74);const auto lip_old=psx_mod_read_word(p+0x1c8);
+                uint8_t old_camera[32];std::memcpy(old_camera,ram+(c&0x1fffff),32);
+                const std::vector<uint8_t> old_mats(ram+(mats&0x1fffff),ram+(mats&0x1fffff)+19*32);
+                psx_mod_write_half(p+0x60,149);psx_mod_write_byte(p+0x22c,6);psx_mod_write_byte(p+0x22d,6);
+                psx_mod_write_byte(p+0x3b8,2);psx_mod_write_half(p+0x74,5);
+                const int32_t lip=-1000;psx_mod_write_word(p+0x1c8,uint32_t(lip));
+                for(unsigned i=0;i<9;++i)psx_mod_write_half(c+2*i,i%4==0?4096:0);
+                for(unsigned i=0;i<3;++i)psx_mod_write_word(c+20+4*i,0);
+                auto place=[&](int32_t hand_y,int32_t hand_z) {
+                    for(unsigned part=10;part<=12;++part) {
+                        const unsigned j=psx_mod_read_byte(desc+0x24+part);
+                        for(unsigned i=0;i<9;++i)psx_mod_write_half(mats+32*j+2*i,i%4==0?4096:0);
+                        psx_mod_write_word(mats+32*j+20,uint32_t(-100));
+                        psx_mod_write_word(mats+32*j+24,uint32_t(part==12?hand_y:hand_y+100*int32_t(12-part)));
+                        psx_mod_write_word(mats+32*j+28,uint32_t(hand_z));
+                    }
+                };
+                struct Case {unsigned weapon;int32_t dy,z;bool shown;};
+                for(const Case k:{Case{4,0,300,true},Case{4,-150,300,true},Case{4,-400,300,false},
+                                  Case{4,0,60,false},Case{5,0,300,false}}) {
+                    psx_mod_write_byte(p+0x3b9,k.weapon);place(lip+k.dy,k.z);
+                    ++save_loads;frame();assert(metric("\"blend\":")==1);
+                    assert(std::strstr(ttk::controls_debug_json(),"\"action\":\"mantle\""));
+                    const std::vector<uint8_t> native(ram+(mats&0x1fffff),ram+(mats&0x1fffff)+19*32);
+                    // The off hand reaches redraws with the frame (replay worker draw).
+                    std::vector<uint8_t> frame_state(ttk::render_state_size());
+                    ttk::render_state_save(frame_state.data());ttk::render_state_load(frame_state.data());
+                    call(0x800348d8,c,p,0x8003769c);
+                    for(unsigned part=10;part<=12;++part) {
+                        CPUState joint{};joint.gpr[4]=c;joint.gpr[20]=p;joint.gpr[29]=0x801f0000;
+                        joint.gpr[23]=psx_mod_read_byte(desc+0x24+part);
+                        const uint32_t m=mats+0x20*joint.gpr[23];
+                        joint.gpr[5]=m;joint.gpr[31]=0x80034c6c;
+                        hooks().at(0x800292a0)(&joint,0x800292a0);
+                        const auto owner=ttk::first_person_limb_presentation().owner;
+                        assert((owner==ttk::LimbOwner::Interaction)==k.shown);
+                        // Off the lip the sidearm's free arm hides; a two-handed
+                        // weapon keeps its support grip on the viewmodel.
+                        if(!k.shown)assert(owner==(k.weapon==4?ttk::LimbOwner::HiddenArm:ttk::LimbOwner::DisplayArm));
+                        // The drawn hand keeps the lip's height (pinned within 40).
+                        if(k.shown && part==12)
+                            assert(joint.gpr[5]!=m && int32_t(psx_mod_read_word(joint.gpr[5]+24))==lip+std::max(k.dy,-40));
+                    }
+                    call(0x8001ca4c,0x800d0000,0,0x800376b4);
+                    assert(std::equal(native.begin(),native.end(),ram+(mats&0x1fffff)));
+                }
+                std::copy(old_mats.begin(),old_mats.end(),ram+(mats&0x1fffff));std::memcpy(ram+(c&0x1fffff),old_camera,32);
+                psx_mod_write_byte(p+0x3b8,equip);psx_mod_write_byte(p+0x3b9,weapon);psx_mod_write_half(p+0x74,upper);
+                psx_mod_write_word(p+0x1c8,lip_old);psx_mod_write_half(p+0x60,63);
+                psx_mod_write_byte(p+0x22c,0);psx_mod_write_byte(p+0x22d,0);++save_loads;frame();
+                std::puts("PASS: D08J7D armed sidearm hang off hand on the contact rig, lip pin, off-lip/eye/other-weapon hides");
+            }
+            // D35E: shared clips need a plain ladder, exits may already
+            // own the landing. Presentation never grants locomotion/aim.
+            {
+                const uint32_t object=0x801ea000,table=0x801e8000;
+                const auto old_table=psx_mod_read_word(0x800d2660),old_owner=psx_mod_read_word(p+0x17c);
+                const auto equip=psx_mod_read_byte(p+0x3b8);psx_mod_write_byte(p+0x3b8,0);
+                const auto flags=psx_mod_read_word(table+28*46);
+                psx_mod_write_word(0x800d2660,table);psx_mod_write_half(object+0x2c,46);
+                psx_mod_write_word(p+0x17c,object);psx_mod_write_word(table+28*46,0x200);
+                for(unsigned pose:{147u,148u,156u,185u,186u,187u,188u,189u,190u,207u,210u,211u}) {
+                    psx_mod_write_half(p+0x60,pose);
+                    psx_mod_write_byte(p+0x22c,3);psx_mod_write_byte(p+0x22d,3);
+                    for(const char* choice:{"first","legacy-third"}) {
+                        setenv("DNTTK_LADDER_VIEW",choice,1);++save_loads;frame();
+                        const bool eye=!std::strcmp(choice,"first");
+                        assert(metric("\"blend\":")==int(eye));
+                        assert(std::strstr(ttk::controls_debug_json(),"\"action\":\"ladder\""));
+                        contact_rig(eye);
+                        assert(!ttk::movement_ready() && !ttk::locomotion_input_ready());
+                        if(eye && pose==207) {
+                            const std::vector<uint8_t> saved(ram+(mats&0x1fffff),ram+(mats&0x1fffff)+19*32);
+                            uint8_t old_camera[32];std::memcpy(old_camera,ram+(c&0x1fffff),32);
+                            setenv("DNTTK_FP_LEGS","on",1);
+                            for(const auto* costume:{first_map,cowboy})for(bool down:{false,true}) {
+                                layout(costume);
+                                const int16_t basis[9]={4096,0,0,0,int16_t(down?2048:4096),int16_t(down?-3547:0),0,int16_t(down?3547:0),int16_t(down?2048:4096)};
+                                for(int k=0;k<9;++k)psx_mod_write_half(c+2*k,uint16_t(basis[k]));
+                                for(int k=0;k<3;++k)psx_mod_write_word(c+20+4*k,0);
+                                for(unsigned part:{1u,5u}) {
+                                    const auto matrix=mats+32*psx_mod_read_byte(desc+0x24+part);
+                                    psx_mod_write_word(matrix+20,part==1?36:-30);
+                                    psx_mod_write_word(matrix+24,420);psx_mod_write_word(matrix+28,93);
+                                }
+                                const std::vector<uint8_t> original(ram+(mats&0x1fffff),ram+(mats&0x1fffff)+19*32);
+                                int shared=0;
+                                for(unsigned h:{160u,256u})for(unsigned part:{1u,2u,3u,4u,5u,6u,7u,8u,21u}) {
+                                    call(0x800348d8,c,p,0x8003769c);
+                                    CPUState draw{};draw.gpr[4]=c;draw.gpr[20]=p;draw.gpr[23]=psx_mod_read_byte(desc+0x24+part);
+                                    const auto native=mats+32*draw.gpr[23];draw.gpr[5]=native;
+                                    draw.gpr[29]=0x801f0000;draw.gpr[31]=0x80034c6c;draw.gte_ctrl[26]=h;
+                                    hooks().at(0x800292a0)(&draw,0x800292a0);
+                                    assert(ttk::first_person_limb_presentation().owner==ttk::LimbOwner::Legs);
+                                    for(int k=0;k<28;++k)assert(psx_mod_read_byte(draw.gpr[5]+k)==psx_mod_read_byte(native+k));
+                                    const int shift=int32_t(psx_mod_read_word(native+28)-psx_mod_read_word(draw.gpr[5]+28));
+                                    if(!shared)shared=shift;else assert(shift==shared);
+                                    assert(down?(shift>48 && shift<=192):shift==48);
+                                    if(down && (part==1 || part==5)) {
+                                        const double y=int32_t(psx_mod_read_word(draw.gpr[5]+24)),z=int32_t(psx_mod_read_word(draw.gpr[5]+28));
+                                        const double cy=(2048*y-3547*z)/4096,cz=(3547*y+2048*z)/4096;
+                                        assert(cy-.5*cz>=47);
+                                    }
+                                    assert(draw.gte_ctrl[26]==h);
+                                    call(0x8001ca4c,0x800d0000,0,0x800376b4);
+                                }
+                                assert(std::equal(original.begin(),original.end(),ram+(mats&0x1fffff)));
+                                std::copy(saved.begin(),saved.end(),ram+(mats&0x1fffff));
+                            }
+                            layout(first_map);std::memcpy(ram+(c&0x1fffff),old_camera,32);
+                            setenv("DNTTK_FP_LEGS","off",1);
+                            std::puts("PASS: D36J5 ladder-end hip clearance, rigid whole-leg/attachment translation, fixed-FOV invariance and native skeleton preservation");
+                        }
+
+                        if(eye) {
+                            call(0x800348d8,c,p,0x8003769c);
+                            CPUState joint{};joint.gpr[4]=c;joint.gpr[19]=c;joint.gpr[20]=p;joint.gpr[29]=0x801f0000;
+                            joint.gpr[23]=psx_mod_read_byte(desc+0x24+0x0f);
+                            joint.gpr[5]=mats+0x20*joint.gpr[23];joint.gpr[31]=0x80034c6c;
+                            hooks().at(0x800292a0)(&joint,0x800292a0);
+                            assert(ttk::first_person_interaction_drawing());
+                            assert(ttk::first_person_limb_presentation().bridge_joint_depth);
+                            assert(joint.gpr[5]==mats+0x20*joint.gpr[23]);
+                            joint.gpr[31]=0x80034c8c;joint.gpr[16]=40;joint.gte_ctrl[26]=256;
+                            psx_mod_write_word(joint.gpr[29]+0x98,c);
+                            hooks().at(0x800b4d2c)(&joint,0x800b4d2c);
+                            assert(joint.gpr[16]==256 && joint.gte_ctrl[26]==256);
+                            joint.gpr[16]=40;joint.gpr[20]=p+4;
+                            hooks().at(0x800b4d2c)(&joint,0x800b4d2c);assert(joint.gpr[16]==40);
+                            call(0x8001ca4c,0x800d0000,0,0x800376b4);
+                        }
+                        ttk::input.active=false;frame();assert(metric("\"blend\":")==int(eye));ttk::input.active=true;
+                        std::vector<uint8_t> snap(ttk::render_state_size());ttk::render_state_save(snap.data());
+                        ttk::input.first_person=false;for(int i=0;i<40;++i)frame();assert(metric("\"blend\":")==0);
+                        ttk::render_state_load(snap.data());assert(metric("\"blend\":")==int(eye));ttk::input.first_person=true;
+                    }
+                    setenv("DNTTK_LADDER_VIEW","first",1);
+                    for(unsigned other:{0u,0x100u,0x400u,0x600u}) {
+                        psx_mod_write_word(table+28*46,other);++save_loads;frame();assert(metric("\"blend\":")==int((other==0x400u || other==0x100u) && (pose==147 || pose==148)));
+                    }
+                    psx_mod_write_word(table+28*46,0x200);
+                }
+                // D08J6C: armed on the rung with the sidearm, the off hand
+                // (parts 10-12) keeps the contact rig at its native world
+                // matrix (no lip pin); the gun arm stays on the viewmodel. Other
+                // weapons keep both arms off the rig; native matrices
+                // are never written; the off hand reaches replay redraws.
+                {
+                    const unsigned weapon=psx_mod_read_byte(p+0x3b9),upper=psx_mod_read_half(p+0x74);
+                    psx_mod_write_half(p+0x60,187);psx_mod_write_byte(p+0x22c,3);psx_mod_write_byte(p+0x22d,3);
+                    psx_mod_write_byte(p+0x3b8,2);psx_mod_write_half(p+0x74,5);
+                    for(unsigned held:{4u,5u}) {
+                        psx_mod_write_byte(p+0x3b9,held);++save_loads;frame();
+                        assert(metric("\"blend\":")==1);
+                        assert(std::strstr(ttk::controls_debug_json(),"\"action\":\"ladder\""));
+                        const std::vector<uint8_t> native(ram+(mats&0x1fffff),ram+(mats&0x1fffff)+19*32);
+                        std::vector<uint8_t> frame_state(ttk::render_state_size());
+                        ttk::render_state_save(frame_state.data());ttk::render_state_load(frame_state.data());
+                        call(0x800348d8,c,p,0x8003769c);
+                        for(unsigned part=10;part<=15;++part) {
+                            CPUState joint{};joint.gpr[4]=c;joint.gpr[20]=p;joint.gpr[29]=0x801f0000;
+                            joint.gpr[23]=psx_mod_read_byte(desc+0x24+part);
+                            const uint32_t m=mats+0x20*joint.gpr[23];
+                            joint.gpr[5]=m;joint.gpr[31]=0x80034c6c;
+                            hooks().at(0x800292a0)(&joint,0x800292a0);
+                            const auto owner=ttk::first_person_limb_presentation().owner;
+                            const bool offhand=part<=12 && held==4;
+                            assert((owner==ttk::LimbOwner::Interaction)==offhand);
+                            if(part==12 && offhand)assert(joint.gpr[5]==m);
+                            if(part<=12 && held==5)assert(owner==ttk::LimbOwner::DisplayArm || owner==ttk::LimbOwner::HiddenArm);
+                        }
+                        call(0x8001ca4c,0x800d0000,0,0x800376b4);
+                        assert(std::equal(native.begin(),native.end(),ram+(mats&0x1fffff)));
+                    }
+                    psx_mod_write_byte(p+0x3b8,0);psx_mod_write_byte(p+0x3b9,weapon);psx_mod_write_half(p+0x74,upper);
+                    std::puts("PASS: D08J6C armed ladder off hand on the contact rig (native hand), gun arm viewmodel, other weapons off the rig");
+                }
+                psx_mod_write_half(p+0x60,185);psx_mod_write_byte(p+0x22c,8);psx_mod_write_byte(p+0x22d,0);
+                ++save_loads;frame();assert(metric("\"blend\":")==1 && !ttk::movement_ready());
+                psx_mod_write_byte(p+0x22d,3);
+                for(unsigned pose:{185u,190u}) {
+                    psx_mod_write_half(p+0x60,pose);psx_mod_write_byte(p+0x22c,8);
+                    psx_mod_write_word(p+0x17c,0);++save_loads;frame();assert(metric("\"blend\":")==1);
+                }
+                psx_mod_write_half(p+0x60,186);psx_mod_write_byte(p+0x22c,3);psx_mod_write_byte(p+0x22d,3);
+                psx_mod_write_word(p+0x17c,object);++save_loads;frame();
+                psx_mod_write_half(p+0x60,108);psx_mod_write_byte(p+0x22c,9);psx_mod_write_word(p+0x17c,0);
+                frame();assert(metric("\"blend\":")==1 && !ttk::movement_ready());
+                psx_mod_write_byte(p+0x3b8,equip);
+                unsetenv("DNTTK_LADDER_VIEW");psx_mod_write_word(0x800d2660,old_table);
+                psx_mod_write_word(p+0x17c,old_owner);psx_mod_write_word(table+28*46,flags);
+                psx_mod_write_half(p+0x60,63);psx_mod_write_byte(p+0x22c,0);psx_mod_write_byte(p+0x22d,0);
+                ++save_loads;frame();
+                std::puts("PASS: D35E ladder lifecycle policy, shared transfer exclusion, exits, choice, global view, pause, load and replay");
+            }
+            // D35F: shared clips need a plain pole, exits may already
+            // own the landing. Presentation never grants locomotion/aim.
+            {
+                const uint32_t object=0x801ea000,table=0x801e8000;
+                const auto old_table=psx_mod_read_word(0x800d2660),old_owner=psx_mod_read_word(p+0x17c);
+                const auto equip=psx_mod_read_byte(p+0x3b8);psx_mod_write_byte(p+0x3b8,0);
+                const auto flags=psx_mod_read_word(table+28*46);
+                psx_mod_write_word(0x800d2660,table);psx_mod_write_half(object+0x2c,46);
+                psx_mod_write_word(p+0x17c,object);psx_mod_write_word(table+28*46,0x400);
+                for(unsigned pose:{147u,148u,154u,191u,192u,193u,194u,195u,196u}) {
+                    psx_mod_write_half(p+0x60,pose);
+                    psx_mod_write_byte(p+0x22c,3);psx_mod_write_byte(p+0x22d,3);
+                    for(const char* choice:{"first","legacy-third"}) {
+                        setenv("DNTTK_POLE_VIEW",choice,1);++save_loads;frame();
+                        const bool eye=!std::strcmp(choice,"first");
+                        assert(metric("\"blend\":")==int(eye));
+                        assert(std::strstr(ttk::controls_debug_json(),"\"action\":\"pole\""));
+                            contact_rig(eye);
+                        assert(!ttk::movement_ready() && !ttk::locomotion_input_ready());
+                        if(pose==193) {
+                            const auto count=psx_mod_read_word(0x800d68a8),room=psx_mod_read_word(0x800d68b8);
+                            const auto kind=psx_mod_read_byte(object+0x14),owner_room=psx_mod_read_byte(object+0x2e);
+                            psx_mod_write_byte(object+0x14,1);psx_mod_write_byte(object+0x2e,43);
+                            psx_mod_write_word(0x800d68a8,1);psx_mod_write_word(0x800d68b8,44);
+                            CPUState draw{};draw.gpr[4]=c;draw.gpr[29]=0x801ff000;draw.gpr[31]=0x8002e6dc;draw.gte_ctrl[26]=256;
+                            const auto original=draw;const auto stack=psx_mod_read_word(0x801feefc);
+                            const auto scratch=psx_mod_read_word(0x1f800000),before=pole_draw_calls;
+                            auto invoke=[&]{hooks().at(0x8002ffec)(&draw,0x8002ffec);};
+                            invoke();assert(pole_draw_calls==before+1);
+                            assert(!std::memcmp(&draw,&original,sizeof draw));
+                            assert(psx_mod_read_word(0x801feefc)==stack && psx_mod_read_word(0x1f800000)==scratch);
+                            assert(psx_mod_read_word(p+0x17c)==object && psx_mod_read_byte(object+0x2e)==43);
+                            assert(psx_mod_read_word(0x800d68a8)==1 && psx_mod_read_word(0x800d68b8)==44);
+                            psx_mod_write_word(0x800d68b8,43);invoke();assert(pole_draw_calls==before+1);
+                            psx_mod_write_word(0x800d68b8,44);
+                            draw.gpr[31]++;invoke();assert(pole_draw_calls==before+1);draw.gpr[31]--;
+                            psx_mod_write_byte(object+0x14,3);invoke();assert(pole_draw_calls==before+1);psx_mod_write_byte(object+0x14,1);
+                            psx_mod_write_word(p+0x17c,0);invoke();assert(pole_draw_calls==before+1);psx_mod_write_word(p+0x17c,object);
+                            const auto op=psx_mod_read_word(0x80031d10);psx_mod_write_word(0x80031d10,op^1);
+                            invoke();assert(pole_draw_calls==before+1);psx_mod_write_word(0x80031d10,op);
+                            ttk::modern=false;invoke();assert(pole_draw_calls==before+1);ttk::modern=true;
+                            psx_mod_write_byte(p+0x22c,8);psx_mod_write_half(p+0x60,196);psx_mod_write_word(p+0x17c,0);
+                            frame();invoke();assert(pole_draw_calls==before+2);
+                            std::vector<uint8_t> exit_snapshot(ttk::render_state_size());ttk::render_state_save(exit_snapshot.data());
+                            psx_mod_write_byte(p+0x22c,0);psx_mod_write_half(p+0x60,63);frame();
+                            psx_mod_write_byte(p+0x22c,8);psx_mod_write_half(p+0x60,196);invoke();assert(pole_draw_calls==before+2);
+                            ttk::render_state_load(exit_snapshot.data());invoke();assert(pole_draw_calls==before+3);
+                            ++save_loads;frame();invoke();assert(pole_draw_calls==before+3);
+                            psx_mod_write_byte(p+0x22c,3);psx_mod_write_half(p+0x60,193);psx_mod_write_word(p+0x17c,object);frame();
+                            psx_mod_write_word(0x800d68a8,count);psx_mod_write_word(0x800d68b8,room);
+                            psx_mod_write_byte(object+0x14,kind);psx_mod_write_byte(object+0x2e,owner_room);
+                        }
+                        if(eye) {
+                            call(0x800348d8,c,p,0x8003769c);
+                            CPUState joint{};joint.gpr[4]=c;joint.gpr[19]=c;joint.gpr[20]=p;joint.gpr[29]=0x801f0000;
+                            joint.gpr[23]=psx_mod_read_byte(desc+0x24+0x0f);
+                            joint.gpr[5]=mats+0x20*joint.gpr[23];joint.gpr[31]=0x80034c6c;
+                            hooks().at(0x800292a0)(&joint,0x800292a0);
+                            assert(ttk::first_person_interaction_drawing());
+                            assert(joint.gpr[5]==mats+0x20*joint.gpr[23]);
+                            joint.gpr[31]=0x80034c8c;joint.gpr[16]=40;joint.gte_ctrl[26]=256;
+                            psx_mod_write_word(joint.gpr[29]+0x98,c);
+                            hooks().at(0x800b4d2c)(&joint,0x800b4d2c);
+                            assert(joint.gpr[16]==256 && joint.gte_ctrl[26]==256);
+                            joint.gpr[16]=40;joint.gpr[20]=p+4;
+                            hooks().at(0x800b4d2c)(&joint,0x800b4d2c);assert(joint.gpr[16]==40);
+                            call(0x8001ca4c,0x800d0000,0,0x800376b4);
+                        }
+                        ttk::input.active=false;frame();assert(metric("\"blend\":")==int(eye));ttk::input.active=true;
+                        std::vector<uint8_t> snap(ttk::render_state_size());ttk::render_state_save(snap.data());
+                        ttk::input.first_person=false;for(int i=0;i<40;++i)frame();assert(metric("\"blend\":")==0);
+                        ttk::render_state_load(snap.data());assert(metric("\"blend\":")==int(eye));ttk::input.first_person=true;
+                    }
+                    setenv("DNTTK_POLE_VIEW","first",1);
+                    for(unsigned other:{0u,0x100u,0x200u,0x600u}) {
+                        psx_mod_write_word(table+28*46,other);++save_loads;frame();assert(metric("\"blend\":")==int((other==0x200u || other==0x100u) && (pose==147 || pose==148)));
+                    }
+                    psx_mod_write_word(table+28*46,0x400);
+                }
+                // Circle-side mapping remains latched while A/D is held,
+                // even as the body and eye pass to the other side of the axis.
+                psx_mod_write_half(p+0x60,192);psx_mod_write_byte(p+0x22c,3);
+                const auto heading=psx_mod_read_half(p+0x1c);
+                const int face=int(std::lround(metric("\"yaw\":")*4096/(2*M_PI)))&4095;
+                psx_mod_write_half(p+0x1c,face);frame();
+                assert(!ttk::pole_view_from_front(false));
+                psx_mod_write_half(p+0x1c,(face+2048)&4095);frame();
+                assert(!ttk::pole_view_from_front(true));
+                assert(ttk::pole_view_from_front(false));
+                psx_mod_write_half(p+0x1c,face);frame();
+                assert(ttk::pole_view_from_front(true));
+                assert(!ttk::pole_view_from_front(false));
+                psx_mod_write_half(p+0x1c,heading);
+                // A wide rotated column keeps the presentation eye outside
+                // its bounds without changing attachment or native root.
+                const uint32_t list=0x801eb000,box=0x801eb020;
+                const auto old_list=psx_mod_read_word(object+0x44);
+                psx_mod_write_word(object+0x44,list);psx_mod_write_word(list+8,box);
+                psx_mod_write_half(object+0x1c,512);
+                psx_mod_write_word(object+4,root[0]);psx_mod_write_word(object+8,root[1]);psx_mod_write_word(object+12,root[2]+225);
+                auto eye_axis=[&](int axis) {
+                    call(0x8003aa48,c,sp+0x18,0x8003aeb0,sp);
+                    const double v=(int32_t)psx_mod_read_word(sp+0x18+4*axis)+(int32_t)psx_mod_read_word(c+0x64+4*axis)-
+                        (int16_t)psx_mod_read_half(c+12+2*axis)/4096.0*193;
+                    call(0x8002a038,0,1,0x8003af40,sp);return v;
+                };
+                for(int width:{69,256}) {
+                    const int16_t bounds[8]={int16_t(-width),-2048,int16_t(-width),0,int16_t(width),2048,int16_t(width),0};
+                    for(int i=0;i<8;++i)psx_mod_write_half(box+2*i,uint16_t(bounds[i]));
+                    ++save_loads;frame();for(int i=0;i<30;++i)frame();
+                    const double ex=eye_axis(0),ez=eye_axis(2);
+                    assert(std::hypot(ex-root[0],ez-root[2]-225)>=std::max(225.0,std::hypot(width,width)+32)-3);
+                    for(int i=0;i<3;++i)assert(int32_t(psx_mod_read_word(p+4+4*i))==root[i]);
+                    assert(psx_mod_read_word(p+0x17c)==object);
+                }
+                psx_mod_write_word(object+0x44,old_list);
+                psx_mod_write_byte(p+0x22d,3);
+                for(unsigned pose:{191u,196u}) {
+                    psx_mod_write_half(p+0x60,pose);psx_mod_write_byte(p+0x22c,8);
+                    psx_mod_write_word(p+0x17c,0);++save_loads;frame();assert(metric("\"blend\":")==1);
+                }
+                psx_mod_write_half(p+0x60,192);psx_mod_write_byte(p+0x22c,3);psx_mod_write_byte(p+0x22d,3);
+                psx_mod_write_word(p+0x17c,object);++save_loads;frame();
+                psx_mod_write_half(p+0x60,108);psx_mod_write_byte(p+0x22c,9);psx_mod_write_word(p+0x17c,0);
+                frame();assert(metric("\"blend\":")==1 && !ttk::movement_ready());
+                psx_mod_write_byte(p+0x3b8,equip);
+                unsetenv("DNTTK_POLE_VIEW");psx_mod_write_word(0x800d2660,old_table);
+                psx_mod_write_word(p+0x17c,old_owner);psx_mod_write_word(table+28*46,flags);
+                psx_mod_write_half(p+0x60,63);psx_mod_write_byte(p+0x22c,0);psx_mod_write_byte(p+0x22d,0);
+                ++save_loads;frame();
+                std::puts("PASS: D35F pole lifecycle policy, shared transfer exclusion, exits, choice, global view, pause, load and replay");
+            }
+            // D11E: swimming is a presentation state, independent of active
+            // input and of the pitched/turning neck. Keep original water and
+            // velocity fields untouched, including a load directly underwater.
+            {
+                const auto water=psx_mod_read_word(p+0x834),flag=psx_mod_read_word(p+0x20c),floor=psx_mod_read_word(p+0x1c8);
+                auto solved_eye=[&](int axis) {
+                    call(0x8003aa48,c,sp+0x18,0x8003aeb0,sp);
+                    const double v=(int32_t)psx_mod_read_word(sp+0x18+4*axis)+(int32_t)psx_mod_read_word(c+0x64+4*axis)-
+                        (int16_t)psx_mod_read_half(c+12+2*axis)/4096.0*193;
+                    call(0x8002a038,0,1,0x8003af40,sp);return v;
+                };
+                ttk::input.active=false;
+                psx_mod_write_word(p+0x834,root[1]-198);psx_mod_write_word(p+0x20c,1);
+                psx_mod_write_word(p+0x1c8,root[1]+2000);
+                for(const uint8_t* parts:{first_map,cowboy}) {
+                    layout(parts);const unsigned head=psx_mod_read_byte(desc+0x34);
+                    for(unsigned mode:{0u,1u,4u,5u}) {
+                        psx_mod_write_byte(p+0x22c,mode);psx_mod_write_byte(p+0x22d,mode);
+                        psx_mod_write_half(p+0x60,mode==4?122:mode==5?128:176);
+                        ++save_loads;frame();
+                        assert(metric("\"blend\":")==1 && !ttk::movement_ready());
+                        const uint32_t water_flag=psx_mod_read_word(p+0x20c),velocity=psx_mod_read_word(p+0x1f8);
+                        for(int pose:{-400,0,450}) {
+                            for(int i=0;i<3;++i)psx_mod_write_word(mats+0x20*head+0x14+4*i,root[i]+pose);
+                            for(int i=0;i<24;++i)frame();
+                            assert(std::abs(solved_eye(0)-root[0])<2 && std::abs(solved_eye(2)-root[2])<2);
+                            assert(std::abs(solved_eye(1)-(root[1]-294))<2);
+                            assert(psx_mod_read_word(p+0x20c)==water_flag && psx_mod_read_word(p+0x1f8)==velocity);
+                            for(int i=0;i<3;++i)assert((int32_t)psx_mod_read_word(p+4+4*i)==root[i]);
+                        }
+                        action_legs();
+                        // D36K: semantic pack visibility follows the primary eye
+                        // draw across both costume orders and all swim modes.
+                        const uint32_t pack=desc+0x44+0x28*psx_mod_read_byte(desc+0x38);
+                        psx_mod_write_byte(pack,0x10);
+                        call(0x800348d8,c,p,0x8003769c);
+                        assert(psx_mod_read_byte(pack)==0x11);
+                        call(0x800348d8,c,p,0x80037718); // reflection restores
+                        assert(psx_mod_read_byte(pack)==0x10);
+                        call(0x800348d8,c,p,0x8003769c);
+                        call(0x8001ca4c,0x800d0000,0,0x800376b4);
+                        assert(psx_mod_read_byte(pack)==0x10);
+                        // A loaded stale flag is reclaimed in third person.
+                        ttk::input.first_person=false;++save_loads;frame();
+                        psx_mod_write_byte(pack,0x11);
+                        call(0x800348d8,c,p,0x8003769c);
+                        assert(psx_mod_read_byte(pack)==0x10);
+                        ttk::input.first_person=true;++save_loads;frame();
+                        // Bad mapping fails closed, without hiding another part.
+                        const uint8_t mapped=psx_mod_read_byte(desc+0x38);
+                        psx_mod_write_byte(desc+0x38,0xff);
+                        call(0x800348d8,c,p,0x8003769c);
+                        assert(psx_mod_read_byte(pack)==0x10);
+                        call(0x8001ca4c,0x800d0000,0,0x800376b4);
+                        psx_mod_write_byte(desc+0x38,mapped);
+                        psx_mod_write_byte(pack,0);
+                        // D14G: holstered strokes share the contact rig; a
+                        // drawn weapon keeps its display arms, never the rig.
+                        if(mode==4 || mode==5) {
+                            assert(std::strstr(ttk::controls_debug_json(),"\"action\":\"swimming\""));
+                            contact_arms(true);contact_rig(true);
+                            const auto held=psx_mod_read_byte(p+0x3b8);
+                            psx_mod_write_byte(p+0x3b8,2);
+                            for(unsigned part:{10u,11u,13u,14u}) {
+                                call(0x800348d8,c,p,0x8003769c);
+                                CPUState joint{};joint.gpr[4]=c;joint.gpr[20]=p;joint.gpr[29]=0x801f0000;
+                                joint.gpr[23]=psx_mod_read_byte(desc+0x24+part);
+                                joint.gpr[5]=mats+0x20*joint.gpr[23];joint.gpr[31]=0x80034c6c;
+                                hooks().at(0x800292a0)(&joint,0x800292a0);
+                                assert(ttk::first_person_limb_presentation().owner!=ttk::LimbOwner::Interaction);
+                                call(0x8001ca4c,0x800d0000,0,0x800376b4);
+                            }
+                            psx_mod_write_byte(p+0x3b8,held);
+                        }
+                        const auto flags=psx_mod_read_word(p+0x224);
+                        psx_mod_write_word(p+0x224,flags|0x200);frame();assert(metric("\"blend\":")==((mode==4 || mode==5)?1:0) && !ttk::movement_ready());
+                        psx_mod_write_word(p+0x224,flags|0x20000000);frame();assert(metric("\"blend\":")==0);
+                        psx_mod_write_word(p+0x224,flags);frame();assert(metric("\"blend\":")==1);
+                        psx_mod_write_half(0x800be568,1);frame();assert(metric("\"blend\":")==1);
+                        psx_mod_write_half(0x800be568,0);
+                        ttk::input.first_person=false;for(int i=0;i<40;++i)frame();assert(metric("\"blend\":")==0);
+                        ttk::input.first_person=true;++save_loads;frame();assert(metric("\"blend\":")==1);
+                    }
+                }
+                // D35B: live action choice, global precedence, reset and replay.
+                for(const char* pace:{"modern","original"}) {
+                    setenv("DNTTK_SWIMMING",pace,1);
+                    for(unsigned mode:{4u,5u}) {
+                        psx_mod_write_byte(p+0x22c,mode);psx_mod_write_byte(p+0x22d,mode);
+                        psx_mod_write_half(p+0x60,mode==4?122:128);
+                        ttk::input.first_person=true;
+                        setenv("DNTTK_SWIM_VIEW","legacy-third",1);
+                        ++save_loads;frame();
+                        assert(metric("\"blend\":")==0 && ttk::input.first_person);
+                        assert(std::strstr(ttk::controls_debug_json(),"\"reason\":\"legacy-choice\""));
+                        // Legacy swim uses the existing third-person equip
+                        // guard. The FP-only 0x200 exception must not leak into it.
+                        const auto flags=psx_mod_read_word(p+0x224);
+                        psx_mod_write_word(p+0x224,flags|0x200);frame();
+                        assert(metric("\"blend\":")==0 && !ttk::movement_ready());
+                        assert(std::strstr(ttk::controls_debug_json(),"\"reason\":\"unsupported-camera\""));
+                        psx_mod_write_word(p+0x224,flags);frame();
+                        std::vector<uint8_t> legacy(ttk::render_state_size()),eye(legacy.size());
+                        ttk::render_state_save(legacy.data());
+                        setenv("DNTTK_SWIM_VIEW","first",1);
+                        for(int i=0;i<40;++i)frame();assert(metric("\"blend\":")==1);
+                        ttk::render_state_save(eye.data());
+                        ttk::render_state_load(legacy.data());assert(metric("\"blend\":")==0);
+                        const uint32_t pack=desc+0x44+0x28*psx_mod_read_byte(desc+0x38);
+                        call(0x800348d8,c,p,0x8003769c);assert(!(psx_mod_read_byte(pack)&1));
+                        ttk::render_state_load(eye.data());assert(metric("\"blend\":")==1);
+                        call(0x800348d8,c,p,0x8003769c);assert(psx_mod_read_byte(pack)&1);
+                        call(0x8001ca4c,0x800d0000,0,0x800376b4);
+                        ttk::modern=false;
+                        call(0x800348d8,c,p,0x8003769c);assert(!(psx_mod_read_byte(pack)&1));
+                        ttk::modern=true;
+                        ttk::input.first_person=false;
+                        for(const char* view:{"first","legacy-third"}) {
+                            setenv("DNTTK_SWIM_VIEW",view,1);++save_loads;frame();
+                            assert(metric("\"blend\":")==0);
+                        }
+                        // P during the action wins on land, no saved-view restore.
+                        psx_mod_write_word(p+0x834,0x40000000);psx_mod_write_word(p+0x20c,0);
+                        psx_mod_write_byte(p+0x22c,0);psx_mod_write_byte(p+0x22d,0);psx_mod_write_half(p+0x60,63);
+                        ++save_loads;frame();assert(metric("\"blend\":")==0);
+                        ttk::input.first_person=true;
+                        for(int i=0;i<40;++i)frame();assert(metric("\"blend\":")==1);
+                        psx_mod_write_word(p+0x834,root[1]-198);psx_mod_write_word(p+0x20c,1);
+                    }
+                }
+                unsetenv("DNTTK_SWIMMING");unsetenv("DNTTK_SWIM_VIEW");
+                std::puts("PASS: D35B both paces, live swim view, global third precedence, land return, reset and replay policy");
+                // A water-to-mantle handoff still has previous mode 4/5 and
+                // may retain the water flag. D35G keeps the eye from the first climb frame.
+                for(unsigned previous:{4u,5u}) {
+                    psx_mod_write_byte(p+0x22c,8);psx_mod_write_byte(p+0x22d,previous);psx_mod_write_half(p+0x60,134);
+                    ++save_loads;frame();assert(metric("\"blend\":")==1);
+                    assert(std::strstr(ttk::controls_debug_json(),"\"action\":\"water-exit\""));
+                    contact_rig(true);
+                    // P during fallback is authoritative after exit and world reset.
+                    ttk::input.first_person=false;frame();
+                    psx_mod_write_byte(p+0x22c,4);psx_mod_write_byte(p+0x22d,4);psx_mod_write_half(p+0x60,171);
+                    ++save_loads;frame();assert(metric("\"blend\":")==0 && !ttk::input.first_person);
+                    ttk::input.first_person=true;for(int i=0;i<40;++i)frame();
+                    assert(metric("\"blend\":")==1);
+                }
+                layout(first_map);
+                for(int i=0;i<3;++i)psx_mod_write_word(mats+0x20*9+0x14+4*i,neck[i]);
+                psx_mod_write_word(p+0x834,water);psx_mod_write_word(p+0x20c,flag);psx_mod_write_word(p+0x1c8,floor);
+                psx_mod_write_byte(p+0x22c,0);psx_mod_write_byte(p+0x22d,0);psx_mod_write_half(p+0x60,63);
+                ++save_loads;frame();
+                call(0x800348d8,c,p,0x8003769c);
+                assert(!(psx_mod_read_byte(desc+0x44+0x28*psx_mod_read_byte(desc+0x38))&1));
+                call(0x8001ca4c,0x800d0000,0,0x800376b4);
+                std::puts("PASS: D36K swim pack scope, costume maps, reflection, stale load, replay, action choice, Vanilla and land exit");
+                std::puts("PASS: D11E surface/underwater eye, two costume layouts, pose independence, suspended input/pause, loaded view, third-person switch and no water/velocity/position writes");
+            }
+
+            // D11F: camera-only flight keeps the selected eye with no action
+            // lease. Lean animation cannot shift it into a wall or the pack.
+            {
+                const auto pack=psx_mod_read_half(p+0x358);
+                const auto water=psx_mod_read_word(p+0x20c);
+                psx_mod_write_word(p+0x20c,0);
+                psx_mod_write_half(p+0x358,3);
+                ttk::input.active=false;
+                for(const char* scheme:{"modern","classic","eduke32"}) {
+                    setenv("DNTTK_JETPACK",scheme,1);
+                    for(const uint8_t* parts:{first_map,cowboy}) {
+                        layout(parts);const unsigned head=psx_mod_read_byte(desc+0x34);
+                        for(unsigned animation=163;animation<=170;++animation) {
+                            psx_mod_write_byte(p+0x22c,10);psx_mod_write_byte(p+0x22d,0);
+                            psx_mod_write_half(p+0x60,animation);
+                            ++save_loads;frame();
+                            assert(metric("\"blend\":")==1 && !ttk::movement_ready());
+                            call(0x800348d8,c,p,0x8003769c);
+                            assert(!(psx_mod_read_byte(desc+0x44+0x28*psx_mod_read_byte(desc+0x38))&1));
+                            call(0x8001ca4c,0x800d0000,0,0x800376b4);
+                            // D36K1: flight admits only empty-handed arm chains,
+                            // never legs, and preserves native flight transforms.
+                            // D14H: with world depth but the fixed display projection.
+                            const auto equipment=psx_mod_read_byte(p+0x3b8);
+                            const std::vector<uint8_t> original(ram+(mats&0x1fffff),ram+(mats&0x1fffff)+19*0x20);
+                            for(unsigned equip:{0u,1u,2u}) for(unsigned j=0;j<19;++j) {
+                                psx_mod_write_byte(p+0x3b8,equip);
+                                call(0x800348d8,c,p,0x8003769c);
+                                CPUState cpu{};cpu.gpr[4]=c;cpu.gpr[5]=mats+0x20*j;
+                                cpu.gpr[20]=p;cpu.gpr[23]=j;cpu.gpr[29]=0x801f0000;cpu.gpr[31]=0x80034c6c;
+                                hooks().at(0x800292a0)(&cpu,0x800292a0);
+                                const auto limb=ttk::first_person_limb_presentation();
+                                const bool arm=equip==0 && parts[j]>=10 && parts[j]<=15;
+                                assert((limb.owner==ttk::LimbOwner::FlightArm)==arm && limb.owner!=ttk::LimbOwner::Body);
+                                if(arm) {
+                                    assert(cpu.gpr[5]==mats+0x20*j && limb.world_clip() && !limb.viewmodel());
+                                    assert(limb.fixed_projection() && limb.light==ttk::LimbLight::CorrectProximityFade);
+                                    assert(limb.bridge_joint_depth && limb.parts==(1u<<parts[j]));
+                                    cpu.gpr[31]=0x80034c8c;cpu.gte_ctrl[26]=256;cpu.gpr[16]=0;
+                                    psx_mod_write_word(cpu.gpr[29]+0x98,c);
+                                    hooks().at(0x800b4d2c)(&cpu,0x800b4d2c);assert(cpu.gpr[16]==256);
+                                }
+                                call(0x8001ca4c,0x800d0000,0,0x800376b4);
+                                assert(ttk::first_person_limb_presentation().owner==ttk::LimbOwner::Native);
+                            }
+                            assert(std::equal(original.begin(),original.end(),ram+(mats&0x1fffff)));
+                            psx_mod_write_byte(p+0x3b8,equipment);
+                            const auto velocity=psx_mod_read_word(p+0x1f8);
+                            for(int pose:{-400,450}) {
+                                for(int i=0;i<3;++i)psx_mod_write_word(mats+0x20*head+0x14+4*i,root[i]+pose);
+                                for(int i=0;i<24;++i)frame();
+                                call(0x8003aa48,c,sp+0x18,0x8003aeb0,sp);
+                                for(int i=0;i<3;++i) {
+                                    const double eye=(int32_t)psx_mod_read_word(sp+0x18+4*i)+(int32_t)psx_mod_read_word(c+0x64+4*i)-
+                                        (int16_t)psx_mod_read_half(c+12+2*i)/4096.0*193;
+                                    assert(std::abs(eye-(root[i]-(i==1?294:0)))<2);
+                                    assert((int32_t)psx_mod_read_word(p+4+4*i)==root[i]);
+                                }
+                                call(0x8002a038,0,1,0x8003af40,sp);
+                                assert(psx_mod_read_word(p+0x1f8)==velocity && psx_mod_read_half(p+0x358)==3);
+                            }
+                        }
+                    }
+                }
+                // D35C: flight choice, replay, global precedence and exit.
+                for(const char* scheme:{"modern","classic","eduke32"}) {
+                    setenv("DNTTK_JETPACK",scheme,1);
+                    for(unsigned animation=163;animation<=170;++animation) {
+                        psx_mod_write_byte(p+0x22c,10);psx_mod_write_byte(p+0x22d,0);
+                        psx_mod_write_half(p+0x60,animation);psx_mod_write_half(p+0x358,3);
+                        ttk::input.first_person=true;
+                        setenv("DNTTK_JETPACK_VIEW","legacy-third",1);
+                        ++save_loads;frame();assert(metric("\"blend\":")==0);
+                        assert(std::strstr(ttk::controls_debug_json(),"\"reason\":\"legacy-choice\""));
+                        const auto velocity=psx_mod_read_word(p+0x1f8);
+                        const auto fuel=psx_mod_read_half(p+0x35a);
+                        std::vector<uint8_t> third(ttk::render_state_size()),first(third.size());
+                        ttk::render_state_save(third.data());
+                        setenv("DNTTK_JETPACK_VIEW","first",1);
+                        for(int i=0;i<40;++i)frame();assert(metric("\"blend\":")==1);
+                        ttk::render_state_save(first.data());
+                        ttk::render_state_load(third.data());assert(metric("\"blend\":")==0);
+                        ttk::render_state_load(first.data());assert(metric("\"blend\":")==1);
+                        action_legs();
+                        for(int i=0;i<3;++i)assert((int32_t)psx_mod_read_word(p+4+4*i)==root[i]);
+                        assert(psx_mod_read_word(p+0x1f8)==velocity && psx_mod_read_half(p+0x35a)==fuel);
+                        assert(psx_mod_read_half(p+0x358)==3 && !ttk::movement_ready());
+                        ttk::input.first_person=false;
+                        for(const char* view:{"first","legacy-third"}) {
+                            setenv("DNTTK_JETPACK_VIEW",view,1);++save_loads;frame();
+                            assert(metric("\"blend\":")==0);
+                        }
+                        ttk::input.first_person=true;
+                        psx_mod_write_half(p+0x358,1);++save_loads;frame();
+                        assert(metric("\"blend\":")==0 && !ttk::jetpack_input_ready());
+                        psx_mod_write_byte(p+0x22c,9);psx_mod_write_byte(p+0x22d,10);
+                        psx_mod_write_half(p+0x60,108);
+                        for(int i=0;i<40;++i)frame();assert(metric("\"blend\":")==1);
+                        for(unsigned pose:{63u,105u,106u}) {
+                            psx_mod_write_byte(p+0x22c,0);psx_mod_write_half(p+0x60,pose);
+                            frame();assert(metric("\"blend\":")==1);
+                        }
+                    }
+                }
+                unsetenv("DNTTK_JETPACK_VIEW");
+                psx_mod_write_byte(p+0x22c,10);psx_mod_write_byte(p+0x22d,0);
+                psx_mod_write_half(p+0x60,164);psx_mod_write_half(p+0x358,3);frame();
+                std::puts("PASS: D35C all schemes/poses, live choice, replay/reset, global precedence, off/fall/landing and unchanged flight fields");
+                // Native off/fuel-out clears the pack one tick before the
+                // flight animation changes; landing retains previous mode 10.
+                psx_mod_write_half(p+0x358,1);frame();
+                assert(metric("\"blend\":")==1 && !ttk::jetpack_input_ready());
+                psx_mod_write_byte(p+0x22c,9);psx_mod_write_byte(p+0x22d,10);
+                psx_mod_write_half(p+0x60,108);frame();assert(metric("\"blend\":")==1);
+                for(unsigned animation:{63u,105u,106u}) {
+                    psx_mod_write_byte(p+0x22c,0);psx_mod_write_byte(p+0x22d,10);
+                    psx_mod_write_half(p+0x60,animation);frame();assert(metric("\"blend\":")==1);
+                }
+                psx_mod_write_half(p+0x358,3);psx_mod_write_byte(p+0x22c,10);
+                psx_mod_write_half(p+0x60,164);frame();
+                unsetenv("DNTTK_JETPACK");
+                {   // the dead flag with health left (D42: no health is the death eye)
+                    const uint16_t health=psx_mod_read_half(p+0x32);psx_mod_write_half(p+0x32,100);
+                    psx_mod_write_word(p,2);frame();assert(metric("\"blend\":")==0);
+                    psx_mod_write_half(p+0x32,health);
+                }
+                psx_mod_write_word(p,0);frame();assert(metric("\"blend\":")==1);
+                ttk::modern=false;frame();assert(!ttk::first_person_view_live());
+                ttk::modern=true;frame();assert(metric("\"blend\":")==1);
+                ttk::input.first_person=false;for(int i=0;i<40;++i)frame();assert(metric("\"blend\":")==0);
+                ttk::input.first_person=true;frame();
+                layout(first_map);
+                for(int i=0;i<3;++i)psx_mod_write_word(mats+0x20*9+0x14+4*i,neck[i]);
+                psx_mod_write_half(p+0x358,pack);psx_mod_write_word(p+0x20c,water);
+                psx_mod_write_byte(p+0x22c,0);psx_mod_write_byte(p+0x22d,0);psx_mod_write_half(p+0x60,63);
+                ++save_loads;frame();assert(metric("\"blend\":")==1);
+                std::puts("PASS: D11F flight eye across schemes, poses and costumes; loaded/suspended presentation, death, Vanilla, third-person and ground handoff");
+            }
+
+            ttk::input.active=true;ttk::input.first_person=false;++ttk::input.epoch;
+            for(unsigned i=0;i<40;++i)frame();
+            for(int i=0;i<3;++i)psx_mod_write_word(p+4+4*i,saved_root[i]);
+        }
+        // Leave the view where the following cases expect it.
+        psx_mod_write_half(p+0x1c,(uint16_t)std::lround(yaw0*4096/6.2831853071795864769)&4095);
+        ttk::input.recenter_total=4;for(unsigned i=0;i<60;++i)frame();
+        call(0x8003aa48,c,sp+0x18,0x8003aeb0,sp);
+        psx_mod_write_half(p+0x1c,heading0);psx_mod_write_word(c+0x64,camera_x0);psx_mod_write_word(c+0x6c,camera_z0);
+    }
+    // Standing-jump preparation retains a bounded direction lease, then redirects
+    // original animation 98 velocity once. No forced state, height or position.
+    // Start an independent fixture facing +Z, not an input-recapture reseed.
+    ++save_loads;psx_mod_write_half(c+12,0);psx_mod_write_half(c+14,0);psx_mod_write_half(c+16,4096);
+    auto ground=[&](){
+        ++ttk::input.epoch;++ttk::input.sequence;ttk::input.active=true;
+        ttk::input.held[ttk::original_aim]=false;ttk::input.held[ttk::crouch]=false;
+        psx_mod_write_word(p,0);psx_mod_write_word(p+0x224,0);
+        psx_mod_write_half(p+0x60,63);psx_mod_write_half(p+0x68,0);
+        psx_mod_write_byte(p+0x22c,0);psx_mod_write_byte(p+0x22d,0);
+        call(0x8003ade4,c,p,0x80025ee8);
+        psx_mod_write_half(p+0x60,96);
+    };
+    for(unsigned animation:{63u,72u,73u,74u,75u,76u,78u}) {
+        ground();psx_mod_write_half(p+0x60,animation);ttk::input.move_x=1;ttk::input.move_y=0;
+        psx_mod_write_half(p+0x358,0);ttk::jump_pending=true;
+        call(0x8005a210,p,0x800c2754,0x80041b34);
+        if(animation<76) {
+            assert(psx_mod_read_half(p+0x60)==96 && !ttk::jump_pending);
+            assert(psx_mod_read_half(p+0x68)==0 && psx_mod_read_half(p+0x6a)==0);
+        } else assert(psx_mod_read_half(p+0x60)==animation && ttk::jump_pending);
+    }
+    // D08Z6 first press during grounded wall-stop preparation. These poses
+    // have a camera-only lease; waiting for idle would expire a short tap.
+    for(unsigned animation:{94u,95u}) for(int reject=0;reject<7;++reject) {
+        setenv("DNTTK_JUMP",reject==1?"assisted":"manual",1);
+        ground();psx_mod_write_half(p+0x60,animation);ttk::input.move_x=0;ttk::input.move_y=1;
+        ttk::running=reject!=2;ttk::jump_pending=true;
+        psx_mod_write_half(p+0x358,0);psx_mod_write_word(p+0x20c,0);
+        if(reject==3)psx_mod_write_byte(p+0x22d,9);
+        if(reject==4)ttk::input.held[ttk::crouch]=true;
+        if(reject==5)ttk::input.held[ttk::original_aim]=true;
+        call(0x8003ade4,c,p,0x80025ee8);
+        if(reject==6)++ttk::input.epoch;
+        call(0x8005a210,p,0x800c2754,0x80041b34);
+        assert(psx_mod_read_half(p+0x60)==(reject?animation:96));
+        assert(ttk::jump_pending==bool(reject));
+    }
+    unsetenv("DNTTK_JUMP");ttk::running=false;ttk::jump_pending=false;
+    std::puts("PASS: D08Z6 first buffered press during grounded run stop; assisted/walk/landing/crouch/aim/epoch exclusions");
+    ground();psx_mod_write_half(p+0x60,72);ttk::input.move_x=1;
+    psx_mod_write_half(p+0x358,3);psx_mod_write_half(p+0x35a,100);psx_mod_write_word(0x800d21fc,1);
+    ttk::jump_pending=true;call(0x8005a210,p,0x800c2754,0x80041b34);
+    assert(psx_mod_read_half(p+0x60)==72 && ttk::jump_pending); // original jet thrust
+    psx_mod_write_half(p+0x358,0);ttk::jump_pending=false;
+    // A fresh run-start press clears only original stride jump suppression.
+    for(int reject=0;reject<6;++reject) {
+        ground();psx_mod_write_half(p+0x60,76);ttk::input.move_y=1;
+        ttk::jump_pending=true;psx_mod_write_word(p+0x228,0x108);
+        uint32_t caller=0x80048664;
+        if(reject==1)ttk::jump_pending=false;
+        if(reject==2)ttk::input.held[ttk::crouch]=true;
+        if(reject==3)ttk::input.held[ttk::original_aim]=true;
+        if(reject==4)caller+=4;
+        if(reject==5)++ttk::input.epoch;
+        call(0x80053500,p,0,caller);
+        assert(psx_mod_read_word(p+0x228)==(reject?0x108:0x100));
+        assert(psx_mod_read_half(p+0x60)==76 && ttk::jump_pending==(reject!=1));
+    }
+    ttk::jump_pending=false;
+    for(auto direction:std::vector<std::pair<float,float>>{{0,1},{0,-1},{1,0},{-1,0},{.707107f,.707107f},{-.707107f,-.707107f}}) {
+        ground();ttk::input.move_x=direction.first;ttk::input.move_y=direction.second;
+        // Camera observes new 96 before its initializer, clearing normal lease.
+        // D22B: the camera-only jump lease continues it in third person too.
+        call(0x8003ade4,c,p,0x80025ee8);assert(!ttk::movement_ready() && !ttk::directional_takeoff_ready());
+        writes=0;call(0x800493a4,p,0,0x8005a3a0);assert(writes==0);
+        call(0x8003ade4,c,p,0x80025ee8);
+        assert(ttk::directional_takeoff_ready() && ttk::locomotion_input_ready() && !ttk::movement_ready());
+        // Releasing both direction and jump cannot change the accepted takeoff.
+        ttk::input.move_x=ttk::input.move_y=0;
+        call(0x8003ade4,c,p,0x80025ee8);assert(ttk::directional_takeoff_ready());
+        psx_mod_write_word(js+0x44,0x800549c4);
+        psx_mod_write_word(js+0x10,0);psx_mod_write_word(js+0x18,375);
+        writes=0;call(0x800780b4,p,js+0x10,0x8007985c,js);
+        assert(writes>0 && std::abs((int32_t)psx_mod_read_word(js+0x10)-375*direction.first)<1);
+        assert(std::abs((int32_t)psx_mod_read_word(js+0x18)-375*direction.second)<1);
+        assert(psx_mod_read_word(js+0x30)==psx_mod_read_word(p+4)+psx_mod_read_word(js+0x10));
+        psx_mod_write_half(p+0x60,98);psx_mod_write_byte(p+0x22c,9);
+        psx_mod_write_word(p+0x1f4,0);psx_mod_write_word(p+0x1fc,1000);psx_mod_write_word(p+0x1f8,-900);
+        call(0x8003ebf4,p,0,0x80055934);
+        assert(std::abs((int32_t)psx_mod_read_word(p+0x1f4)-1000*direction.first)<1);
+        assert(std::abs((int32_t)psx_mod_read_word(p+0x1fc)-1000*direction.second)<1);
+        assert((int32_t)psx_mod_read_word(p+0x1f8)==-900);
+        writes=0;call(0x8003ebf4,p,0,0x80055934);assert(writes==0);
+        call(0x8003ade4,c,p,0x80025ee8);assert(ttk::airborne_input_ready());
+        unsigned saved_equipment=psx_mod_read_byte(p+0x3b8),saved_upper=psx_mod_read_half(p+0x74);
+        psx_mod_write_byte(p+0x3b8,2);psx_mod_write_half(p+0x74,7);
+        assert(!ttk::interaction_holster_ready());
+        psx_mod_write_half(p+0x74,5);psx_mod_write_word(p+0x224,4);assert(!ttk::interaction_holster_ready());
+        psx_mod_write_word(p+0x224,0);assert(ttk::interaction_holster_ready());
+        psx_mod_write_byte(p+0x3b8,0);psx_mod_write_half(p+0x74,1);assert(!ttk::interaction_ready());
+        psx_mod_write_half(p+0x74,104);psx_mod_write_word(p+0x224,4);assert(!ttk::interaction_ready());
+        psx_mod_write_word(p+0x224,0);assert(ttk::interaction_ready());
+        psx_mod_write_byte(p+0x3b8,saved_equipment);psx_mod_write_half(p+0x74,saved_upper);
+        transition.gpr[31]=0x8005a5a8;
+        for(unsigned upper:{0u,1u,6u,21u,30u,36u,40u}) {
+            psx_mod_write_byte(p+0x3b8,upper<2?0:2);
+            ttk::auto_stow=true;call(0x8005a210,p,0x800c2754,0x80041b34);
+            psx_mod_write_half(p+0x74,upper);psx_mod_write_half(0x801effd2,1024);
+            hooks().at(0x80059db0)(&transition,0x80059db0);assert(psx_mod_read_half(0x801effd2)==4096);
+            hooks().at(0x80059db0)(&transition,0x80059db0);assert(psx_mod_read_half(0x801effd2)==4096);
+            ttk::auto_stow=false;call(0x8005a210,p,0x800c2754,0x80041b34);
+            psx_mod_write_half(0x801effd2,1024);
+            // D08A36: without E, an air switch's tracks run 2x (the blend only
+            // while a weapon is requested).
+            const bool air_switch=upper>=2 || psx_mod_read_byte(p+0x3ba)!=0;
+            hooks().at(0x80059db0)(&transition,0x80059db0);assert(psx_mod_read_half(0x801effd2)==(air_switch?2048:1024));
+        }
+
+    }
+    // Space-first: neutral 96 keeps ownership, then picks up direction without
+    // restarting preparation or supplying a phantom Forward while neutral.
+    for(auto direction:std::vector<std::pair<float,float>>{{0,1},{0,-1},{1,0},{-1,0},{.707107f,.707107f},{-.707107f,-.707107f}}) {
+        ground();ttk::input.move_x=ttk::input.move_y=0;
+        call(0x800493a4,p,0,0x8005a4d0);call(0x8003ade4,c,p,0x80025ee8);
+        assert(ttk::locomotion_input_ready() && !ttk::directional_takeoff_ready());
+        psx_mod_write_half(p+0x68,1);psx_mod_write_half(p+0x62,7);
+        ttk::input.sequence+=3;call(0x8003ade4,c,p,0x80025ee8);
+        ttk::input.move_x=direction.first;ttk::input.move_y=direction.second;
+        writes=0;call(0x8005a210,p,0x800c2754,0x80041b34);
+        assert(writes==0 && ttk::directional_takeoff_ready());
+        assert(psx_mod_read_half(p+0x68)==1 && psx_mod_read_half(p+0x62)==7);
+        ttk::input.move_x=ttk::input.move_y=0;
+        psx_mod_write_half(p+0x60,98);psx_mod_write_byte(p+0x22c,9);
+        psx_mod_write_word(p+0x1f4,0);psx_mod_write_word(p+0x1fc,1000);psx_mod_write_word(p+0x1f8,-900);
+        call(0x8003ebf4,p,0,0x80055934);
+        assert(std::abs((int32_t)psx_mod_read_word(p+0x1f4)-1000*direction.first)<1);
+        assert(std::abs((int32_t)psx_mod_read_word(p+0x1fc)-1000*direction.second)<1);
+        assert((int32_t)psx_mod_read_word(p+0x1f8)==-900);
+    }
+    ground();ttk::input.move_x=ttk::input.move_y=0;
+    call(0x800493a4,p,0,0x8005a4d0);call(0x8003ade4,c,p,0x80025ee8);
+    ++ttk::input.epoch;ttk::input.move_y=1;
+    call(0x8005a210,p,0x800c2754,0x80041b34);assert(!ttk::directional_takeoff_ready());
+    ground();ttk::input.move_x=ttk::input.move_y=0;
+    call(0x800493a4,p,0,0x8005a4d0);call(0x8003ade4,c,p,0x80025ee8);
+    psx_mod_write_half(p+0x60,97);psx_mod_write_byte(p+0x22c,9);ttk::input.move_y=1;
+    writes=0;call(0x8005a210,p,0x800c2754,0x80041b34);call(0x8003ebf4,p,0,0x80055bc4);
+    assert(writes==0 && !ttk::directional_takeoff_ready()); // no midair reinjection
+    for(int rejection=0;rejection<10;++rejection) {
+        ground();ttk::input.move_x=1;ttk::input.move_y=0;
+        uint32_t actor=p,caller=0x8005a3a0;
+        if(rejection==0)ttk::input.move_x=0;
+        if(rejection==1)ttk::input.active=false;
+        if(rejection==2)ttk::input.held[ttk::original_aim]=true;
+        if(rejection==3)ttk::input.held[ttk::crouch]=true;
+        if(rejection==4)++ttk::input.epoch;
+        if(rejection==5)ttk::input.sequence+=5;
+        if(rejection==6)psx_mod_write_byte(p+0x22c,3);
+        if(rejection==7)actor=p+0x8a4;
+        if(rejection==8)caller+=4;
+        if(rejection==9)poke(0x5492c);
+        call(0x800493a4,actor,0,caller);assert(!ttk::directional_takeoff_ready());
+        if(rejection==9)poke(0x5492c);
+    }
+    ground();ttk::input.move_x=1;call(0x800493a4,p,0,0x8005a3a0);
+    ttk::input.sequence+=61;assert(!ttk::directional_takeoff_ready());
+    // A refused directional takeoff may continue forward only once ascending
+    // clearance accepts it. Preserve vertical velocity, support and position.
+    ground();ttk::input.move_x=0;ttk::input.move_y=1;
+    call(0x800493a4,p,0,0x8005a3a0);call(0x8003ade4,c,p,0x80025ee8);
+    psx_mod_write_half(p+0x60,97);psx_mod_write_byte(p+0x22c,9);psx_mod_write_byte(p+0x22d,9);
+    psx_mod_write_word(p+0x1f8,-4000);psx_mod_write_word(p+0x1c4,123);
+    psx_mod_write_word(p+0x1c8,567);psx_mod_write_word(p+8,-12000);psx_mod_write_word(p+0x10,-11500);
+    terrain_result=3;terrain_floor=100;
+    call(0x8005a210,p,0x800c2754,0x80041b34,0x801fff00);
+    assert(psx_mod_read_half(p+0x60)==97 && psx_mod_read_word(p+0x1c4)==123);
+    assert((int32_t)terrain_reference==-11500 && psx_mod_read_word(p+0x1c8)==567);
+    terrain_result=0;terrain_floor=-20;
+    call(0x8005a210,p,0x800c2754,0x80041b34,0x801fff00);assert(psx_mod_read_half(p+0x60)==97);
+    terrain_floor=100;
+    call(0x8005a210,p,0x800c2754,0x80041b34,0x801fff00);assert(psx_mod_read_half(p+0x60)==98);
+    psx_mod_write_word(p+0x1f8,-9000); // model original initializer
+    psx_mod_write_word(p+0x1fc,6000);psx_mod_write_word(p+0x1f4,0);
+    call(0x8003ebf4,p,0,0x80055934);assert((int32_t)psx_mod_read_word(p+0x1f8)==-4000);
+    ground();ttk::input.move_x=0;ttk::input.move_y=1;
+    call(0x800493a4,p,0,0x8005a3a0);call(0x8003ade4,c,p,0x80025ee8);
+    psx_mod_write_half(p+0x60,97);psx_mod_write_byte(p+0x22c,9);psx_mod_write_byte(p+0x22d,9);
+    psx_mod_write_word(p+0x1f8,-9000);psx_mod_write_word(p+0x1c8,-11264);
+    psx_mod_write_word(p+0x1c4,-383);psx_mod_write_word(p+8,-11775);psx_mod_write_word(p+0x10,-11380);
+    terrain_result=0;terrain_floor=100; // head-height query alone would falsely accept
+    call(0x8005a210,p,0x800c2754,0x80041b34,0x801fff00);assert(psx_mod_read_half(p+0x60)==97);
+    psx_mod_write_word(p+0x10,-11648);
+    call(0x8005a210,p,0x800c2754,0x80041b34,0x801fff00);assert(psx_mod_read_half(p+0x60)==98);
+    // D08Z7: a held or repeated jump taken straight out of a landing (105/106),
+    // a wall bump (94/95) or on the landing update itself (0/9 after a jump
+    // camera) is still an owned takeoff, so 98 follows the pressed direction
+    // instead of Duke's facing. Stale epochs and non-jump landings stay unowned.
+    {
+        auto landed=[&](unsigned pose,unsigned mode,unsigned previous,int reject=0) {
+            ground();ttk::input.move_x=0;ttk::input.move_y=-1;
+            ++ttk::input.epoch;ttk::input.sequence+=20; // the idle sample is gone
+            if(pose==105 || pose==0) { // a live jump camera first
+                psx_mod_write_half(p+0x60,98);psx_mod_write_byte(p+0x22c,9);psx_mod_write_byte(p+0x22d,9);
+                call(0x8003ade4,c,p,0x80025ee8);++ttk::input.sequence;call(0x8003ade4,c,p,0x80025ee8);
+            }
+            if(pose) {
+                psx_mod_write_half(p+0x60,pose);psx_mod_write_byte(p+0x22c,mode);psx_mod_write_byte(p+0x22d,previous);
+                ++ttk::input.sequence;call(0x8003ade4,c,p,0x80025ee8);
+            }
+            if(reject==1)++ttk::input.epoch;
+            if(reject==2)ttk::input.sequence+=20;
+            psx_mod_write_half(p+0x60,96);psx_mod_write_half(p+0x68,0);
+            psx_mod_write_byte(p+0x22c,0);psx_mod_write_byte(p+0x22d,pose?0:9);
+            call(0x800493a4,p,0,0x8005a4d0);
+            return ttk::directional_takeoff_ready();
+        };
+        for(unsigned pose:{94u,95u,106u,105u})assert(landed(pose,0,0));
+        assert(landed(0,0,0));                         // landing update, 0/9
+        assert(!landed(106,0,9));                      // still settling from the air
+        assert(!landed(108,9,9));                      // a fall is not ground
+        assert(!landed(94,0,0,1) && !landed(0,0,0,1)); // load/focus epoch
+        assert(!landed(94,0,0,2) && !landed(0,0,0,2)); // stale sample
+        // The owned landing-update takeoff redirects its 98 once (backward).
+        assert(landed(0,0,0));
+        psx_mod_write_half(p+0x60,98);psx_mod_write_byte(p+0x22c,9);psx_mod_write_byte(p+0x22d,0);
+        psx_mod_write_word(p+0x1f4,0);psx_mod_write_word(p+0x1fc,1000);psx_mod_write_word(p+0x1f8,-900);
+        call(0x8003ebf4,p,0,0x80055934);
+        assert(std::abs((int32_t)psx_mod_read_word(p+0x1fc)+1000)<1 && (int32_t)psx_mod_read_word(p+0x1f8)==-900);
+        // Clearance refused: the vertical 97 drifts the pressed way, same speed.
+        auto blocked=[&](int reject) {
+            ground();ttk::input.move_x=0;ttk::input.move_y=-1;
+            call(0x800493a4,p,0,0x8005a3a0);call(0x8003ade4,c,p,0x80025ee8);
+            if(reject==1) {ground();ttk::input.move_x=ttk::input.move_y=0;call(0x800493a4,p,0,0x8005a3a0);}
+            psx_mod_write_half(p+0x60,97);psx_mod_write_byte(p+0x22c,9);psx_mod_write_byte(p+0x22d,reject==2?9:0);
+            psx_mod_write_word(p+0x1f4,0);psx_mod_write_word(p+0x1fc,1000);psx_mod_write_word(p+0x1f8,-9000);
+            if(reject==3)ttk::input.held[ttk::original_aim]=true;
+            if(reject==4)ttk::modern=false;
+            uint32_t ra=reject==5?0x80055934:0x80055bc4;
+            writes=0;call(0x8003ebf4,p,0,ra);
+            ttk::input.held[ttk::original_aim]=false;ttk::modern=true;
+            return (int32_t)psx_mod_read_word(p+0x1fc);
+        };
+        assert(std::abs(blocked(0)+1000)<1 && (int32_t)psx_mod_read_word(p+0x1f8)==-9000 && psx_mod_read_word(p+0x1f4)==0);
+        for(int reject=1;reject<=5;++reject)assert(blocked(reject)==1000);
+        // Jump, then hold S: manual steers the vertical 97 (cap: its drift,
+        // at least 2048); assisted, aim and a stale epoch keep the drift.
+        auto vertical=[&](const char* style,int reject) {
+            setenv("DNTTK_JUMP",style,1);
+            ground();ttk::input.move_x=ttk::input.move_y=0;
+            call(0x800493a4,p,0,0x8005a3a0);call(0x8003ade4,c,p,0x80025ee8);
+            psx_mod_write_half(p+0x60,97);psx_mod_write_byte(p+0x22c,9);psx_mod_write_byte(p+0x22d,0);
+            psx_mod_write_word(p+0x1f4,0);psx_mod_write_word(p+0x1fc,1000);psx_mod_write_word(p+0x1f8,-9000);
+            call(0x8003ebf4,p,0,0x80055bc4);assert(psx_mod_read_word(p+0x1fc)==1000); // takeoff: no direction yet
+            psx_mod_write_byte(p+0x22d,9);ttk::input.move_y=-1;psx_mod_write_half(p+0xba,11);
+            if(reject==1)ttk::input.held[ttk::original_aim]=true;
+            if(reject==2)++ttk::input.epoch;
+            for(int i=0;i<30;++i)call(0x8003ebf4,p,0,0x80055bc4);
+            ttk::input.held[ttk::original_aim]=false;unsetenv("DNTTK_JUMP");
+            assert((int32_t)psx_mod_read_word(p+0x1f8)==-9000);
+            return (int32_t)psx_mod_read_word(p+0x1fc);
+        };
+        assert(std::abs(vertical("manual",0)+2048)<2);   // reversed, at the 2048 floor
+        assert(vertical("assisted",0)==1000 && vertical("manual",1)==1000 && vertical("manual",2)==1000);
+        std::puts("PASS: D08Z7 jumps out of landings, bumps and the landing update stay owned (no facing-direction 98); blocked 97 drifts the pressed way; manual steers the vertical 97 (assisted/aim/epoch keep the drift); neutral/airborne/aim/Vanilla/caller untouched");
+    }
+    // D08Z6: clearance, not proximity, permits forward acceleration. Manual
+    // running builds speed through the ordinary steering and sweep path;
+    // walking/assisted keep the standing cap, and release adds no impulse.
+    for(int variant=0;variant<3;++variant) {
+        setenv("DNTTK_JUMP",variant==2?"assisted":"manual",1);
+        ground();ttk::input.move_x=0;ttk::input.move_y=1;ttk::running=variant!=1;
+        psx_mod_write_word(p+0x20c,0);
+        call(0x800493a4,p,0,0x8005a3a0);call(0x8003ade4,c,p,0x80025ee8);
+        psx_mod_write_half(p+0x60,97);psx_mod_write_byte(p+0x22c,9);psx_mod_write_byte(p+0x22d,9);
+        psx_mod_write_word(p+0x1f8,-4000);psx_mod_write_word(p+0x1c4,0);
+        psx_mod_write_word(p+0x10,-11500);psx_mod_write_half(p+0xba,11);
+        terrain_result=3;terrain_floor=100;
+        call(0x8005a210,p,0x800c2754,0x80041b34,0x801fff00);
+        assert(psx_mod_read_half(p+0x60)==97);
+        terrain_result=0;
+        call(0x8005a210,p,0x800c2754,0x80041b34,0x801fff00);
+        assert(psx_mod_read_half(p+0x60)==98);
+        psx_mod_write_word(p+0x1f4,0);psx_mod_write_word(p+0x1fc,2734);
+        psx_mod_write_word(p+0x1f8,-9000);
+        const uint32_t xyz[]={psx_mod_read_word(p+4),psx_mod_read_word(p+8),psx_mod_read_word(p+12)};
+        call(0x8003ebf4,p,0,0x80055934);
+        assert((int32_t)psx_mod_read_word(p+0x1f8)==-4000);
+        assert((int32_t)psx_mod_read_word(p+0x1fc)==(variant==0?4134:2734));
+        for(int i=0;i<12;++i)call(0x8003ebf4,p,0,0x80055934);
+        assert((int32_t)psx_mod_read_word(p+0x1fc)==(variant==0?10000:2734));
+        for(int i=0;i<3;++i)assert(psx_mod_read_word(p+4+4*i)==xyz[i]);
+        ttk::input.move_y=0;psx_mod_write_word(p+0x1fc,0);writes=0;
+        call(0x8003ebf4,p,0,0x80055934);assert(writes==0);
+    }
+    unsetenv("DNTTK_JUMP");ttk::running=false;
+    std::puts("PASS: D08Z6 cleared running jump builds bounded horizontal speed; vertical/position, release, walking and assisted preserved");
+    // Only the original clear drop result, in the small-drop range, selects
+    // the original run/fall dispatcher for a walking-speed step.
+    for(auto check:std::vector<std::pair<int,int>>{{6,384},{6,900},{3,384},{6,200}}) {
+        ground();psx_mod_write_half(p+0x60,72);ttk::input.move_y=1;ttk::input.move_x=0;
+        ttk::input.held[ttk::jump]=false;ttk::running=false;
+        call(0x8003ade4,c,p,0x80025ee8);
+        terrain_result=check.first;terrain_floor=check.second;
+        psx_mod_write_word(p+0x1c4,123);
+        call(0x80048410,p,0,0x8004b634,0x801fff00);
+        assert(psx_mod_read_half(p+0x60)==(check.first==6 && check.second>256?76:72));
+        assert(psx_mod_read_word(p+0x1c4)==123);
+    }
+    for(int height:{384,900}) {
+        ground();psx_mod_write_half(p+0x60,72);ttk::input.move_y=1;ttk::input.move_x=0;
+        call(0x8003ade4,c,p,0x80025ee8);
+        psx_mod_write_half(p+0x60,108);psx_mod_write_byte(p+0x22c,9);psx_mod_write_byte(p+0x22d,9);
+        psx_mod_write_word(p+0x1c4,height);psx_mod_write_word(p+0x20c,0);
+        call(0x8005a210,p,0x800c2754,0x80041b34,0x801fff00);
+        call(0x8003ade4,c,p,0x80025ee8);
+        assert(ttk::short_fall_input_ready()==(height==384));
+        if(height==384) {
+            psx_mod_write_word(p+0x1f4,3058);psx_mod_write_word(p+0x1fc,0);
+            psx_mod_write_word(p+0x1f8,456);
+            call(0x8003ebf4,p,0,0x80055934);
+            auto vx=(int32_t)psx_mod_read_word(p+0x1f4),vz=(int32_t)psx_mod_read_word(p+0x1fc);
+            assert(std::abs(std::hypot(vx,vz)-2048)<1 && psx_mod_read_word(p+0x1f8)==456);
+            psx_mod_write_word(p+0x1f4,0);psx_mod_write_word(p+0x1fc,0);
+            call(0x8003ebf4,p,0,0x80055934); // collision must keep its stopped velocity
+            assert(psx_mod_read_word(p+0x1f4)==0 && psx_mod_read_word(p+0x1fc)==0);
+        }
+        ttk::input.active=false;assert(!ttk::short_fall_input_ready());ttk::input.active=true;
+        psx_mod_write_half(p+0x60,74);psx_mod_write_byte(p+0x22c,0);psx_mod_write_byte(p+0x22d,0);
+        call(0x8005a210,p,0x800c2754,0x80041b34,0x801fff00);
+        // D08L1: a later walking ground stride also permits a large walk-off.
+        psx_mod_write_half(p+0x60,108);psx_mod_write_byte(p+0x22c,9);psx_mod_write_byte(p+0x22d,9);
+        psx_mod_write_word(p+0x1c4,900);
+        call(0x8005a210,p,0x800c2754,0x80041b34,0x801fff00);
+        call(0x8003ade4,c,p,0x80025ee8);assert(ttk::short_fall_input_ready());
+    }
+    // A running furniture fall inherits actual ground speed, once. Original
+    // collision can subsequently stop it; the velocity is never reinjected.
+    ground();ttk::input.move_x=0;ttk::input.move_y=1;ttk::running=true;
+    psx_mod_write_half(p+0x60,76);psx_mod_write_half(p+0xba,11);
+    psx_mod_write_half(p+0xfc,0);psx_mod_write_half(p+0x100,88);
+    call(0x8003ade4,c,p,0x80025ee8);call(0x80053500,p,0,0x80048664);
+    const double approach=psx_mod_read_half(p+0x100)*1024.0/11;
+    psx_mod_write_half(p+0x60,108);psx_mod_write_byte(p+0x22c,9);psx_mod_write_byte(p+0x22d,9);
+    psx_mod_write_word(p+0x1c4,384);psx_mod_write_word(p+0x20c,0);
+    call(0x8005a210,p,0x800c2754,0x80041b34,0x801fff00);
+    psx_mod_write_word(p+0x1f4,3058);psx_mod_write_word(p+0x1fc,0);psx_mod_write_word(p+0x1f8,456);
+    call(0x8003ebf4,p,0,0x80055934);
+    assert(std::abs((int32_t)psx_mod_read_word(p+0x1fc)-approach)<2 && psx_mod_read_word(p+0x1f8)==456);
+    psx_mod_write_word(p+0x1fc,0);call(0x8003ebf4,p,0,0x80055934);assert(psx_mod_read_word(p+0x1fc)==0);
+    psx_mod_write_half(p+0xba,0);ttk::running=false;
+    std::puts("PASS: ascending clearance reference, retained vertical impulse, bounded small drops and expired landing lease");
+    // D08L: running off a larger ledge straight from a ground stride departs
+    // at ground speed, capped below the running jump. D08L1 caps a walking
+    // departure at 2048; a fall following a jump (103) keeps original 3058.
+    for(int variant=0;variant<4;++variant) {
+        ground();ttk::input.move_x=0;ttk::input.move_y=1;ttk::running=variant!=1;
+        psx_mod_write_half(p+0x60,76);psx_mod_write_half(p+0xba,11);
+        psx_mod_write_half(p+0xfc,0);psx_mod_write_half(p+0x100,variant==3?200:88);
+        call(0x8003ade4,c,p,0x80025ee8);call(0x80053500,p,0,0x80048664);
+        const double run_off=psx_mod_read_half(p+0x100)*1024.0/11;
+        if(variant==2)psx_mod_write_half(p+0x60,103);
+        call(0x8005a210,p,0x800c2754,0x80041b34,0x801fff00);
+        psx_mod_write_half(p+0x60,108);psx_mod_write_byte(p+0x22c,9);psx_mod_write_byte(p+0x22d,9);
+        psx_mod_write_word(p+0x1c4,2048);psx_mod_write_word(p+0x20c,0);
+        call(0x8005a210,p,0x800c2754,0x80041b34,0x801fff00);
+        psx_mod_write_byte(p+0x22d,9);
+        psx_mod_write_word(p+0x1f4,3058);psx_mod_write_word(p+0x1fc,0);psx_mod_write_word(p+0x1f8,456);
+        call(0x8003ebf4,p,0,0x80055934);
+        const auto vz=(int32_t)psx_mod_read_word(p+0x1fc),vx=(int32_t)psx_mod_read_word(p+0x1f4);
+        if(variant==0)assert(std::abs(vz-run_off)<2 && vx==0);
+        else if(variant==3)assert(run_off>10000 && vz==10000);
+        else if(variant==1)assert(vx==0 && vz==2048);
+        else assert(vx==3058 && vz==0);
+        assert(psx_mod_read_word(p+0x1f8)==456);
+        psx_mod_write_word(p+0x1fc,0);call(0x8003ebf4,p,0,0x80055934);assert(psx_mod_read_word(p+0x1fc)==0);
+        psx_mod_write_half(p+0x60,74);psx_mod_write_byte(p+0x22c,0);psx_mod_write_byte(p+0x22d,0);
+        call(0x8005a210,p,0x800c2754,0x80041b34,0x801fff00);
+    }
+    // A spiked stride estimate (run start) is capped below the running jump.
+    ground();ttk::running=true;psx_mod_write_half(p+0x60,76);psx_mod_write_half(p+0xba,11);psx_mod_write_half(p+0x100,200);
+    call(0x8005a210,p,0x800c2754,0x80041b34,0x801fff00); // retire the previous landing
+    call(0x8003ade4,c,p,0x80025ee8);call(0x80053500,p,0,0x80048664);
+    call(0x8005a210,p,0x800c2754,0x80041b34,0x801fff00);
+    psx_mod_write_half(p+0x60,108);psx_mod_write_byte(p+0x22c,9);psx_mod_write_byte(p+0x22d,9);
+    psx_mod_write_word(p+0x1c4,384);psx_mod_write_word(p+0x20c,0);
+    call(0x8005a210,p,0x800c2754,0x80041b34,0x801fff00);
+    psx_mod_write_word(p+0x1f4,3058);psx_mod_write_word(p+0x1fc,0);
+    call(0x8003ebf4,p,0,0x80055934);assert(psx_mod_read_word(p+0x1fc)==10000);
+    psx_mod_write_half(p+0x60,74);psx_mod_write_byte(p+0x22c,0);psx_mod_write_byte(p+0x22d,0);
+    call(0x8005a210,p,0x800c2754,0x80041b34,0x801fff00);
+    psx_mod_write_half(p+0xba,0);ttk::running=false;
+    std::puts("PASS: running large-ledge run-off keeps capped ground speed; walking capped at 2048 and post-jump falls unchanged; spiked strides capped");
+    terrain_result=3;terrain_floor=-1000;
+    // Original grant dispatch, flags, unsupported-context rejection, and
+    // hostile-only hide/show ownership. Guest routines are modeled separately.
+    auto cheat=[&](ttk::Cheat command){ttk::pending_cheat=command;call(0x8005a210,p,0x800c2754,0x80041b34,0x801fff00);};
+    ground();psx_mod_write_half(p+0x60,63);ttk::input.move_x=ttk::input.move_y=0;
+    call(0x8003ade4,c,p,0x80025ee8);psx_mod_write_word(0x800c27bc,1);
+    // D08Q2: the reported Continue state strands only jetpack pending at the
+    // closed/off endpoint. Exercise the actual selection hook, including the
+    // negative cases that must keep original item transitions/restrictions.
+    {
+        uint8_t saved_player[0x8a4];std::memcpy(saved_player,ram+(p&0x1fffff),sizeof saved_player);
+        ttk::input.command_count=0;
+        psx_mod_write_byte(p+0x3b8,2);psx_mod_write_half(p+0x74,5);
+        psx_mod_write_word(p+0x834,0x40000000);
+        // (Steroids, item 4, are not held here: held ones would follow the medkit, D08A4.)
+        for(unsigned i:{1u,2u,3u,5u}){psx_mod_write_half(p+0x354+4*i,1);psx_mod_write_half(p+0x356+4*i,100);}
+        auto stranded=[&](){
+            ttk::modern=true;ttk::input.active=true;
+            psx_mod_write_word(p,0);psx_mod_write_half(p+0x32,6250);
+            psx_mod_write_word(p+0x224,0);psx_mod_write_half(p+0x358,0x8001);
+            psx_mod_write_half(p+0x35a,9000);psx_mod_write_half(p+0x84c,0);
+            psx_mod_write_word(p+0x884,1);psx_mod_write_half(p+0x60,63);psx_mod_write_byte(p+0x22c,0);psx_mod_write_byte(p+0x22d,0);
+        };
+        auto poll=[&](){call(0x80058120,p,0,0x80041c44);};
+        stranded();poll();assert(psx_mod_read_half(p+0x358)==1 && psx_mod_read_half(p+0x35a)==9000);
+        // Picker and activation use the repaired original record, without a cheat.
+        psx_mod_write_half(0x800c3f94,5);request(ttk::item_next);assert(psx_mod_read_half(0x800c3f94)==1);
+        ttk::input.commands[0]=ttk::jetpack;++ttk::input.command_serial;
+        call(0x80058120,p,0,0x80041c44,0x801fff00);assert(psx_mod_read_half(p+0x358)==3 && psx_mod_read_byte(p+0x22c)==10);
+        const uint32_t start_y=psx_mod_read_word(p+8);
+        ttk::input.held[ttk::jump]=false;ttk::input.held[ttk::crouch]=false;
+        ttk::input.sequence+=2;call(0x8003ade4,c,p,0x80025ee8);
+        call(0x8005a210,p,0x800c2754,0x80041b34,0x801fff00);
+        assert((int32_t)psx_mod_read_word(p+0x1f8)<0 && psx_mod_read_word(p+8)==start_y); // native collision applies lift
+
+        // Modern J also acquires a free fall, through the same guarded startup.
+        psx_mod_write_half(p+0x358,1);psx_mod_write_byte(p+0x22c,9);psx_mod_write_byte(p+0x22d,9);
+        psx_mod_write_half(p+0x60,108);psx_mod_write_word(p+0x224,0x41);
+        ++ttk::input.sequence;call(0x8003ade4,c,p,0x80025ee8);
+        ttk::input.commands[0]=ttk::jetpack;++ttk::input.command_serial;
+        call(0x80058120,p,0,0x80041c44,0x801fff00);
+        assert(psx_mod_read_byte(p+0x22c)==10 && psx_mod_read_half(p+0x358)==3);
+        // No ground-start boost or automatic clearance climb on a low air start.
+        const uint32_t air_y=psx_mod_read_word(p+8);
+        psx_mod_write_word(p+0x10,1000);psx_mod_write_word(p+0x1c8,1100);
+        psx_mod_write_word(0x800d21fc,10);
+        ttk::input.move_x=0;ttk::input.move_y=0;ttk::input.arrow_y=0;
+        ttk::input.sequence+=2;call(0x8003ade4,c,p,0x80025ee8);
+        call(0x8005a210,p,0x800c2754,0x80041b34,0x801fff00);
+        assert(psx_mod_read_word(p+8)==air_y && (int32_t)psx_mod_read_word(p+0x1f8)==0);
+        // Rapid off/on: the native close is still pending while Duke falls.
+        psx_mod_write_half(p+0x358,0x8001);psx_mod_write_byte(p+0x22c,9);psx_mod_write_byte(p+0x22d,9);
+        psx_mod_write_half(p+0x60,108);psx_mod_write_word(p+0x224,0x10000002);
+        psx_mod_write_word(p+0x884,1);psx_mod_write_half(p+0x84c,2);
+        ++ttk::input.sequence;call(0x8003ade4,c,p,0x80025ee8);++ttk::input.command_serial;
+        call(0x80058120,p,0,0x80041c44,0x801fff00);
+        assert(psx_mod_read_byte(p+0x22c)==10 && psx_mod_read_half(p+0x358)==3 && psx_mod_read_half(p+0x84c)==5);
+
+        for(unsigned flag:{0x1000u,0x10000000u,4u,8u}) {
+            stranded();psx_mod_write_word(p+0x224,flag);poll();assert(psx_mod_read_half(p+0x358)==0x8001);
+        }
+        for(unsigned phase:{1u,4u,5u}) {
+            stranded();psx_mod_write_half(p+0x84c,phase);poll();assert(psx_mod_read_half(p+0x358)==0x8001);
+        }
+        for(unsigned flags:{0u,1u,3u,0x8000u,0x8003u}) {
+            stranded();psx_mod_write_half(p+0x358,flags);poll();assert(psx_mod_read_half(p+0x358)==flags);
+        }
+        stranded();psx_mod_write_word(p+0x884,2);poll();assert(psx_mod_read_half(p+0x358)==0x8001);
+        stranded();psx_mod_write_word(p,2);poll();assert(psx_mod_read_half(p+0x358)==0x8001);
+        stranded();psx_mod_write_half(p+0x32,0);poll();assert(psx_mod_read_half(p+0x358)==0x8001);
+        stranded();psx_mod_write_byte(p+0x22c,10);poll();assert(psx_mod_read_half(p+0x358)==0x8001);
+        stranded();ttk::input.active=false;poll();assert(psx_mod_read_half(p+0x358)==0x8001);
+        stranded();ttk::modern=false;poll();assert(psx_mod_read_half(p+0x358)==0x8001);
+        stranded();poke(0x4001c);poll();assert(psx_mod_read_half(p+0x358)==0x8001);poke(0x4001c);
+        // Empty fuel is still unusable after housekeeping; unrelated bits survive.
+        stranded();psx_mod_write_half(p+0x358,0x8041);psx_mod_write_half(p+0x35a,0);poll();
+        assert(psx_mod_read_half(p+0x358)==0x41 && psx_mod_read_half(p+0x35a)==0);
+        request(ttk::jetpack);assert(psx_mod_read_half(p+0x358)==0x41);
+        std::memcpy(ram+(p&0x1fffff),saved_player,sizeof saved_player);++g_dirty_ram_code_gen;
+        ttk::input.command_count=0;
+        std::puts("PASS: D08Q2 stranded jetpack repair, picker/J, empty fuel, transition/death/Vanilla/code guards");
+    }
+    // D08G8: a dead Duke (health 0) refuses cheats; the fixture Duke lives.
+    const uint16_t fixture_health=psx_mod_read_half(p+0x32);psx_mod_write_half(p+0x32,10000);
+    cheat_calls.clear();cheat(ttk::Cheat::Stuff);    assert((cheat_calls==std::vector<uint32_t>{0x8003d7bc,0x8003d738,0x8003d840}));
+    {
+        // D08G4: the inventory cheats set full armour (10000, never lower) and
+        // stop running steroids, leaving the dose held; the grant is stubbed, so
+        // the flags stand in for what it leaves (bit 0, full amount).
+        const uint16_t armour=psx_mod_read_half(p+0x234);
+        for(auto c:{ttk::Cheat::Stuff,ttk::Cheat::Items,ttk::Cheat::Inventory}) {
+            psx_mod_write_half(p+0x234,2500);psx_mod_write_half(p+0x364,3);psx_mod_write_half(p+0x366,9000);
+            cheat(c);assert(psx_mod_read_half(p+0x234)==10000 && psx_mod_read_half(p+0x364)==1 && psx_mod_read_half(p+0x366)==9000);
+        }
+        psx_mod_write_half(p+0x364,1);cheat(ttk::Cheat::Inventory);assert(psx_mod_read_half(p+0x364)==1);  // held stays held
+        psx_mod_write_half(p+0x234,2500);psx_mod_write_half(p+0x364,3);
+        cheat(ttk::Cheat::Keys);assert(psx_mod_read_half(p+0x234)==2500 && psx_mod_read_half(p+0x364)==3);
+        cheat(ttk::Cheat::Weapons);assert(psx_mod_read_half(p+0x234)==2500);
+        psx_mod_write_half(p+0x234,armour);psx_mod_write_half(p+0x364,0);psx_mod_write_half(p+0x366,0);
+        std::puts("PASS: D08G4 dnstuff/dnitems/dninventory give full armour and stop running steroids (dose held); dnkeys/dnweapons unchanged");
+    }
+    psx_mod_write_half(0x800c3cc6,0);cheat(ttk::Cheat::God);assert(psx_mod_read_half(0x800c3cc6)==1);
+    cheat(ttk::Cheat::God);assert(psx_mod_read_half(0x800c3cc6)==0);
+    {
+        // D08Q4: god mode raises health to the type maximum (never lowers an
+        // Atomic Health surplus) and keeps an owned jetpack at the item cap.
+        const uint32_t saved_types=psx_mod_read_word(0x800d2660),most=0x801e8000+28*psx_mod_read_half(p+0x2c)+0xc;
+        const uint16_t saved_most=psx_mod_read_half(most),saved_health=psx_mod_read_half(p+0x32);
+        const uint16_t saved_jet=psx_mod_read_half(p+0x358),saved_fuel=psx_mod_read_half(p+0x35a);
+        psx_mod_write_word(0x800d2660,0x801e8000);psx_mod_write_half(most,10000);
+        assert(psx_mod_read_half(0x800c2716)==9000);
+        psx_mod_write_half(p+0x32,3000);psx_mod_write_half(p+0x358,1);psx_mod_write_half(p+0x35a,100);
+        cheat(ttk::Cheat::God);assert(psx_mod_read_half(p+0x32)==10000 && psx_mod_read_half(p+0x35a)==9000);
+        psx_mod_write_half(p+0x32,15000);psx_mod_write_half(p+0x35a,8983);cheat(ttk::Cheat::None);
+        assert(psx_mod_read_half(p+0x32)==15000 && psx_mod_read_half(p+0x35a)==9000);
+        psx_mod_write_half(p+0x358,0);psx_mod_write_half(p+0x35a,0);cheat(ttk::Cheat::None); // pack lost while on: given back
+        assert(psx_mod_read_half(p+0x358)==1 && psx_mod_read_half(p+0x35a)==9000);
+        psx_mod_write_half(p+0x358,1);cheat(ttk::Cheat::God);assert(psx_mod_read_half(0x800c3cc6)==0);
+        psx_mod_write_half(p+0x32,3000);psx_mod_write_half(p+0x35a,100);cheat(ttk::Cheat::None);
+        assert(psx_mod_read_half(p+0x32)==3000 && psx_mod_read_half(p+0x35a)==100);
+        // Turning god mode on gives a missing jetpack (owned bit, full fuel);
+        // the jetpack's on bit is untouched and turning it off keeps the pack.
+        psx_mod_write_half(p+0x358,0);psx_mod_write_half(p+0x35a,0);
+        cheat(ttk::Cheat::God);assert(psx_mod_read_half(0x800c3cc6)==1 && psx_mod_read_half(p+0x358)==1 && psx_mod_read_half(p+0x35a)==9000);
+        cheat(ttk::Cheat::God);assert(psx_mod_read_half(0x800c3cc6)==0 && psx_mod_read_half(p+0x358)==1);
+        // D08G3: upgrade bit on weapons 4,5,7,8,9,10 and the persistent mask only.
+        uint16_t saved_weapons[36];for(unsigned i=0;i<36;++i)saved_weapons[i]=psx_mod_read_half(p+0x2c4+4*i);
+        const uint8_t saved_mask=psx_mod_read_byte(p+0x85f);
+        uint16_t saved_ammo[36];for(unsigned i=0;i<36;++i)saved_ammo[i]=psx_mod_read_half(p+0x2c6+4*i);
+        for(unsigned i=0;i<36;++i){psx_mod_write_half(p+0x2c4+4*i,i==7||i==9?1:0);psx_mod_write_half(p+0x2c6+4*i,0);}
+        psx_mod_write_half(p+0x2c6+4*7,30000);psx_mod_write_half(p+0x2c6+4*9,5);psx_mod_write_half(p+0x2c6+4*27,7);
+        psx_mod_write_byte(p+0x85f,0x40);
+        cheat(ttk::Cheat::Upgrade);
+        for(unsigned i=0;i<36;++i) {
+            const bool up=i==4||i==5||i==7||i==8||i==9||i==10,owned=i==7||i==9||i==28||i==27;
+            assert(psx_mod_read_half(p+0x2c4+4*i)==((owned?1:0)|(up?8:0)));
+        }
+        // Owned Gatling carries ammo to 28 up to its capacity; a larger
+        // upgraded stock (27) is kept; the unowned RPG gives 29 nothing.
+        assert(psx_mod_read_half(p+0x2c6+4*28)==psx_mod_read_half(0x800c4594+44*28));
+        assert(psx_mod_read_half(p+0x2c6+4*27)==7 && psx_mod_read_half(p+0x2c6+4*29)==0);
+        assert(psx_mod_read_half(p+0x2c6+4*7)==30000 && psx_mod_read_byte(p+0x85f)==0x7f);
+        for(unsigned i=0;i<36;++i)psx_mod_write_half(p+0x2c6+4*i,saved_ammo[i]);
+        for(unsigned i=0;i<36;++i)psx_mod_write_half(p+0x2c4+4*i,saved_weapons[i]);psx_mod_write_byte(p+0x85f,saved_mask);
+        psx_mod_write_half(most,saved_most);psx_mod_write_word(0x800d2660,saved_types);psx_mod_write_half(p+0x32,saved_health);
+        psx_mod_write_half(p+0x358,saved_jet);psx_mod_write_half(p+0x35a,saved_fuel);
+        std::puts("PASS: D08Q4 god mode health/jetpack pin and jetpack grant, Atomic surplus kept, off resumes; D08G3 upgrade bits and mask");
+    }
+    {
+        // D08G8: every living state takes cheats (air 9, ladder 3, surface 4,
+        // underwater 5, jetpack 10, frozen); dead, a scripted scene and a busy
+        // guest stack refuse them.
+        const uint8_t mode=psx_mod_read_byte(p+0x22c),previous=psx_mod_read_byte(p+0x22d);
+        const uint32_t word=psx_mod_read_word(p),inhibit=psx_mod_read_word(p+0x224);
+        const uint16_t health=psx_mod_read_half(p+0x32);
+        psx_mod_write_half(0x800c3cc6,0);
+        for(unsigned m:{9u,3u,4u,5u,10u}) {
+            psx_mod_write_byte(p+0x22c,m);psx_mod_write_byte(p+0x22d,m);
+            cheat_calls.clear();cheat(ttk::Cheat::Weapons);assert((cheat_calls==std::vector<uint32_t>{0x8003d7bc}));
+            cheat(ttk::Cheat::God);assert(psx_mod_read_half(0x800c3cc6)==1);
+            cheat(ttk::Cheat::God);assert(psx_mod_read_half(0x800c3cc6)==0);
+        }
+        psx_mod_write_word(p,word|0x20000);cheat(ttk::Cheat::God);assert(psx_mod_read_half(0x800c3cc6)==1);
+        cheat(ttk::Cheat::God);psx_mod_write_word(p,word);
+        psx_mod_write_word(p,word|2);cheat_calls.clear();cheat(ttk::Cheat::Stuff);cheat(ttk::Cheat::God);
+        assert(cheat_calls.empty() && psx_mod_read_half(0x800c3cc6)==0);psx_mod_write_word(p,word);
+        psx_mod_write_half(p+0x32,0);cheat(ttk::Cheat::God);assert(psx_mod_read_half(0x800c3cc6)==0);psx_mod_write_half(p+0x32,health);
+        psx_mod_write_word(p+0x224,inhibit|0x20000000);cheat_calls.clear();cheat(ttk::Cheat::Stuff);
+        assert(cheat_calls.empty());psx_mod_write_word(p+0x224,inhibit);
+        ttk::pending_cheat=ttk::Cheat::Stuff;cheat_calls.clear();call(0x8005a210,p,0x800c2754,0x80041b34,0x80100000);
+        assert(cheat_calls.empty());
+        psx_mod_write_byte(p+0x22c,mode);psx_mod_write_byte(p+0x22d,previous);
+        std::puts("PASS: D08G8 cheats in air, ladder, swim, underwater, jetpack and frozen; refused dead, in a scene, off the guest stack");
+    }
+    psx_mod_write_word(0x800c27bc,2);cheat_calls.clear();cheat(ttk::Cheat::Stuff);assert(cheat_calls.empty());
+    psx_mod_write_word(0x800c27bc,1);ttk::input.active=false;cheat(ttk::Cheat::God);assert(psx_mod_read_half(0x800c3cc6)==0);ttk::input.active=true;
+    constexpr uint32_t table=0x801e1000,types=0x801e8000,enemy=0x801c0000,npc=0x801c0400;
+    psx_mod_write_word(0x800de720,table);psx_mod_write_word(0x800d2660,types);psx_mod_write_word(0x800c56a0,5);
+    psx_mod_write_byte(types+57*28+6,6);psx_mod_write_byte(types+167*28+6,8);
+    for(unsigned i=0;i<5;++i){for(unsigned j=0;j<48;++j)psx_mod_write_byte(table+i*48+j,0);psx_mod_write_word(table+i*48,57);}
+    psx_mod_write_word(table+4,enemy);psx_mod_write_word(table+20,1);
+    psx_mod_write_word(enemy,1);psx_mod_write_half(enemy+0x2c,57);psx_mod_write_half(enemy+0x32,1234);psx_mod_write_byte(enemy+0x15,6);
+    psx_mod_write_word(table+48,167);psx_mod_write_word(table+52,npc);psx_mod_write_word(table+68,1);
+    psx_mod_write_word(table+96+20,2); // dead stays dead
+    psx_mod_write_word(table+192+20,16); // scripted-disabled stays disabled
+    enemy_restore_actor=enemy;
+    cheat(ttk::Cheat::Monsters);
+    assert(psx_mod_read_word(table+4)==0 && psx_mod_read_word(table+20)==16);
+    assert(psx_mod_read_word(table+52)==npc && psx_mod_read_word(table+68)==1);
+    assert(psx_mod_read_word(table+96+20)==2 && psx_mod_read_word(table+144+20)==16);
+    cheat(ttk::Cheat::Monsters);
+    assert(psx_mod_read_word(table+4)==enemy && psx_mod_read_half(enemy+0x32)==1234);
+    assert(psx_mod_read_word(table+144+20)==0 && psx_mod_read_word(table+192+20)==16);
+    // Scene teardown clears host ownership; no writes into a recycled table.
+    cheat(ttk::Cheat::Monsters);call(0x8002b9f4,1,0,0x80025474);
+    writes=0;cheat(ttk::Cheat::Monsters); // all rows already inactive/dead/disabled
+    assert(psx_mod_read_word(table+20)==16);
+    psx_mod_write_half(p+0x32,fixture_health);
+    // Concealed apartment pickup is denied by dispatch, never by moving/deleting
+    // its object or changing the player's inventory. Exposed/other rooms fall through.
+    ground();psx_mod_write_word(0x800c27bc,1);psx_mod_write_word(0x800dd878,0);
+    constexpr uint32_t bed=0x801d6004,pickup=0x801dad64;
+    psx_mod_write_word(0x800d257c,bed);psx_mod_write_half(bed+0x2c,5);
+    psx_mod_write_byte(bed+0x34,11);psx_mod_write_byte(bed+0x2e,8);
+    psx_mod_write_half(pickup+0x2c,58);psx_mod_write_byte(pickup+0x34,0);
+    psx_mod_write_byte(pickup+0x15,1);psx_mod_write_byte(pickup+0x2e,8);
+    auto pickup_call=[&](uint32_t caller=0x8007fe6c){
+        CPUState cpu{};cpu.gpr[4]=p;cpu.gpr[5]=pickup;cpu.gpr[29]=0x801fff00;cpu.gpr[31]=caller;
+        hooks().at(0x80081a48)(&cpu,0x80081a48);return cpu.gpr[5];
+    };
+    const auto old_inventory=psx_mod_read_word(p+0x2c4+12*4);
+    auto denied=pickup_call();assert(denied!=pickup && psx_mod_read_half(denied+0x2c)==0xffff);
+    assert(psx_mod_read_half(pickup+0x2c)==58 && psx_mod_read_word(p+0x2c4+12*4)==old_inventory);
+    psx_mod_write_word(0x800dd878,0x400);assert(pickup_call()==pickup);
+    psx_mod_write_word(0x800dd878,0);psx_mod_write_byte(pickup+0x2e,51);assert(pickup_call()==pickup);
+    psx_mod_write_byte(pickup+0x2e,8);assert(pickup_call(0x8007fe68)==pickup);
+    ttk::modern=false;assert(pickup_call()==pickup);ttk::modern=true;
+    ttk::input.active=false;assert(pickup_call()==pickup);ttk::input.active=true;
+    auto pickup_code=psx_mod_read_word(0x80081a48);psx_mod_write_word(0x80081a48,pickup_code^1);
+    assert(pickup_call()==pickup);psx_mod_write_word(0x80081a48,pickup_code);
+    constexpr uint32_t sw=0x801d64e4,query_sp=0x801ffd00;
+    psx_mod_write_word(0x800d25b0,sw);psx_mod_write_half(sw+0x2c,595);psx_mod_write_byte(sw+0x34,24);
+    psx_mod_write_byte(sw+0x2e,psx_mod_read_byte(p+0x2e));
+    psx_mod_write_word(query_sp+0x84,0x80077fa4);psx_mod_write_word(query_sp+0xb0,0x800518c0);
+    psx_mod_write_half(c+12,0);psx_mod_write_half(c+16,4096);
+    for(unsigned j=0;j<3;++j)psx_mod_write_word(query_sp+0x58+4*j,psx_mod_read_word(p+4+4*j));
+    psx_mod_write_word(query_sp+0x58,psx_mod_read_word(p+4)+100);
+    psx_mod_write_word(query_sp+0x60,psx_mod_read_word(p+12)+400);
+    auto switch_query=[&](){
+        CPUState cpu{};cpu.gpr[4]=query_sp+0x18;cpu.gpr[5]=sw;cpu.gpr[6]=query_sp+0x38;
+        cpu.gpr[7]=query_sp+0x48;cpu.gpr[20]=p+0x1c;cpu.gpr[29]=query_sp;cpu.gpr[31]=0x80077e18;
+        writes=0;hooks().at(0x80076330)(&cpu,0x80076330);return writes;
+    };
+    assert(switch_query()>0 && psx_mod_read_word(query_sp+0x28)>psx_mod_read_word(query_sp+0x58));
+    psx_mod_write_word(query_sp+0x60,psx_mod_read_word(p+12)+900);assert(!switch_query());
+    psx_mod_write_word(query_sp+0x60,psx_mod_read_word(p+12)-400);assert(!switch_query());
+    psx_mod_write_word(query_sp+0x60,psx_mod_read_word(p+12)+400);
+    ttk::modern=false;assert(!switch_query());ttk::modern=true;
+    psx_mod_write_word(query_sp+0xb0,0x800518bc);assert(!switch_query());
+    psx_mod_write_word(query_sp+0xb0,0x800518c0);
+    psx_mod_write_word(0x800be570,1);assert(!switch_query()); // apartment level only
+    {
+        // D35N1/D35N2: a mirror (class 11, use flag 0x400000) behind furniture
+        // gets its first finder ray aimed through its centre up to 896 units,
+        // on any level; other objects, rooms, views and Vanilla are unchanged.
+        constexpr uint32_t table=0x801e8000,mirror=0x801d6600;
+        const uint32_t saved_table=psx_mod_read_word(0x800d2660);
+        psx_mod_write_word(0x800d2660,table);
+        psx_mod_write_word(table+28*750,0x80509002);psx_mod_write_byte(table+28*750+4,11);
+        psx_mod_write_word(table+28*751,0x80509002);psx_mod_write_byte(table+28*751+4,4);
+        psx_mod_write_half(mirror+0x2c,750);psx_mod_write_byte(mirror+0x2e,psx_mod_read_byte(p+0x2e));
+        auto mirror_query=[&](){
+            for(unsigned j=0;j<3;++j)psx_mod_write_word(query_sp+0x28+4*j,psx_mod_read_word(p+4+4*j));
+            CPUState cpu{};cpu.gpr[4]=query_sp+0x18;cpu.gpr[5]=mirror;cpu.gpr[6]=query_sp+0x38;
+            cpu.gpr[7]=query_sp+0x48;cpu.gpr[20]=p+0x1c;cpu.gpr[29]=query_sp;cpu.gpr[31]=0x80077e18;
+            writes=0;hooks().at(0x80076330)(&cpu,0x80076330);return writes;
+        };
+        psx_mod_write_word(query_sp+0x58,psx_mod_read_word(p+4)+100);
+        psx_mod_write_word(query_sp+0x60,psx_mod_read_word(p+12)+700);
+        assert(mirror_query()>0 && int32_t(psx_mod_read_word(query_sp+0x30))>int32_t(psx_mod_read_word(query_sp+0x60)));
+        psx_mod_write_word(0x800be570,0);assert(mirror_query()>0);psx_mod_write_word(0x800be570,1);
+        psx_mod_write_word(query_sp+0x60,psx_mod_read_word(p+12)+950);assert(!mirror_query());
+        psx_mod_write_word(query_sp+0x60,psx_mod_read_word(p+12)-700);assert(!mirror_query());
+        psx_mod_write_word(query_sp+0x60,psx_mod_read_word(p+12)+700);
+        psx_mod_write_byte(mirror+0x2e,psx_mod_read_byte(p+0x2e)+1);assert(!mirror_query());
+        psx_mod_write_byte(mirror+0x2e,psx_mod_read_byte(p+0x2e));
+        psx_mod_write_half(mirror+0x2c,751);assert(!mirror_query());psx_mod_write_half(mirror+0x2c,750);
+        psx_mod_write_word(table+28*750,0x80109002);assert(!mirror_query());psx_mod_write_word(table+28*750,0x80509002);
+        ttk::modern=false;assert(!mirror_query());ttk::modern=true;
+        psx_mod_write_word(query_sp+0xb0,0x800518bc);assert(!mirror_query());psx_mod_write_word(query_sp+0xb0,0x800518c0);
+        psx_mod_write_word(0x800c27bc,2);assert(!mirror_query());psx_mod_write_word(0x800c27bc,1);
+        assert(mirror_query()>0);
+        psx_mod_write_word(0x800d2660,saved_table);psx_mod_write_word(0x800be570,0);
+    }
+    {
+        // D08A4: a steroids pickup (type 638) is held instead of run. The
+        // original case writes the full amount and bit 1; at its sound call
+        // (ra 0x800828d8) bit 1 goes back off and bit 0 on. Held: the next
+        // pickup is left on the ground. Running: the original refresh.
+        constexpr uint32_t pills=0x801dae00;psx_mod_write_half(pills+0x2c,638);
+        psx_mod_write_half(p+0x364,0);psx_mod_write_half(p+0x366,0);
+        auto touch=[&](uint32_t caller=0x8007fe6c){
+            CPUState cpu{};cpu.gpr[4]=p;cpu.gpr[5]=pills;cpu.gpr[29]=0x801fff00;cpu.gpr[31]=caller;
+            hooks().at(0x80081a48)(&cpu,0x80081a48);return cpu.gpr[5];
+        };
+        auto original_case=[&](uint32_t sound_ra=0x800828d8){
+            psx_mod_write_half(p+0x366,psx_mod_read_half(0x800c2722));psx_mod_write_half(p+0x364,psx_mod_read_half(p+0x364)|2);
+            CPUState cpu{};cpu.gpr[17]=p;cpu.gpr[29]=0x801fff00;cpu.gpr[31]=sound_ra;
+            hooks().at(0x8006b73c)(&cpu,0x8006b73c);
+        };
+        assert(psx_mod_read_half(0x800c2722)==9000);
+        assert(touch()==pills);original_case();
+        assert(psx_mod_read_half(p+0x364)==1 && psx_mod_read_half(p+0x366)==9000);
+        auto left=touch();assert(left!=pills && psx_mod_read_half(left+0x2c)==0xffff && psx_mod_read_half(p+0x364)==1);
+        psx_mod_write_half(p+0x364,3);psx_mod_write_half(p+0x366,100);
+        assert(touch()==pills);original_case();assert(psx_mod_read_half(p+0x364)==1 && psx_mod_read_half(p+0x366)==9000);  // D08A15: run stops, held
+        psx_mod_write_half(p+0x364,2);psx_mod_write_half(p+0x366,100);  // dnhyper run
+        assert(touch()==pills);original_case();assert(psx_mod_read_half(p+0x364)==1 && psx_mod_read_half(p+0x366)==9000);
+        psx_mod_write_half(p+0x364,0);
+        assert(touch(0x8007fe68)==pills);original_case();assert(psx_mod_read_half(p+0x364)==2); // other caller
+        psx_mod_write_half(p+0x364,0);
+        assert(touch()==pills);original_case(0x800936e8);assert(psx_mod_read_half(p+0x364)==2); // other sound call
+        psx_mod_write_half(p+0x364,0);psx_mod_write_half(pills+0x2c,580);
+        assert(touch()==pills);original_case();assert(psx_mod_read_half(p+0x364)==2); // not steroids
+        psx_mod_write_half(p+0x364,0);psx_mod_write_half(pills+0x2c,638);
+        ttk::modern=false;assert(touch()==pills);original_case();assert(psx_mod_read_half(p+0x364)==2);ttk::modern=true;
+        psx_mod_write_half(p+0x364,0);psx_mod_write_half(p+0x366,0);
+        std::puts("PASS: D08A4 steroids pickup held at the original sound call; held leaves it, running stops and is held full (D08A15); caller/sound/type/Vanilla fallbacks");
+    }
+    {
+        // D08A13: at Duke's damage handler (0x800a40a8) running steroids lose
+        // bit 1 for that call only, so the original's shield (0x800a4154: take
+        // 1500, no damage) is skipped and the timer is left alone; the next
+        // hook (Duke's update 0x800412a4 here) puts the bit back.
+        auto damage=[&](uint32_t victim){CPUState cpu{};cpu.gpr[4]=victim;cpu.gpr[29]=0x801fff00;hooks().at(0x800a40a8)(&cpu,0x800a40a8);};
+        auto update=[&]{CPUState cpu{};cpu.gpr[4]=p;cpu.gpr[29]=0x801fff00;hooks().at(0x800412a4)(&cpu,0x800412a4);};
+        auto flags=[&]{return psx_mod_read_half(p+0x364);};
+        psx_mod_write_half(p+0x364,3);psx_mod_write_half(p+0x366,4000);
+        damage(p);assert(flags()==1 && psx_mod_read_half(p+0x366)==4000);
+        assert(std::strstr(ttk::controls_debug_json(),"\"damage_hidden\":true"));
+        damage(p);assert(flags()==1);  // a second hit: off again for its own call
+        update();assert(flags()==3 && psx_mod_read_half(p+0x366)==4000);
+        assert(std::strstr(ttk::controls_debug_json(),"\"damage_hidden\":false"));
+        psx_mod_write_half(p+0x364,2);damage(p);assert(flags()==0);update();assert(flags()==2);  // dnhyper
+        damage(p);psx_mod_write_half(p+0x366,0);update();assert(flags()==0);  // ended meanwhile: stays off
+        psx_mod_write_half(p+0x366,4000);psx_mod_write_half(p+0x364,3);
+        damage(0x801d0000);assert(flags()==3);  // another victim
+        psx_mod_write_half(p+0x364,1);damage(p);assert(flags()==1);update();assert(flags()==1);  // held, not running
+        psx_mod_write_half(p+0x364,3);ttk::modern=false;damage(p);assert(flags()==3);ttk::modern=true;  // Vanilla
+        psx_mod_write_half(p+0x364,0);psx_mod_write_half(p+0x366,0);
+        std::puts("PASS: D08A13 damage handler skips the steroid shield (timer untouched, bit 1 back at the next hook); dnhyper, expiry, other victim, held, Vanilla");
+    }
+    {
+        // D08A14: while Duke is dead (word 0 bit 1, health 0) the next hook
+        // clears steroids, running or held; alive, Vanilla and other bits stay.
+        // Any shared hook will do (hook_body); 0x8001fc44 is the view composition's.
+        auto update=[&]{CPUState cpu{};cpu.gpr[29]=0x801fff00;cpu.gpr[31]=0x800265a4;hooks().at(0x8001fc44)(&cpu,0x8001fc44);};
+        auto flags=[&]{return psx_mod_read_half(p+0x364);};
+        const uint32_t word0=psx_mod_read_word(p);const uint16_t health=psx_mod_read_half(p+0x32);
+        psx_mod_write_half(p+0x32,700);psx_mod_write_half(p+0x364,3);psx_mod_write_half(p+0x366,4000);
+        update();assert(flags()==3 && psx_mod_read_half(p+0x366)==4000);  // alive
+        psx_mod_write_word(p,word0|2);psx_mod_write_half(p+0x32,0);
+        ttk::modern=false;update();assert(flags()==3);ttk::modern=true;  // Vanilla keeps them
+        update();assert(flags()==0 && psx_mod_read_half(p+0x366)==0);  // running dose
+        psx_mod_write_half(p+0x364,2);psx_mod_write_half(p+0x366,4000);update();assert(flags()==0);  // dnhyper
+        psx_mod_write_half(p+0x364,0x8001);psx_mod_write_half(p+0x366,9000);update();  // held: lost, other bits kept
+        assert(flags()==0x8000 && psx_mod_read_half(p+0x366)==0);
+        assert(std::strstr(ttk::controls_debug_json(),"\"death_clears\":3"));
+        psx_mod_write_word(p,word0);psx_mod_write_half(p+0x32,health);psx_mod_write_half(p+0x364,0);
+        std::puts("PASS: D08A14 death clears steroids (dose, dnhyper, held); alive and Vanilla keep them");
+    }
+    {
+        // D08A12: a drawn dynamite (+0x3b8 = 0x0e02) stays unlit at the
+        // held-throwable handler 0x8004dea4: fuse held full (0x800c4ed8),
+        // this call's sparks (ra 0x8004e138) dark and sizzle (ra 0x8004e154)
+        // refused; a request or the released holster button stows it like
+        // the Holy Hand Grenade. Cross down lights it, and the original runs
+        // from then on until the stick leaves the hand.
+        const uint32_t cross_slot=psx_mod_read_word(0x800d1b50),holster_slot=psx_mod_read_word(0x800d1a90);
+        const uint32_t cross=0x801e2000,holster=0x801e2010;
+        psx_mod_write_word(0x800d1b50,cross);psx_mod_write_word(0x800d1a90,holster);
+        const uint8_t index=psx_mod_read_byte(p+0x233);psx_mod_write_byte(p+0x233,0);
+        const uint16_t lower=psx_mod_read_half(p+0x60);psx_mod_write_half(p+0x60,63);
+        const uint32_t flags0=psx_mod_read_word(p+0x224);
+        const uint16_t full=psx_mod_read_half(0x800c4ed8);assert(full==4000);
+        auto handler=[&](uint32_t who){CPUState cpu{};cpu.gpr[4]=who;cpu.gpr[29]=0x801fff00;cpu.gpr[31]=0x8004f608;hooks().at(0x8004dea4)(&cpu,0x8004dea4);};
+        auto sparks=[&](uint32_t ra){CPUState cpu{};cpu.gpr[4]=6;cpu.gpr[6]=0xff;cpu.gpr[29]=0x801fff00;cpu.gpr[31]=ra;hooks().at(0x8006d594)(&cpu,0x8006d594);return cpu.gpr[6];};
+        auto sizzle=[&](uint32_t ra){CPUState cpu{};cpu.gpr[4]=0x101d;cpu.gpr[29]=0x801fff00;cpu.gpr[31]=ra;hooks().at(0x8006b270)(&cpu,0x8006b270);return cpu.gpr[4];};
+        auto other_hook=[&]{CPUState cpu{};cpu.gpr[29]=0x801fff00;cpu.gpr[31]=0x800265a4;hooks().at(0x8001fc44)(&cpu,0x8001fc44);};
+        auto stick=[&](uint32_t flags,uint32_t cross_word,uint32_t holster_word){
+            psx_mod_write_half(p+0x3b8,0x0e02);psx_mod_write_word(p+0x224,flags);psx_mod_write_word(p+0x250,1234);
+            psx_mod_write_word(cross,cross_word);psx_mod_write_word(holster,holster_word);
+            psx_mod_write_half(p+0x74,39);psx_mod_write_half(p+0x7c,5);psx_mod_write_half(p+0x7e,0);writes=0;
+        };
+        auto stowed=[&]{return psx_mod_read_half(p+0x74)==0x28 && psx_mod_read_half(p+0x7c)==0 && psx_mod_read_half(p+0x7e)==1;};
+        // Unlit and idle: fuse full, quiet, no stow; only the handler's own calls are quieted.
+        stick(0,0,0);handler(p);
+        assert(psx_mod_read_word(p+0x250)==full && psx_mod_read_half(p+0x74)==39);
+        assert(sparks(0x8004e138)==0 && sizzle(0x8004e154)==0xffffffffu);
+        assert(sparks(0x8004e6d0)==0xff && sizzle(0x8004e0d8)==0x101d);
+        // A weapon request or a released holster button stows it (anim 40 backwards).
+        stick(4,0,0);handler(p);assert(stowed() && psx_mod_read_word(p+0x250)==full);
+        stick(0,0,2);handler(p);assert(stowed());
+        stick(0x200,0,2);handler(p);assert(psx_mod_read_half(p+0x74)==39);  // 0x4241 blocks the button, as at 0x8004e1c0
+        stick(0,0,3);handler(p);assert(psx_mod_read_half(p+0x74)==39);      // still held: not yet
+        // Cross down where 0x8004dc74 would charge lights it: full fuse from the press, original from then on.
+        stick(4,1,0);handler(p);
+        assert(psx_mod_read_word(p+0x250)==full && psx_mod_read_half(p+0x74)==39);
+        assert(sparks(0x8004e138)==0xff && sizzle(0x8004e154)==0x101d);
+        assert(std::strstr(ttk::controls_debug_json(),"\"lit\":true"));
+        psx_mod_write_word(p+0x250,1234);psx_mod_write_word(cross,0);handler(p);
+        assert(psx_mod_read_word(p+0x250)==1234 && psx_mod_read_half(p+0x74)==39);  // burning, no stow
+        other_hook();handler(p);assert(psx_mod_read_word(p+0x250)==1234);         // still in hand: still lit
+        // Stowed or exploded (the hand empties outside a throw): the next stick
+        // starts unlit and none is queued.
+        psx_mod_write_half(p+0x3b8,0);other_hook();
+        assert(std::strstr(ttk::controls_debug_json(),"\"lit\":false,\"redraw\":false"));
+        // Thrown (the hand empties during throw animations 41-46): the next stick is queued.
+        stick(0,0,0);other_hook();psx_mod_write_half(p+0x74,41);psx_mod_write_half(p+0x3b8,0);other_hook();
+        assert(std::strstr(ttk::controls_debug_json(),"\"redraw\":true"));
+        setenv("DNTTK_DYNAMITE","original",1);stick(0,0,0);other_hook();psx_mod_write_half(p+0x74,42);psx_mod_write_half(p+0x3b8,0);other_hook();
+        assert(std::strstr(ttk::controls_debug_json(),"\"redraw\":false"));unsetenv("DNTTK_DYNAMITE");
+        // A charge already running (+0x224 bit 8) lights it even with Cross up.
+        stick(0x100,0,0);handler(p);assert(sparks(0x8004e138)==0xff);psx_mod_write_half(p+0x3b8,0);other_hook();
+        stick(0,0,0);handler(p);assert(psx_mod_read_word(p+0x250)==full);
+        // Cross in the charge's reset state (+0x224 bit 5) or with 0x241 set does not light it.
+        stick(0x20,1,0);handler(p);assert(sparks(0x8004e138)==0);
+        stick(0x40,1,0);handler(p);assert(sparks(0x8004e138)==0);
+        // Other actors, other weapons, Original and Vanilla: untouched.
+        stick(4,0,0);handler(0x801d0000);assert(writes==0);
+        stick(4,0,0);psx_mod_write_half(p+0x3b8,0x0d02);writes=0;handler(p);assert(writes==0);
+        setenv("DNTTK_DYNAMITE","original",1);stick(4,0,0);handler(p);assert(writes==0 && sparks(0x8004e138)==0xff);unsetenv("DNTTK_DYNAMITE");
+        ttk::modern=false;stick(4,0,0);handler(p);assert(writes==0 && sizzle(0x8004e154)==0x101d);ttk::modern=true;
+        psx_mod_write_half(p+0x3b8,0);psx_mod_write_word(p+0x224,flags0);psx_mod_write_word(p+0x250,0);
+        psx_mod_write_half(p+0x74,0);psx_mod_write_half(p+0x7c,0);psx_mod_write_half(p+0x7e,0);
+        psx_mod_write_half(p+0x60,lower);psx_mod_write_byte(p+0x233,index);
+        psx_mod_write_word(0x800d1b50,cross_slot);psx_mod_write_word(0x800d1a90,holster_slot);
+        other_hook();
+        std::puts("PASS: D08A12 dynamite unlit until Cross (fuse full, sparks dark, sizzle refused), request/holster stow, lit runs original until it leaves the hand; reset/0x241, other actor/weapon, Original and Vanilla untouched");
+    }
+    {
+        // D08A9: a gadget the dispatcher grants (bit 0, full amount) or
+        // refills becomes the selection when its caller resumes (0x8001ca4c,
+        // ra 0x8007fe78); keys, full items and other callers leave it, and a
+        // gadget mid-activation makes it wait for the next item poll.
+        constexpr uint32_t box=0x801dae00;psx_mod_write_half(box+0x2c,560);
+        for(unsigned i=1;i<=5;++i){psx_mod_write_half(p+0x354+4*i,0);psx_mod_write_half(p+0x356+4*i,0);}
+        psx_mod_write_half(p+0x368,1);psx_mod_write_half(p+0x36a,100);psx_mod_write_half(0x800c3f94,5);
+        const uint16_t health=psx_mod_read_half(p+0x32);psx_mod_write_half(p+0x32,10000);
+        auto poll=[&]{psx_mod_write_word(p+0x224,0);call(0x80058120,p,0,0x80041c44,0x801ff000);};
+        poll();assert(psx_mod_read_half(0x800c3f94)==5);
+        auto pickup=[&](unsigned item,uint16_t amount,uint32_t ra=0x8007fe78,uint32_t caller=0x8007fe6c){
+            CPUState cpu{};cpu.gpr[4]=p;cpu.gpr[5]=box;cpu.gpr[29]=0x801fff00;cpu.gpr[31]=caller;
+            hooks().at(0x80081a48)(&cpu,0x80081a48);
+            if(item){psx_mod_write_half(p+0x354+4*item,psx_mod_read_half(p+0x354+4*item)|1);psx_mod_write_half(p+0x356+4*item,amount);}
+            CPUState after{};after.gpr[29]=0x801fff00;after.gpr[31]=ra;hooks().at(0x8001ca4c)(&after,0x8001ca4c);
+            return psx_mod_read_half(0x800c3f94);
+        };
+        assert(pickup(2,13500)==2);                       // new Bio Mask
+        assert(pickup(0,0)==2);                           // a key: nothing granted
+        assert(pickup(5,10000)==5);                       // medkit refill (100 -> full)
+        assert(pickup(2,13500)==5);                       // full Bio Mask: the original refuses it
+        assert(pickup(1,9000,0x800376b4)==5);             // other return: not a pickup
+        psx_mod_write_half(p+0x358,0);
+        assert(pickup(1,9000,0x8007fe78,0x8007fe68)==5);  // other caller
+        psx_mod_write_half(p+0x358,0);
+        psx_mod_write_half(p+0x35c,0x8001);               // Bio Mask mid-activation
+        assert(pickup(3,18000)==5);poll();assert(psx_mod_read_half(0x800c3f94)==5);
+        psx_mod_write_half(p+0x35c,1);poll();assert(psx_mod_read_half(0x800c3f94)==3);
+        ttk::modern=false;assert(pickup(1,9000)==3);ttk::modern=true;
+        // D08A33 EQUIP PICKUPS: NEVER leaves a new gadget unselected.
+        psx_mod_write_half(p+0x358,0);psx_mod_write_half(0x800c3f94,3);
+        setenv("DNTTK_EQUIP_PICKUPS","never",1);assert(pickup(1,9000)==3);unsetenv("DNTTK_EQUIP_PICKUPS");
+        // IF NEW draws a weapon whose owned bit 0 the dispatcher set, through
+        // the number keys' request (+0x3ba, flag 4); owned weapons (ammo),
+        // NEVER, Vanilla and a waiting draw past its window do not.
+        {
+            const uint16_t gat0=psx_mod_read_half(p+0x2c4+4*7),gat_ammo=psx_mod_read_half(p+0x2c6+4*7);
+            ttk::input={};ttk::input.active=true;ttk::input.sequence=20000;ttk::input.epoch=200;
+            psx_mod_write_word(p,0);psx_mod_write_half(p+0x60,63);psx_mod_write_half(p+0x74,5);
+            psx_mod_write_byte(p+0x22c,0);psx_mod_write_byte(p+0x22d,0);
+            psx_mod_write_byte(p+0x3b8,2);psx_mod_write_byte(p+0x3b9,4);psx_mod_write_byte(p+0x3ba,4);
+            call(0x8003ade4,c,p,0x80025ee8);
+            auto weapon_pickup=[&](unsigned slot,bool grant){
+                CPUState cpu{};cpu.gpr[4]=p;cpu.gpr[5]=box;cpu.gpr[29]=0x801fff00;cpu.gpr[31]=0x8007fe6c;
+                hooks().at(0x80081a48)(&cpu,0x80081a48);
+                if(grant)psx_mod_write_half(p+0x2c4+4*slot,psx_mod_read_half(p+0x2c4+4*slot)|1);
+                psx_mod_write_half(p+0x2c6+4*slot,50);
+                CPUState after{};after.gpr[29]=0x801fff00;after.gpr[31]=0x8007fe78;hooks().at(0x8001ca4c)(&after,0x8001ca4c);
+            };
+            auto drawn=[&](unsigned slot){
+                psx_mod_write_byte(p+0x3ba,4);poll();
+                return (psx_mod_read_word(p+0x224)&4) && psx_mod_read_byte(p+0x3ba)==slot;
+            };
+            psx_mod_write_half(p+0x2c4+4*7,0);
+            weapon_pickup(7,true);assert(drawn(7));                     // new Gatling gun
+            assert(!drawn(7));                                          // once only
+            weapon_pickup(7,false);assert(!drawn(7));                   // owned: ammo only
+            psx_mod_write_half(p+0x2c4+4*7,0);
+            setenv("DNTTK_EQUIP_PICKUPS","never",1);weapon_pickup(7,true);assert(!drawn(7));unsetenv("DNTTK_EQUIP_PICKUPS");
+            psx_mod_write_half(p+0x2c4+4*7,0);
+            ttk::modern=false;weapon_pickup(7,true);ttk::modern=true;assert(!drawn(7));
+            // Fire held at the pickup: the draw waits, then comes after release.
+            psx_mod_write_half(p+0x2c4+4*7,0);weapon_pickup(7,true);
+            ttk::input.held[ttk::fire]=true;assert(!drawn(7));
+            ttk::input.held[ttk::fire]=false;assert(drawn(7));
+            // Mid-attack (upper 30) for longer than the window: dropped.
+            psx_mod_write_half(p+0x2c4+4*7,0);weapon_pickup(7,true);
+            psx_mod_write_half(p+0x74,30);for(int i=0;i<70;++i)assert(!drawn(7));
+            psx_mod_write_half(p+0x74,5);assert(!drawn(7));
+            // The player's own weapon key drops a waiting draw.
+            psx_mod_write_half(p+0x2c4+4*7,0);weapon_pickup(7,true);
+            ttk::input.held[ttk::fire]=true;assert(!drawn(7));ttk::input.held[ttk::fire]=false;
+            ttk::input.commands[0]=ttk::weapon_group_2;ttk::input.command_count=1;++ttk::input.command_serial;
+            psx_mod_write_word(p+0x224,0);call(0x80058120,p,0,0x80041c44,0x801ff000);
+            assert(psx_mod_read_byte(p+0x3ba)!=7);ttk::input.command_count=0;
+            assert(!drawn(7));
+            assert(std::strstr(ttk::controls_debug_json(),"\"weapon_draws\":2,"));
+            psx_mod_write_half(p+0x2c4+4*7,gat0);psx_mod_write_half(p+0x2c6+4*7,gat_ammo);psx_mod_write_word(p+0x224,0);
+        }
+        for(unsigned i=1;i<=5;++i){psx_mod_write_half(p+0x354+4*i,0);psx_mod_write_half(p+0x356+4*i,0);}
+        psx_mod_write_half(p+0x32,health);
+        std::puts("PASS: D08A9 picked-up gadget selected (grant, refill), keys/full/other return/other caller/Vanilla keep it, waits for an activation");
+        std::puts("PASS: D08A33 EQUIP PICKUPS: IF NEW draws a new weapon once (after fire is let go), owned weapon/ammo, NEVER, Vanilla, a missed window and a weapon key do not; NEVER leaves gadgets unselected");
+    }
+    std::puts("PASS: bounded switch query, model-centre ray, reach/cone/parent/Vanilla fallbacks");
+    std::puts("PASS: concealed pickup, exposed/other-room/Vanilla/actor/caller/code fallbacks; inventory preserved");
+    std::puts("PASS: typed cheat grants/toggles, context guards, hostile/NPC separation, health restoration and scene ownership reset");
+    std::puts("PASS: standing takeoff, six directions, release latch, clearance rotation, once-only impulse and interruption guards");
+    for(int rejection=0;rejection<7;++rejection) {
+        ground();psx_mod_write_half(p+0x60,76);ttk::input.move_y=1;ttk::input.move_x=0;
+        call(0x8003ade4,c,p,0x80025ee8);
+        psx_mod_write_half(p+0x60,108);psx_mod_write_byte(p+0x22c,9);
+        psx_mod_write_word(p+0x174,0);psx_mod_write_word(p+0x20c,0);
+        psx_mod_write_word(p+0x1c4,383);psx_mod_write_word(p+0x1f8,100);
+        terrain_result=0;terrain_floor=383;clearance_result=2048;
+        ttk::jump_pending=true;unsigned before=edge_launches;
+        if(rejection==1)ttk::input.sequence+=7;
+        if(rejection==2)++ttk::input.epoch;
+        if(rejection==3)psx_mod_write_word(p+0x1c4,2048);
+        if(rejection==4)clearance_result=500;
+        if(rejection==5)terrain_result=1;
+        if(rejection==6)psx_mod_write_word(p+0x1f8,-100);
+        call(0x8005a210,p,0x800c2754,0x80041b34,0x801fff00);
+        if(edge_launches!=before+(rejection==0))std::fprintf(stderr,"edge fixture rejection=%d launches=%u before=%u controls=%s pending=%d\n",rejection,edge_launches,before,ttk::controls_debug_json(),ttk::jump_pending);
+        assert(edge_launches==before+(rejection==0));
+        if(!rejection) {
+            assert(!ttk::jump_pending && psx_mod_read_half(p+0x60)==98);
+            ttk::jump_pending=true;call(0x8005a210,p,0x800c2754,0x80041b34,0x801fff00);
+            assert(edge_launches==before+1); // no second impulse
+        }
+    }
+    // Crystal-2 turret wade: depth 0x100, water flagged, walk/turn clips.
+    // Original 8005201c only free-swims at ≥0x281; anim 70 is a turn.
+    psx_mod_write_half(p+0x60,63);psx_mod_write_byte(p+0x22c,0);psx_mod_write_byte(p+0x22d,0);
+    psx_mod_write_word(p+0x224,0);psx_mod_write_word(p+0x20c,0x33000);
+    psx_mod_write_word(p+0x834,(uint32_t)-6144);psx_mod_write_word(p+0x1c8,(uint32_t)-5888);
+    ttk::input.active=true;++ttk::input.sequence;
+    call(0x8003ade4,c,p,0x80025ee8);assert(ttk::movement_ready() && !ttk::swim_input_ready());
+    psx_mod_write_half(p+0x60,70);++ttk::input.sequence;
+    call(0x8003ade4,c,p,0x80025ee8);
+    assert(ttk::movement_ready() && ttk::locomotion_input_ready() && !ttk::swim_input_ready());
+    psx_mod_write_half(p+0x60,71);++ttk::input.sequence;
+    call(0x8003ade4,c,p,0x80025ee8);
+    assert(ttk::movement_ready() && !ttk::swim_input_ready());
+    ttk::want_capture=true;const auto wade_offers=ttk::capture_offers;
+    call(0x8005a210,p,0x800c2754,0x80041b34);
+    assert(ttk::capture_offers==wade_offers+1); // Escape recapture without walk gait
+    psx_mod_write_half(0x800be568,1);call(0x8005a210,p,0x800c2754,0x80041b34);
+    assert(ttk::capture_offers==wade_offers+1);
+    psx_mod_write_half(0x800be568,0);ttk::want_capture=false;
+    ttk::running=true;ttk::input.move_x=1;ttk::input.move_y=0;
+    psx_mod_write_half(p+0x60,71);
+    call(0x80048410,p,0,0x8004b634);
+    assert(psx_mod_read_half(p+0x60)==76); // tank turn becomes land run
+    ttk::running=false;ttk::input.move_x=0;
+    psx_mod_write_word(p+0x834,0x40000000);psx_mod_write_word(p+0x20c,0);
+    psx_mod_write_half(p+0x60,63);++ttk::input.sequence;
+    call(0x8003ade4,c,p,0x80025ee8);assert(ttk::movement_ready());
+    std::puts("PASS: turret-wade land lease, anim-70/71 run, Escape recapture");
+    // D08AC: authenticated mid-water gaits use the land dispatcher without
+    // removing the water mask or changing floor/position/velocity. Native
+    // swimming, Original, Vanilla, foreign callers and changed code stay out.
+    {
+        const auto saved=ttk::input;
+        uint8_t body[0x8a4];for(unsigned i=0;i<sizeof body;++i)body[i]=psx_mod_read_byte(p+i);
+        for(int test=0;test<8;++test) {
+            for(unsigned i=0;i<sizeof body;++i)psx_mod_write_byte(p+i,body[i]);
+            ttk::input=saved;ttk::input.active=true;ttk::input.move_x=0;ttk::input.move_y=1;
+            ttk::input.held[ttk::crouch]=false;ttk::input.held[ttk::original_aim]=false;
+            psx_mod_write_word(p+0x224,0);psx_mod_write_word(p,0);
+            psx_mod_write_half(p+0x60,80);psx_mod_write_half(p+0x68,0);
+            psx_mod_write_byte(p+0x22c,test==2?4:test==3?5:1);psx_mod_write_byte(p+0x22d,1);
+            psx_mod_write_word(p+0x834,-512);psx_mod_write_word(p+0x1c8,test==1?288:0);
+            psx_mod_write_word(p+0x20c,0x3b800);
+            if(test==4)setenv("DNTTK_SWIMMING","original",1);
+            if(test==5)ttk::modern=false;
+            if(test==7)poke(0x5492c);
+            call(0x800493a4,p,0,test==6?0x8005a3a4:0x8005a3a0);
+            assert(psx_mod_read_half(p+0x60)==(test==0?(ttk::input_running()?76:72):80));
+            assert(psx_mod_read_byte(p+0x22c)==(test==0?0:test==2?4:test==3?5:1));
+            assert(psx_mod_read_word(p+0x20c)==0x3b800 && int32_t(psx_mod_read_word(p+0x834))==-512);
+            for(unsigned o:{4u,8u,12u,0x1f4u,0x1f8u,0x1fcu})
+                for(unsigned i=0;i<4;++i)assert(psx_mod_read_byte(p+o+i)==body[o+i]);
+            if(test==7)poke(0x5492c);
+            ttk::modern=true;unsetenv("DNTTK_SWIMMING");
+        }
+        ttk::input.active=true;ttk::input.move_y=1;
+        ttk::input.held[ttk::original_aim]=ttk::input.held[ttk::crouch]=false;
+        psx_mod_write_word(p,0);psx_mod_write_word(p+0x224,0);
+        psx_mod_write_word(p+0x834,-512);psx_mod_write_word(p+0x1c8,0);
+        psx_mod_write_word(p+0x20c,0x3b800);
+        psx_mod_write_half(p+0x60,72);psx_mod_write_byte(p+0x22c,0);psx_mod_write_byte(p+0x22d,0);
+        call(0x8003ade4,c,p,0x80025ee8);
+        call(0x80048410,p,0,0x8004b634,0x801ff000);
+        assert(psx_mod_read_word(0x8004866c)==0x10000332);
+        assert(psx_mod_read_word(0x80054964)==0);
+        psx_mod_write_word(0x801feffc,0x8004b634);
+        call(0x800780b4,0,0,0,0x801fefc0); // nested hook restores, checks, reapplies
+        assert(psx_mod_read_word(0x8004866c)==0x10000332);
+        ttk::modern=false;call(0x80058120,p,0,0x80041c44,0x801ff010);
+        assert(psx_mod_read_word(0x8004866c)==0x10400332);
+        assert(psx_mod_read_word(0x80054964)==0x10400060);
+        ttk::modern=true;
+        psx_mod_write_word(p+0x838,640);
+        for(int depth:{640,641}) {
+            psx_mod_write_word(p+0x834,-depth);psx_mod_write_half(p+0x60,98);
+            psx_mod_write_byte(p+0x22c,9);psx_mod_write_byte(p+0x22d,9);
+            call(0x80055e80,p,0,0x8005a4f8,0x801ff000);
+            assert(psx_mod_read_word(0x80056240)==(depth==640?0x1000005cu:0x1040005cu));
+            call(0x80058120,p,0,0x80041c44,0x801ff010);
+            assert(psx_mod_read_word(0x80056240)==0x1040005c);
+        }
+        psx_mod_write_word(p+0x834,-640);psx_mod_write_half(p+0x60,98);
+        psx_mod_write_byte(p+0x22c,9);psx_mod_write_byte(p+0x22d,9);
+        call(0x80048410,p,0,0x8004b634,0x801ff000);
+        assert(psx_mod_read_word(0x80054cbc)==0x1000000a);
+        assert(ttk::player_identity_ready()); // collision/aim plugins see owned code
+        psx_mod_write_code_word(0x80054964,0); // known substitution, but not owned in this scope
+        assert(!ttk::player_identity_ready());
+        psx_mod_write_code_word(0x80054964,0x10400060);
+        poke(0x54c04);assert(!ttk::player_identity_ready());poke(0x54c04);
+        assert(ttk::player_identity_ready());
+        // A real floor/water change during collision must release the shallow
+        // landing rule before the native selector reads the volume depth.
+        psx_mod_write_word(0x801feffc,0x8004b634);psx_mod_write_word(p+0x834,-800);
+        call(0x8006b270,0x3001,p+4,0x80054cb0,0x801fef80);
+        assert(psx_mod_read_word(0x80054cbc)==0x1440000a);
+        assert(psx_mod_read_word(p+0x20c)==0x3b800);
+        // D08AE: cached support at the surface must not suppress native
+        // deep entry. Also release an already armed shallow scope when the
+        // native query refreshes only the volume (the support stays stale).
+        for(unsigned target:{0x80055e80u,0x80048410u})for(int volume:{640,641,3072,5120}) {
+            const bool transition=target==0x80055e80;
+            const uint32_t branch=transition?0x80056240:0x80054cbc;
+            const uint32_t original=transition?0x1040005c:0x1440000a;
+            const uint32_t patched=transition?0x1000005c:0x1000000a;
+            const uint32_t caller=transition?0x8005a4f8:0x8004b634;
+            psx_mod_write_word(p+0x834,0);psx_mod_write_word(p+0x1c8,0);
+            psx_mod_write_word(p+0x838,volume);psx_mod_write_half(p+0x60,98);
+            psx_mod_write_byte(p+0x22c,9);psx_mod_write_byte(p+0x22d,9);
+            call(target,p,0,caller,0x801ff000);
+            assert(psx_mod_read_word(branch)==(volume==640?patched:original));
+            psx_mod_write_word(0x801feffc,caller);
+            psx_mod_write_word(p+0x838,5120);
+            call(0x8006b270,0x3001,p+4,0x80054cb0,0x801fef80);
+            assert(psx_mod_read_word(branch)==original);
+            assert(psx_mod_read_word(p+0x20c)==0x3b800);
+            call(0x80058120,p,0,0x80041c44,0x801ff010);
+        }
+        // Grounded shelf policy still depends on solid support, even if the
+        // enclosing water volume is deep; only flight protection changed.
+        psx_mod_write_word(p+0x838,5120);
+        // D08AD: a walking terrain probe runs before the dispatcher's stack
+        // exists. Re-entering the outer hook must arm its scope afterwards.
+        psx_mod_write_word(p+0x834,-512);psx_mod_write_half(p+0x60,72);
+        psx_mod_write_byte(p+0x22c,0);psx_mod_write_byte(p+0x22d,0);
+        ttk::running=false;ttk::input.move_y=1;ttk::input.move_x=0;
+        ttk::input.held[ttk::jump]=false;
+        call(0x8003ade4,c,p,0x80025ee8);
+        psx_mod_write_word(0x801feffc,p);
+        terrain_nested_hook=true;terrain_nested_calls=0;
+        call(0x80048410,p,0,0x8004b634,0x801ff000);
+        terrain_nested_hook=false;assert(terrain_nested_calls>0);
+        assert(psx_mod_read_word(0x800485e4)==0x10000354);
+        psx_mod_write_word(0x801feffc,0x8004b634);
+        call(0x80053404,p,0,0x800485dc,0x801fefd8);
+        assert(psx_mod_read_word(0x800485e4)==0x10000354);
+        call(0x80058120,p,0,0x80041c44,0x801ff010);
+        // The completion selector has a different saved-RA offset (-8).
+        // Preserve the native phase/frame data: no host phase reconstruction.
+        for(unsigned a:{72u,74u,76u,78u})for(int test=0;test<7;++test) {
+            ttk::input=saved;ttk::input.active=true;ttk::input.move_y=1;
+            ttk::input.held[ttk::original_aim]=ttk::input.held[ttk::crouch]=false;
+            psx_mod_write_word(p,0);psx_mod_write_word(p+0x224,0);
+            psx_mod_write_word(p+0x834,test==1?-641:-512);
+            psx_mod_write_word(p+0x1c8,0);psx_mod_write_word(p+0x20c,0x3b800);
+            psx_mod_write_byte(p+0x22c,test==2?4:0);
+            psx_mod_write_half(p+0x60,a);psx_mod_write_half(p+0x68,2);
+            psx_mod_write_half(p+0x64,117);psx_mod_write_half(p+0x66,118);
+            if(test==3)setenv("DNTTK_SWIMMING","original",1);
+            if(test==4)ttk::modern=false;
+            if(test==6)poke(0x4b874);
+            const auto original=psx_mod_read_word(0x8004b874);
+            call(0x8004b644,p,0,test==5?0x8005a474:0x8005a470,0x801ff000);
+            assert(psx_mod_read_word(0x8004b874)==(test==0?0x1000000au:original));
+            assert(psx_mod_read_word(0x8004bb04)==(test==0?0x1000000au:0x1040000au));
+            assert(psx_mod_read_half(p+0x60)==a && psx_mod_read_half(p+0x68)==2);
+            assert(psx_mod_read_half(p+0x64)==117 && psx_mod_read_half(p+0x66)==118);
+            assert(psx_mod_read_word(p+0x20c)==0x3b800);
+            if(test==0) {
+                psx_mod_write_word(0x801feff8,0x8005a470);
+                call(0x800780b4,0,0,0,0x801fefc0);
+                assert(psx_mod_read_word(0x8004b874)==0x1000000a);
+            }
+            call(0x80058120,p,0,0x80041c44,0x801ff010);
+            assert(psx_mod_read_word(0x8004b874)==original);
+            if(test==6)poke(0x4b874);
+            ttk::modern=true;unsetenv("DNTTK_SWIMMING");
+        }
+        std::puts("PASS: D08AD post-probe dispatcher scope and native stride completion; phase preservation and exclusions");
+        for(unsigned i=0;i<sizeof body;++i)psx_mod_write_byte(p+i,body[i]);
+        ttk::input=saved;
+        std::puts("PASS: D08AC shared mid-water gait; water identity/physics preserved; deep/swim/Original/Vanilla/caller/code exclusions");
+    }
+    // Mid-depth wade (flooded corridor ledge): depth 0x200, mode 1, clip 81.
+    // The wade handler's root is retargeted to camera-relative WASD at land
+    // pace; camera-only lease keeps mouse look; no direction keeps the clip.
+    psx_mod_write_half(p+0x60,81);psx_mod_write_byte(p+0x22c,1);psx_mod_write_byte(p+0x22d,1);
+    psx_mod_write_word(p+0x224,2);psx_mod_write_word(p+0x20c,0x7fc91);
+    psx_mod_write_word(p+0x834,(uint32_t)-6144);psx_mod_write_word(p+0x1c8,(uint32_t)-5632);
+    ttk::input.active=true;ttk::input.move_x=0;ttk::input.move_y=0;++ttk::input.sequence;
+    call(0x8003ade4,c,p,0x80025ee8);
+    assert(ttk::movement_ready() && ttk::locomotion_input_ready() && !ttk::swim_input_ready());
+    assert(ttk::mid_wade_input_ready());
+    psx_mod_write_half(c+12,0);psx_mod_write_half(c+16,4096); // view +Z
+    psx_mod_write_half(p+0xfc,(uint16_t)(int16_t)-22);psx_mod_write_half(p+0x100,0); // clip root, body-relative world
+    call(0x800539f8,p,4,0x8004870c,0x801fff00);
+    assert((int16_t)psx_mod_read_half(p+0xfc)==-22 && (int16_t)psx_mod_read_half(p+0x100)==0); // idle: untouched
+    ttk::input.move_x=0;ttk::input.move_y=1;ttk::running=true;
+    call(0x800539f8,p,4,0x8004870c,0x801fff00);
+    assert((int16_t)psx_mod_read_half(p+0x100)==78 && (int16_t)psx_mod_read_half(p+0xfc)==0); // W: view forward, 22 * run step/28 lifted to the 78..117 band
+    ttk::input.move_x=1;ttk::input.move_y=0;
+    psx_mod_write_half(p+0xfc,0);psx_mod_write_half(p+0x100,22);
+    call(0x800539f8,p,4,0x8004870c,0x801fff00);
+    assert((int16_t)psx_mod_read_half(p+0xfc)==78 && (int16_t)psx_mod_read_half(p+0x100)==0); // D: strafe right (+X)
+    psx_mod_write_half(p+0xfc,0);psx_mod_write_half(p+0x100,30); // mid clip tick: 30 * run step/28
+    call(0x800539f8,p,4,0x8004870c,0x801fff00);assert((int16_t)psx_mod_read_half(p+0xfc)==105);
+    psx_mod_write_half(p+0xfc,0);psx_mod_write_half(p+0x100,6); // short clip tick: floor 0.8 * run step
+    call(0x800539f8,p,4,0x8004870c,0x801fff00);assert((int16_t)psx_mod_read_half(p+0xfc)==78);
+    psx_mod_write_half(p+0xfc,0);psx_mod_write_half(p+0x100,44); // long clip tick: ceiling 1.2 * run step
+    call(0x800539f8,p,4,0x8004870c,0x801fff00);assert((int16_t)psx_mod_read_half(p+0xfc)==117);
+    ttk::running=false;psx_mod_write_half(p+0xfc,0);psx_mod_write_half(p+0x100,22); // D08AA: land walk pace, band 17..25
+    call(0x800539f8,p,4,0x8004870c,0x801fff00);assert((int16_t)psx_mod_read_half(p+0xfc)==17);ttk::running=true;
+    // D08AB SWIMMING original: the pre-D08AA band (walk 2x22 in 40..60, run 4x22
+    // in 80..120) and the forced run in shallow / mid-depth water.
+    assert(!ttk::wade_full_speed_ready());
+    setenv("DNTTK_SWIMMING","original",1);assert(ttk::wade_full_speed_ready());
+    ttk::running=false;psx_mod_write_half(p+0xfc,0);psx_mod_write_half(p+0x100,22);
+    call(0x800539f8,p,4,0x8004870c,0x801fff00);assert((int16_t)psx_mod_read_half(p+0xfc)==44);
+    ttk::running=true;psx_mod_write_half(p+0xfc,0);psx_mod_write_half(p+0x100,22);
+    call(0x800539f8,p,4,0x8004870c,0x801fff00);assert((int16_t)psx_mod_read_half(p+0xfc)==88);
+    assert(std::strstr(ttk::controls_debug_json(),"\"swimming\":\"original\""));
+    ttk::modern=false;assert(!ttk::wade_full_speed_ready());ttk::modern=true;
+    unsetenv("DNTTK_SWIMMING");assert(std::strstr(ttk::controls_debug_json(),"\"swimming\":\"modern\""));
+    psx_mod_write_half(p+0xfc,0);psx_mod_write_half(p+0x100,22);
+    call(0x800539f8,p,4,0x80048664,0x801fff00); // foreign caller: untouched
+    assert((int16_t)psx_mod_read_half(p+0xfc)==0 && (int16_t)psx_mod_read_half(p+0x100)==22);
+    psx_mod_write_byte(p+0x22c,0);psx_mod_write_half(p+0x60,76); // land run in the same water: not the wade handler
+    call(0x800539f8,p,4,0x8004870c,0x801fff00);
+    assert((int16_t)psx_mod_read_half(p+0xfc)==0 && (int16_t)psx_mod_read_half(p+0x100)==22);
+    {
+        // D08AA: surface strokes and underwater thrust at the shared walk/run
+        // pace, from the swim tail's rotation call (0x80066e34, ra 0x80046ec8).
+        const uint32_t angles=0x801fff30,v=p+0x1f4;
+        auto stroke=[&](unsigned mode,unsigned anim,int32_t x,int32_t z,int16_t pitch=0,uint32_t ra=0x80046ec8) {
+            psx_mod_write_byte(p+0x22c,mode);psx_mod_write_byte(p+0x22d,mode);psx_mod_write_half(p+0x60,anim);
+            psx_mod_write_word(v,x);psx_mod_write_word(v+4,0);psx_mod_write_word(v+8,z);psx_mod_write_half(angles+2,pitch);
+            CPUState cpu{};cpu.gpr[4]=angles;cpu.gpr[5]=v;cpu.gpr[31]=ra;
+            for(auto& cb:hooks().at(0x80066e34).list)cb(&cpu,0x80066e34);
+        };
+        auto vx=[&]{return (int32_t)psx_mod_read_word(v);};
+        auto vz=[&]{return (int32_t)psx_mod_read_word(v+8);};
+        ttk::input.move_x=0;ttk::input.move_y=1;ttk::running=false;
+        stroke(4,125,0,0x1333);assert(vz()==2030);          // surface forward: walk
+        ttk::running=true;stroke(4,125,0,0x1333);assert(vz()==9520); // Shift: run
+        stroke(4,125,0,0x1333/2);assert(std::abs(vz()-4760)<=1); // pad pressure share kept
+        ttk::input.move_y=-1;stroke(4,126,0,-0xaaa);assert(vz()==-9520); // back
+        ttk::input.move_x=-1;ttk::input.move_y=0;stroke(4,123,-0x444,0);assert(vx()==-9520 && vz()==0); // strafe
+        ttk::input.move_x=0;ttk::input.move_y=1;
+        stroke(5,128,0,0x149f,-300);assert(vz()==9520 && (int16_t)psx_mod_read_half(angles+2)==-300); // view-pitched thrust
+        ttk::running=false;stroke(5,129,0,0x149f);assert(vz()==2030);
+        ttk::running=true;ttk::input.held[ttk::jump]=true;
+        stroke(5,128,0,0x149f,640); // Space: vertical kept, horizontal = pace
+        {
+            const double was=0x149f*std::sin(640*ttk::tau/4096),pitch=(int16_t)psx_mod_read_half(angles+2)*ttk::tau/4096;
+            assert(std::abs(vz()*std::sin(pitch)-was)<30 && std::abs(vz()*std::cos(pitch)-9520)<30);
+        }
+        ttk::input.held[ttk::jump]=false;
+        stroke(5,133,0,0x149f);assert(vz()==0x149f);        // dive 133: original
+        stroke(4,125,0,0x1333,0,0x80046000);assert(vz()==0x1333); // foreign caller
+        ttk::input.move_y=0;stroke(4,125,0,0x1333);assert(vz()==0x1333); // no direction
+        ttk::input.move_y=1;ttk::modern=false;stroke(4,125,0,0x1333);assert(vz()==0x1333);ttk::modern=true; // Vanilla
+        // D08AB SWIMMING original: strokes and thrust keep their fixed speeds; live.
+        setenv("DNTTK_SWIMMING","original",1);
+        stroke(4,125,0,0x1333);assert(vz()==0x1333);
+        ttk::input.move_x=-1;ttk::input.move_y=0;stroke(4,123,-0x444,0);assert(vx()==-0x444);
+        ttk::input.move_x=0;ttk::input.move_y=1;stroke(5,128,0,0x149f,-300);assert(vz()==0x149f && (int16_t)psx_mod_read_half(angles+2)==-300);
+        unsetenv("DNTTK_SWIMMING");stroke(4,125,0,0x1333);assert(vz()==9520);
+        // D08AF: bracket the native integrator and pre-collision sweep.
+        // Simulate its output; the blend may change only horizontal root.
+        auto plunge=[&](int vy,bool release=false,uint32_t caller=0x8004b5bc,
+                        bool stale=false,unsigned mode=5,unsigned anim=128,uint32_t flags=0x04000000) {
+            psx_mod_write_word(p,(psx_mod_read_word(p)&~0x04000020u)|flags);
+            psx_mod_write_byte(p+0x22c,mode);psx_mod_write_half(p+0x60,anim);
+            psx_mod_write_word(p+0x224,0);psx_mod_write_word(v+4,vy?vy:1100);
+            psx_mod_write_half(p+0xba,17);
+            ttk::input.move_y=1;
+            CPUState cpu{};cpu.gpr[4]=p;cpu.gpr[29]=0x801fff00;cpu.gpr[31]=caller;
+            hooks().at(0x800455bc)(&cpu,0x800455bc);
+            psx_mod_write_word(v,500);psx_mod_write_word(v+4,vy);psx_mod_write_word(v+8,2000);
+            psx_mod_write_half(p+0xfc,8);psx_mod_write_half(p+0xfe,31);psx_mod_write_half(p+0x100,32);
+            if(release)ttk::input.move_y=0;
+            if(stale)++ttk::input.epoch;
+            cpu.gpr[31]=0x8007a9f8;cpu.gpr[29]-=0xb8;
+            const unsigned before=writes;
+            hooks().at(0x8003964c)(&cpu,0x8003964c);
+            assert(psx_mod_read_word(v)==500 && (int32_t)psx_mod_read_word(v+4)==vy && psx_mod_read_word(v+8)==2000);
+            assert(psx_mod_read_half(p+0xfe)==31); // native plunge depth untouched
+            const bool changed=writes!=before;
+            const unsigned after=writes;
+            hooks().at(0x8003964c)(&cpu,0x8003964c);assert(writes==after); // consumed once
+            if(stale)--ttk::input.epoch;
+            return changed;
+        };
+        assert(!plunge(16000));assert(!plunge(8192)); // initial resistance unchanged
+        assert(plunge(2048));
+        const int partial_x=(int16_t)psx_mod_read_half(p+0xfc),partial_z=(int16_t)psx_mod_read_half(p+0x100);
+        assert(plunge(0)); // native stop reaches the existing swim pace
+        const int full_x=(int16_t)psx_mod_read_half(p+0xfc),full_z=(int16_t)psx_mod_read_half(p+0x100);
+        const double expected=9520*std::cos((int16_t)psx_mod_read_half(p+0x1e)*ttk::tau/4096)*17/1024;
+        assert(std::abs(std::hypot(full_x,full_z)-expected)<1);
+        assert(std::abs(partial_x-full_x)<=std::abs(8-full_x));
+        assert(std::abs(partial_z-full_z)<=std::abs(32-full_z));
+        assert(!plunge(2048,true)); // release retains native damping
+        assert(!plunge(2048,false,0x80046d78)); // foreign caller
+        assert(!plunge(2048,false,0x8004b5bc,true)); // load/context epoch
+        assert(!plunge(2048,false,0x8004b5bc,false,1,80)); // shallow water
+        assert(!plunge(2048,false,0x8004b5bc,false,4,125)); // surface
+        assert(!plunge(2048,false,0x8004b5bc,false,5,133)); // explicit dive
+        assert(!plunge(2048,false,0x8004b5bc,false,5,128,0)); // ordinary stroke
+        ttk::modern=false;assert(!plunge(2048));ttk::modern=true;
+        setenv("DNTTK_SWIMMING","original",1);assert(!plunge(2048));unsetenv("DNTTK_SWIMMING");
+        poke(0x3e4b0);assert(!plunge(2048));poke(0x3e4b0);assert(plunge(2048));
+        psx_mod_write_word(p,psx_mod_read_word(p)&~0x04000000u);
+        std::puts("PASS: D08AF plunge tail, native vertical/velocity preservation, release, caller, epoch, Original, Vanilla and changed-code gates");
+        psx_mod_write_word(v,0);psx_mod_write_word(v+8,0);
+    }
+    ttk::running=false;ttk::input.move_x=0;ttk::input.move_y=0;
+    psx_mod_write_half(p+0x60,63);psx_mod_write_byte(p+0x22c,0);psx_mod_write_byte(p+0x22d,0);
+    psx_mod_write_word(p+0x834,0x40000000);psx_mod_write_word(p+0x20c,0);
+    ++ttk::input.sequence;call(0x8003ade4,c,p,0x80025ee8);assert(ttk::movement_ready());
+    std::puts("PASS: mid-depth wade handler root retarget, idle/foreign/land exclusions; D08AA surface/underwater pace; D08AB original swimming");
+    // Isolated F7 UI slot 2: overlay already patched, waist-deep, anim 63.
+    psx_mod_write_word(0x800cc57c,0x24020000);
+    psx_mod_write_word(0x800cc580,0x30a30400);
+    psx_mod_write_half(p+0x60,63);psx_mod_write_byte(p+0x22c,0);psx_mod_write_byte(p+0x22d,0);
+    psx_mod_write_word(p+0x224,2);psx_mod_write_word(p+0x20c,0x33000);
+    psx_mod_write_word(p+0x834,(uint32_t)-6144);psx_mod_write_word(p+0x1c8,(uint32_t)-5888);
+    ttk::input.active=true;++ttk::input.sequence;
+    call(0x8003ade4,c,p,0x80025ee8);assert(ttk::movement_ready() && !ttk::swim_input_ready());
+    ttk::want_capture=true;const auto slot2_offers=ttk::capture_offers;
+    call(0x8005a210,p,0x800c2754,0x80041b34);
+    assert(ttk::capture_offers==slot2_offers+1);
+    ttk::want_capture=false;
+    std::puts("PASS: F7 slot-2 patched overlay identity, wade lease, recapture offer");
+    // D17Y: widen only a direct, open upper room boundary. Downstream
+    // windows retain their authored aperture, as do indoor/short portals.
+    {
+        setenv("DNTTK_DRAW_DISTANCE","extended",1);
+        constexpr uint32_t table=0x80180000,portals=0x80181000,entry=0x800d68b0,rect=0x800d2210;
+        auto setup=[&] {
+            psx_mod_write_word(0x800da454,table);psx_mod_write_word(c+0x90,0);
+            psx_mod_write_word(table+4,1024);psx_mod_write_word(table+0x14,1024);
+            psx_mod_write_byte(table+0x30,1);psx_mod_write_word(table+0x38,portals);
+            psx_mod_write_word(table+88+12,8);psx_mod_write_word(table+88+0x14,uint32_t(-2048));
+            psx_mod_write_half(portals+14,1);
+            for(unsigned j=0;j<4;++j) psx_mod_write_half(portals+j*8+2,(j&1)?5120:0);
+            psx_mod_write_half(rect,uint16_t(-256));psx_mod_write_half(rect+2,uint16_t(-120));
+            psx_mod_write_half(rect+4,512);psx_mod_write_half(rect+6,240);
+            psx_mod_write_word(0x800d68a8,1);
+            psx_mod_write_half(entry,uint16_t(-100));psx_mod_write_half(entry+2,uint16_t(-80));
+            psx_mod_write_half(entry+4,200);psx_mod_write_half(entry+6,160);psx_mod_write_word(entry+8,1);
+            psx_mod_write_word(0x800da450,1000);psx_mod_write_word(0x800da34c,2000);
+            psx_mod_write_word(0x800d67a8+0x74,1000+0x13d0);
+        };
+        auto top=[&]{return int16_t(psx_mod_read_half(entry+2));};
+        auto run=[&]{call(0x80062b48,0,0,0x8002e688);};
+        setup();run();assert(top()==-120);run();assert(top()==-120);
+        setup();psx_mod_write_word(entry+8,2);run();assert(top()==-82); // indirect
+        setup();psx_mod_write_word(table+88+12,0);run();assert(top()==-82); // indoors
+        setup();psx_mod_write_word(table+88+0x14,1024);run();assert(top()==-82);
+        setup();for(unsigned j=0;j<4;j+=2)psx_mod_write_half(portals+j*8+2,64);run();assert(top()==-82);
+        setup();psx_mod_write_word(table+0x38,0x801ffff0);run();assert(top()==-82);
+        setup();ttk::modern=false;run();assert(top()==-80);ttk::modern=true;
+        setup();call(0x80062b48,0,0,0x80012345);assert(top()==-80);
+        std::puts("PASS: D17Y open upper portal, downstream/indoor/height/bounds/caller and Vanilla guards");
+    }
+    // D17AQ: open sky lists the sky rooms Duke sees over the camera room's
+    // walls, only from a sky room and only in view.
+    {
+        constexpr uint32_t table=0x80180000,pieces=0x80182000,entry=0x800d68b0,rect=0x800d2210;
+        auto box=[&](uint32_t room,int32_t x0,int32_t y0,int32_t z0,int32_t x1,int32_t y1,int32_t z1,uint32_t flags) {
+            const uint32_t a=table+room*88;
+            for(uint32_t i=0;i<88;i+=4) psx_mod_write_word(a+i,0);
+            psx_mod_write_word(a,x0);psx_mod_write_word(a+4,y0);psx_mod_write_word(a+8,z0);psx_mod_write_word(a+12,flags);
+            psx_mod_write_word(a+0x20,x1);psx_mod_write_word(a+0x24,y1);psx_mod_write_word(a+0x28,z1);
+        };
+        auto piece=[&](uint32_t room,unsigned slot,int16_t x0,int16_t y0,int16_t z0,int16_t x1,int16_t y1,int16_t z1) {
+            const uint32_t a=table+room*88,list=pieces+room*0x100,p=pieces+0x1000+room*0x100+slot*0x20;
+            psx_mod_write_byte(a+0x32,slot+1);psx_mod_write_word(a+0x40,list);psx_mod_write_word(list+4*slot,p);
+            const int16_t v[8]={x0,y0,z0,0,x1,y1,z1,0};
+            for(unsigned k=0;k<8;++k) psx_mod_write_half(p+4+2*k,uint16_t(v[k]));
+        };
+        auto setup=[&](int32_t eye_y,int forward) {
+            psx_mod_write_word(0x800da454,table);psx_mod_write_word(0x800da47c,2);psx_mod_write_word(c+0x90,0);
+            box(0,0,-2048,0,10240,13312,10240,8);
+            piece(0,0,9000,4096,0,10240,15360,10240);           // east wall, top at Y 2048
+            // D17BC: one portal joins the two sky rooms (one open-air region).
+            for(uint32_t i=0;i<36;i+=4) psx_mod_write_word(pieces+0x3000+i,0);
+            psx_mod_write_byte(table+0x30,1);psx_mod_write_word(table+0x38,pieces+0x3000);psx_mod_write_half(pieces+0x3000+14,1);
+            box(1,12000,-2048,0,20000,13312,10240,8);
+            piece(1,0,2000,6048,3000,6000,15360,7000);          // a yard wall, top at Y 4000
+            const int16_t m[9]={0,0,int16_t(-4096*forward),0,4096,0,int16_t(4096*forward),0,0};
+            for(int i=0;i<9;++i) psx_mod_write_half(c+0x20+2*i,uint16_t(m[i]));
+            psx_mod_write_word(c+0x14,5000);psx_mod_write_word(c+0x18,eye_y);psx_mod_write_word(c+0x1c,5000);
+            psx_mod_write_half(c+0x42,160);
+            psx_mod_write_half(rect,uint16_t(-256));psx_mod_write_half(rect+2,uint16_t(-120));
+            psx_mod_write_half(rect+4,512);psx_mod_write_half(rect+6,240);
+            psx_mod_write_word(0x800d68a8,1);
+            psx_mod_write_half(entry,uint16_t(-256));psx_mod_write_half(entry+2,uint16_t(-120));
+            psx_mod_write_half(entry+4,512);psx_mod_write_half(entry+6,240);psx_mod_write_word(entry+8,0);
+            psx_mod_write_word(0x800da450,1000);psx_mod_write_word(0x800da34c,2000);
+            psx_mod_write_word(0x800d67a8+0x74,1000+0x13d0);
+        };
+        auto run=[&]{call(0x80062b48,0,0,0x8002e688);};
+        auto listed=[&](uint32_t room){
+            for(uint32_t i=0;i<psx_mod_read_word(0x800d68a8);++i) if(psx_mod_read_word(entry+12*i+8)==room) return true;
+            return false;
+        };
+        setup(-1800,1);run();assert(psx_mod_read_word(0x800d67a8+0x74)==0xffff && listed(1)); // above the wall
+        // drawn through the screen rectangle of its seen piece (x about +-36 plus margin), not the whole view
+        auto edge=[&](uint32_t e,int i){return int(int16_t(psx_mod_read_half(e+2*i)));};
+        assert(edge(entry+12,0)<-36 && edge(entry+12,0)>-60 && edge(entry+12,2)>72 && edge(entry+12,2)<120);
+        assert(edge(entry+12,1)>=-120 && edge(entry+12,1)+edge(entry+12,3)<=120);
+        call(0x800374cc,c,0,0x8002e6e4);assert(psx_mod_read_word(0x800d68a8)==1); // the object pass: the walk's own rooms
+        setup(8000,1);run();assert(!listed(1));                       // below it, on the ground
+        setup(-1800,-1);run();assert(!listed(1));                     // behind the camera
+        setup(-1800,1);psx_mod_write_word(table+12,0);run();assert(!listed(1)); // indoors
+        setup(-1800,1);psx_mod_write_word(table+88+12,0);run();assert(!listed(1)); // not a sky room
+        setup(-1800,1);psx_mod_write_word(0x800d67a8+0x74,1234);run();assert(!listed(1)); // unknown limit: refused
+        setup(-1800,1);psx_mod_write_byte(table+0x30,0);run();assert(!listed(1)); // D17BC: another open-air region
+        // A portal-listed sky room opens to the whole view only when seen over the walls.
+        setup(-1800,1);psx_mod_write_word(0x800d68a8,2);
+        psx_mod_write_half(entry+12,uint16_t(-20));psx_mod_write_half(entry+14,uint16_t(-20));
+        psx_mod_write_half(entry+16,40);psx_mod_write_half(entry+18,40);psx_mod_write_word(entry+20,1);
+        run();assert(edge(entry+12,0)<-36 && edge(entry+12,0)>-60 && edge(entry+12,0)+edge(entry+12,2)>=22); // widened over the portal's
+        assert(edge(entry+12,1)<=-22 && edge(entry+12,1)+edge(entry+12,3)>=22);
+        setup(8000,1);psx_mod_write_word(0x800d68a8,2);
+        psx_mod_write_half(entry+12,uint16_t(-20));psx_mod_write_half(entry+14,uint16_t(-20));
+        psx_mod_write_half(entry+16,40);psx_mod_write_half(entry+18,40);psx_mod_write_word(entry+20,1);
+        run();assert(psx_mod_read_half(entry+12)==uint16_t(-22) && psx_mod_read_half(entry+16)==44); // margin only
+        setup(-1800,1);ttk::modern=false;run();assert(!listed(1));ttk::modern=true;
+        setup(-1800,1);call(0x80062b48,0,0,0x80012345);assert(!listed(1));
+        psx_mod_write_word(0x800da47c,0);psx_mod_write_word(0x800d68a8,0);
+        std::puts("PASS: D17AQ open sky over walls, ground/behind/indoor/flags/limit/region/caller and Vanilla guards");
+
+        // Dormant enemies: spawner range out to the extended limit with removal
+        // hysteresis, without writing the radius; beyond the original radius a
+        // spawned enemy's controller is skipped until it is hurt.
+        constexpr uint32_t duke=0x800d719c,record=0x80183000,records=0x80184000,actor_a=0x80185000,actor_b=0x80186000;
+        psx_mod_write_word(0x800da450,20480);
+        auto range=[&](int32_t dx,uint32_t ra,uint32_t type=1) {
+            psx_mod_write_word(record,type);
+            for(int i=0;i<3;++i) {psx_mod_write_word(duke+4*i,1000);psx_mod_write_word(record+8+4*i,1000);}
+            psx_mod_write_word(record+8,uint32_t(1000+dx));
+            CPUState cpu{};cpu.gpr[4]=duke;cpu.gpr[5]=record;cpu.gpr[31]=ra;cpu.gpr[29]=0x801f0000;
+            const uint32_t radius=psx_mod_read_word(0x800dd9e0);
+            hooks().at(0x80099164)(&cpu,0x80099164);
+            assert(psx_mod_read_word(0x800dd9e0)==radius);
+            return cpu.gpr[4];
+        };
+        const uint32_t far_point=range(70000,0x800991ec);
+        assert(far_point!=duke && far_point!=record+8);
+        for(int i=0;i<3;++i) assert(psx_mod_read_word(far_point+4*i)==0x40000000u);
+        assert(range(40000,0x800991ec)==record+8);   // the original 25552 says too far
+        assert(range(-65535,0x80099288)==record+8 && range(65600,0x80099288)==far_point);
+        assert(range(67000,0x80099310)==record+8);   // removal waits 4096 longer
+        assert(range(69700,0x80099310)==far_point);
+        assert(range(70000,0x800991ec,0x3d)==duke && range(70000,0x800991ec,0x385)==duke && range(70000,0x800991ec,0x3e)==duke);
+        assert(range(70000,0x80012345)==duke);       // other callers
+        auto actor=[&](uint32_t a,int32_t x,uint8_t cls,int16_t health) {
+            for(uint32_t i=0;i<0x40;i+=4) psx_mod_write_word(a+i,0);
+            psx_mod_write_word(a+4,uint32_t(1000+x));psx_mod_write_word(a+8,1000);psx_mod_write_word(a+12,1000);
+            psx_mod_write_byte(a+0x15,cls);psx_mod_write_half(a+0x32,uint16_t(health));
+        };
+        psx_mod_write_word(0x800de720,records);psx_mod_write_word(0x800c56a0,2);psx_mod_write_word(0x800dd9e0,25552u*25552u);
+        for(uint32_t i=0;i<0x60;i+=4) psx_mod_write_word(records+i,0);
+        psx_mod_write_word(records+4,actor_a);psx_mod_write_word(records+0x14,1);
+        psx_mod_write_word(records+0x30+4,actor_b);psx_mod_write_word(records+0x30+0x14,1);
+        actor(actor_a,40000,6,100);actor(actor_b,1000,6,100);
+        auto tick=[&]{call(0x80099530,duke,0,0x80025b18);};
+        auto prep=[&](uint32_t a,uint32_t ra=0x80025be0){call(0x80025944,a,0,ra);};
+        auto empty=[&](uint32_t a){call(0x800632b8,a,0,0x80025c00);};
+        tick();prep(actor_a);assert(psx_mod_read_byte(actor_a+0x15)==0);   // dormant: the empty handler runs
+        empty(actor_a);assert(psx_mod_read_byte(actor_a+0x15)==6);           // and puts the class back
+        prep(actor_b);assert(psx_mod_read_byte(actor_b+0x15)==6);           // near: the original enemy
+        prep(actor_a,0x80012345);assert(psx_mod_read_byte(actor_a+0x15)==6); // other callers
+        prep(actor_a,0x80025c58);assert(psx_mod_read_byte(actor_a+0x15)==0);
+        call(0x8006cefc,0,0,0x80025c8c);assert(psx_mod_read_byte(actor_a+0x15)==6); // after the loop
+        psx_mod_write_half(actor_a+0x32,90);tick();prep(actor_a);assert(psx_mod_read_byte(actor_a+0x15)==6); // hurt: awake
+        psx_mod_write_half(actor_a+0x32,100);tick();prep(actor_a);assert(psx_mod_read_byte(actor_a+0x15)==6); // stays awake
+        psx_mod_write_word(records+0x14,0);tick();psx_mod_write_word(records+0x14,1);tick(); // a new enemy in that record
+        prep(actor_a);assert(psx_mod_read_byte(actor_a+0x15)==0);empty(actor_a);
+        // A savestate taken inside the hold: the next tick heals from the type table.
+        constexpr uint32_t types=0x80187000;
+        psx_mod_write_word(0x800d2660,types);psx_mod_write_half(actor_a+0x2c,3);psx_mod_write_byte(types+28*3+6,6);
+        psx_mod_write_byte(actor_a+0x15,0);tick();assert(psx_mod_read_byte(actor_a+0x15)==0); // only after a load
+        ++save_loads;tick();assert(psx_mod_read_byte(actor_a+0x15)==6);
+        psx_mod_write_word(0x800d2660,0);
+        psx_mod_write_word(0x800c56a0,0);psx_mod_write_word(0x800de720,0);tick();
+        prep(actor_a);assert(psx_mod_read_byte(actor_a+0x15)==6);
+        std::puts("PASS: D17AQ dormant enemies: extended spawner range, hysteresis, hold/release, hurt wake and callers");
+
+    }
+    assert(ttk::camera_body_coverage(650,0)==0);
+    assert(ttk::camera_body_coverage(1700,0)==1);
+    assert(ttk::camera_body_coverage(650,660)==1);
+    for(int d=650;d<1700;++d) {
+        const double a=ttk::camera_body_coverage(d,0),b=ttk::camera_body_coverage(d+1,0);
+        assert(a>=0 && b<=1 && b>=a && b-a<0.002);
+        assert(ttk::camera_body_coverage(d,400)==ttk::camera_body_coverage(d,-400));
+    }
+    std::puts("PASS: D10B proximity coverage bounds, continuity, monotonicity and shoulder symmetry");
+    std::puts("PASS: distance clamps, convergence, epoch recovery and wall-independent preference; D10 recenter, shoulder offset and camera side file");
+    std::puts("PASS: all semantic groups, upgrades, empty remote, history, unsafe attack/item guards, crouch delta and clearance fixtures");
+    std::puts("PASS: immediate takeoff support probe, guarded caller/code, owned airborne reach lease");
+    std::puts("PASS: respawn boom, landing seam and pre-collision stride smoothing");
+    std::puts("PASS: camera constraints, duplicate look, capture and original-camera gates");
+    std::puts("PASS: Vanilla, actor/caller/overlay/code/state guards; movement/probe alignment; independent facing");
+    std::puts("PASS: D08T1 pushable masks (D08T4 floor gate, D08T2 types up to 1061, grab-only climb mask, E-only idle grab mask; caller/actor/flags/Vanilla/capture) and camera-only grab lease");
+    std::puts("PASS: D12A first-person quick kick (boot request conversion from the attack only (E suppressed) and its guards, lease, sound, view-aimed hit sphere at the crosshair surface within reach, held attack with Boot, plain left-leg Q viewmodel; right-leg door presentation, third person untouched); D12C kick impact (thud (one octave up, three times its volume) once at the first sphere contact or a reachable wall, silent otherwise; third-person sphere made by the host, original neutralized, once per kick; Vanilla and other callers untouched)");
+}

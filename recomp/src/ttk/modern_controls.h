@@ -1,0 +1,254 @@
+#pragma once
+#include "limb_presentation.h"
+#include <cstddef>
+#include <cstdint>
+struct CPUState;
+namespace ttk {
+bool movement_ready();
+// D08G9: a cheat typed on the death scene (game_menu's death hook): true for
+// dnkroz / dncornholio (god mode is now on; the caller revives Duke), other
+// cheats are refused with the dead notice.
+bool death_cheat_take();
+// D08G9: the revive is under way (the death view's roll unwinds after it).
+void death_view_revive();
+const char* movement_lease_miss();
+bool edge_jump_queued();
+// DNTTK_FRAME_TRACE: other plugins add their hook time to the frame trace.
+bool frame_trace_on();
+void frame_trace_account(uint32_t address,long us);
+bool view_aim_input_ready();
+// D10E: inspection is visual only; shots retain the gameplay camera ray.
+bool free_look_active();
+bool free_look_aim(double* eye,double* forward);
+bool locomotion_input_ready();
+/* D08K4: the Modernized crouch walk owns the stance; withhold the directions. */
+bool crouch_walk_input_ready();
+bool airborne_input_ready();
+/* D07F: view-aimed shots in takeoff, jumps, falls and the landing frame. */
+bool airborne_shot_ready();
+bool short_fall_input_ready();
+bool directional_takeoff_ready();
+bool interaction_ready();
+bool fire_draw_ready();
+// D10H4 WEAPON FEEL RETRO: a fire press edge (input thread), whether the
+// fire pad is still latched for the game, and the player's gun call.
+void weapon_feel_press();
+bool weapon_feel_latched_fire();
+void weapon_feel_shot();
+bool hold_button_sampled();
+bool interaction_restore_ready();
+/* D08O3: the E redraw in the native swim states (surface / underwater). */
+bool interaction_swim_restore_ready();
+/* D08O5: fire draws a holstered weapon in the native swim states. */
+bool swim_fire_draw_ready();
+bool swim_fire_cross_masked();
+/* D08J6A: fire draws the sidearm on ladders, chains, poles and climbing walls. */
+bool climb_weapon_ready();
+bool hang_weapon_ready();
+bool hang_drop_armed_ready(bool drop);
+bool hang_pullup_input_ready(bool pull);
+// D08J8: a ledge hang reached by a climb with the sidearm drawn inside it.
+bool trav_hang_climbing();
+// D08J9: E at a door with a weapon out (door_use.inc).
+bool door_use_ready();
+void door_use_request();
+int door_use_state();   // 0 idle, 1 asked, 2 door use started, 3 no door
+void door_use_end();
+bool hang_pullup_handoff();
+bool armed_pullup_fire_masked();
+bool climb_fire_hold_ready();
+bool climb_stow_ready();
+bool mantle_fire_cross_masked();
+bool switch_fire_masked(); // D08A37: a queued weapon switch holds the fire input off
+bool climb_shot_ready();
+bool interaction_alive();
+bool interaction_holster_ready();
+// D08Z8 revision 2 (sidearm_mantle.inc): with the climb sidearm out on the
+// ground, E asks whether the original mantles here before any stow.
+// State 0 idle, 1 asked, 2 mantled (E answered), 3 no mantle.
+bool sidearm_mantle_ready();
+void sidearm_mantle_ask();
+int sidearm_mantle_state();
+void sidearm_mantle_end();
+void sidearm_mantle_cancel();
+// D08Z8: a weapon that can climb as the sidearm, in a takeoff or flight: E keeps fire.
+bool sidearm_in_flight();
+bool sidearm_weapon_out();
+// D08Z8: Duke has left ground locomotion for a climb, mantle or hang.
+bool interaction_climb_started();
+bool weapon_drawn();
+bool weapon_holstered();
+bool traversal_input_ready();
+/* Settled world/object ledge hang; Space uses its original Down release. */
+bool ledge_hang_ready();
+/* D08V: camera-only lease through an original mantle/hang/pull-up or unowned fall. */
+bool traversal_camera_ready();
+bool committed_camera_ready();
+/* Modern free-swim: WASD bridges to D-pad; vertical is host-owned. */
+bool swim_input_ready();
+/* Waist-deep / mid water: land run, mouse look and Shift, not the swim path.
+   D08AB: true only with SWIMMING original, which forces the run there. */
+bool wade_full_speed_ready();
+/* Mid-depth wade (0x200..0x281, original mode 1 / anims 80/81): the host
+   rewrites the wade handler's root toward camera-relative WASD at land pace. */
+bool mid_wade_input_ready();
+/* Suppress Square (modern Space) while wading or free-swimming so host owns
+   land jumps / soft ascend. Square is original swim thrust (anim 176), not rise. */
+bool swim_host_owns_jump();
+/* Active-layout strafe pad masks (8005201c strafe words, default L2/R2). */
+void swim_strafe_pads(uint16_t& left,uint16_t& right);
+/* Original underwater state (player+0x22c == 5): WASD / Space / Ctrl inject
+   Square thrust along the host-steered body yaw/pitch; no D-pad (that is pitch). */
+bool swim_thrust_input_ready();
+/* D08O1: the original swim states (surface 4, underwater 5) under the swim
+   lease; weapon view aiming, shots and the crosshair apply there. */
+bool swim_weapon_ready();
+/* D08Q jetpack flight (original mode 10, anims 163-170): camera lease live,
+   body faces the view, WASD -> original Up/Down + layout strafe pads. */
+bool jetpack_input_ready();
+/* D08R Classic jetpack scheme (DNTTK_JETPACK=classic): jetpack_input_ready()
+   controls with the original burst physics (no host hover/descent). */
+bool jetpack_classic_input_ready();
+bool player_identity_ready();
+/* D08T/D08T1 pushable objects (push.inc). Grab 119..121 on an object flagged
+   0x08000000 is live; Duke touches one on normal ground; settled holstered idle 63. */
+bool push_grab_ready();
+/* D08X: let go of an original object hang (mode 7) on a crate at once. */
+bool object_hang_release_ready();
+/* D08J4: hanging under a climbable ceiling (mode 7, not a crate). The pad
+   carries only the host's Up (advance) or Square (Ctrl lets go). */
+bool ceiling_hang_ready();
+bool ceiling_hang_advance();
+bool ceiling_hang_drop();
+bool ceiling_armed_drop();
+bool ceiling_weapon_ready();
+bool push_contact_ready();
+bool push_idle_ready();
+/* Original Up (16) / Down (64) for camera-relative movement along Duke's facing. */
+uint16_t push_pad(float move_x,float move_y);
+/* D08U top-of-ladder mount (ladder_top.inc): Duke stands at the top of a plain
+   ladder within reach; E there asks for the host-blended original transfer. */
+bool ladder_top_available();
+void ladder_top_request();
+/* D08J1: E held, heading at a plain ladder whose bottom is out of reach from
+   the floor, inside the catching window for the gait: press the original jump. */
+bool ladder_leap_ready();
+void ladder_leap_note();
+/* The leap is under way (until the catch, landing or timeout): E's reach stays held. */
+bool ladder_leap_active();
+/* Duke is on a plain ladder: S also holds Cross so he climbs down and steps off. */
+bool ladder_descent_ready();
+int ladder_bottom_hang();
+bool ladder_end_below();
+bool ladder_mount_finishing();
+/* Original ladder exit (190 top, 185 bottom step-off): directions stay neutral. */
+bool ladder_exit_ready();
+/* D08J2: Duke hangs on a pole or chain (192..195): A/D reach the original swapped. */
+bool pole_sidestep_ready();
+bool pole_view_from_front(bool sidestep_held);
+/* D08J5: S rests at the end of a pole or chain with nothing to step onto: let go (Square). */
+bool pole_let_go_ready();
+const char* controls_debug_json();
+// D17: draw-time host state for render replay workers (frame_replay.cpp).
+// D17B late camera (live process only): the view the next game update would
+// take from the mouse input pumped so far (yaw/pitch, radians, as the orbit
+// camera uses them), the orbit pivot and the first-person blend. False when the
+// modern camera does not own the view.
+// at_ms >= 0: the mouse look as it was at that time (performance clock, ms).
+bool replay_gameplay_context();
+// D17AR3: the live frame in progress is redraw-only (frame_replay.cpp).
+bool live_frame_redraw_only();
+// D23E/D23H: one second of gameplay judged by overclock_lease: 0 kept up,
+// 1 behind real time, 2 not a gameplay second (menus, loads). Sheds presents
+// on a sustained deficit and steps back up when emulation keeps up again.
+// Returns 1 after a shed, -1 when behind and nothing is left to shed (pause
+// the overclock), else 0.
+int replay_load_window(int window);
+// D17AQ: the audio ring is under a third of its target in gameplay: shed one present
+// step now. Returns 1 after a shed, else 0 (nothing to shed, shedding off).
+int replay_audio_low();
+void render_state_prepare();
+bool late_view(double& yaw, double& pitch, double at_ms=-1);
+bool late_pivot(double* xyz);
+double late_fp_blend();
+void replay_body_camera(bool duke);
+void replay_beam_roots();
+// D44A earthquakes (earthquake.inc): fix the offset of the live image about
+// to be composed (once a game frame), then read the offset of the image being
+// drawn (live, or the redraw's base frame in a worker): eye dy (game units,
+// Y down) and yaw (radians, right); eye = first person (Duke's own draw keeps
+// the steady camera).
+void earthquake_compose();
+bool earthquake_image(double& dy,double& yaw,bool& eye);
+const char* earthquake_json();
+// frame_replay.cpp: Duke's own draw in first person sees the steady camera,
+// every other draw the shaken one; and the live camera is put back after the
+// composition.
+void replay_quake_camera(bool duke);
+void replay_quake_restore();
+bool replay_late_rotation(int16_t rot[9]);
+// D10G3: the late view the last present showed (eye, forward x4096) and how
+// long ago it was presented, ms (frame_replay.cpp). False when that image was
+// not a late-view redraw (60 Hz, game-owned camera, frontend).
+bool shot_view(double eye[3],double forward[3],double& age_ms);
+bool shot_view_rows(double rows[9]);
+// D10G4: the objects that view drew and where (position +4..+12 as shown);
+// 0 when shot_view has none.
+int shot_view_poses(uint32_t obj[],double pos[][3],int max);
+// D17AY: an object's position (+4..+12) and heading (+0x1c, 0..4095) as this
+// draw shows it: interpolated in a redraw between game ticks (true), else
+// guest memory (false). Draw-time hooks use it instead of reading the fields.
+bool draw_object_pose(uint32_t obj,double pos[3],double* yaw);
+// D17AY: a render replay redraw is drawing (worker process, inside its job).
+bool replay_redraw_active();
+extern bool present_trace_reference;
+// D17AY developer diagnostic (DNTTK_PRESENT_TRACE=1): log a presented world
+// point in the view of the current redraw.
+bool present_trace_enabled();
+void present_trace(const char* name,const double world[3]);
+void present_trace_value(const char* name,double value);
+size_t render_state_size();
+void render_state_save(void* out);
+void render_state_load(const void* in);
+void render_state_blend_mask(void* out,const void* next,double alpha);
+void render_state_blend_newer(void* out,const void* older,double alpha);
+// D11B: the eye view is live (Modernized, orbit lease, first-person blend > 0).
+bool first_person_view_live();
+bool third_person_camera_live();
+bool third_person_duke_drawing();
+double third_person_body_coverage();
+// D41C: Duke's body in an outside view with no power-up effect (lightable).
+bool third_person_body_lightable();
+// D36H9: coverage of the first-person legs drawn now (1 = solid).
+double first_person_legs_coverage();
+void third_person_mesh_begin(CPUState* cpu);
+void first_person_mesh_begin(CPUState* cpu);
+// D08A35: the cowboy hat on the Bio Mask / goggles head (a private mesh copy).
+void cowboy_hat_mesh_begin(CPUState* cpu);
+bool cowboy_hat_mesh(uint32_t address);
+// D11B: Duke's own actor draw is in progress (object meshes belong to him).
+bool first_person_duke_drawing();
+// D11B: any actor draw (0x800348d8) is in progress, until the next list step.
+bool first_person_actor_drawing();
+bool first_person_interaction_drawing();
+// D12: true while Duke's hand joint, its weapon, muzzle flash or held item is
+// drawn with the first-person weapon transform.
+bool first_person_weapon_drawing();
+// D49: the barrel tip as drawn in this composition's Duke draw, view frame (x right, y down, z ahead).
+bool first_person_drawn_muzzle(double v[3]);
+void first_person_muzzle_reset();
+// D14: Modernized widescreen is presenting a wider view (any camera). Near
+// polygons the original drops or tears then sit inside the revealed margins.
+bool widescreen_near_clip_live();
+// Last modern camera-lease refusal: "context", "identity", "state" or "" (none yet).
+const char* lease_refusal_reason();
+// D19G: CAMERA DISTANCE from the in-game menu (0 = original boom).
+// D14A: session-only horizontal FOV at 4:3, 60..120 degrees. Invalid setters
+// return false without changing state. Getter reports integer-H quantized degrees.
+// Call setter from menu confirmation in D19X; serialize the requested degrees
+// there, default 64 (exact H=256), and load before first gameplay frame.
+bool first_person_set_fov(double degrees);
+double first_person_fov_setting();
+double camera_distance_setting();
+void camera_set_distance(double distance);
+}

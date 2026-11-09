@@ -1,0 +1,879 @@
+// D08M — modern swimming / wading (host locomotion layer).
+// Included from modern_controls.cpp after terrain.inc.
+//
+// Iteration 9 — root/input bridge (see documentation/55-swim-controls-research.md):
+//   • Never invent +0x20c, never zero +0x1f8 on entry, never world-XYZ locomotion.
+//   • Free swim: face_view upright; WASD→D-pad + stick tables; suppress Square;
+//     soft clamped body-Y for Space↑/Ctrl↓; optional look×W when deep.
+//   • Optional late rewrite of +0xfc/+0x100 from camera-relative WASD.
+//   • Wade/ledge: 8003e2d0(97|98) + anti-bounce holdoff/reassert.
+//
+// D08O — deep free-swim polish:
+//   • A/D strafe: 8005201c's strafe branches read the layout's L2/R2 words
+//     (800d1a68 = left → 88/91/92, 800d1b80 = right → 89/90/93). D-pad
+//     Left/Right are turn buttons (71/70) and stick X is also turn, so the
+//     host resolves the strafe pad bits from the layout tables instead.
+//   • Ctrl descends from the surface: gate on floor margin (+0x1c8), not on
+//     "already >0x100 under the surface".
+//   • Free swim Space = ascend only; no host Space ledge exit (E / original
+//     mantle owns leaving the water). Wade jump 8003e2d0(97|98) unchanged.
+//
+// D08O.2 — native swim state machine (800455bc, player+0x22c):
+//   • state 4 = surface (anims 122 idle, 125 fwd, 126 back, 123/124 strafe).
+//     80044c18 pins body Y to the surface every frame, so soft-Y can never
+//     dive from here. The original dive is 80045564 → state 5 / anim 133;
+//     Ctrl calls it directly (Square would also require "no ledge ahead").
+//   • state 5 = underwater (127 idle, 128–130 thrust, 133 dive). Square/Cross
+//     = thrust along body yaw + body pitch (+0x1e/+0x26, +900 up … −900 down;
+//     D-pad Up/Down are pitch). Host sets yaw/pitch camera-relatively from
+//     WASD / Space / Ctrl and injects Square; the original integrator moves
+//     Duke and hands back to state 4 when he breaks the surface.
+//
+// D08O.3 — wade ledge assist (subway platforms from shallow water):
+//   • The directed jump 98 rises only ~560 units; the subway ledge is ~635
+//     above the water floor. It lands only from a ~700–1250-unit run-up; from
+//     the wall the 98 is cancelled on frame one (splash), and from 300–600
+//     units it hits the wall face (107) and falls back (105).
+//   • Fix: when the standing probe (repeated 0/320/…/1280 units along the
+//     view) sees a ledge ≥256 above the feet, the ordinary directed jump 98
+//     is launched toward it with a higher takeoff velocity (applied at the
+//     first ballistic update like the bed fix's delayed_vertical; 98
+//     integrates ≈vy/96 per tick so −9000 rises ≈840 vs its own ≈560), XZ
+//     speed scaled to the measured distance, and — within one probe step of
+//     the wall — XZ held at zero until the animated foot clears the lip, since
+//     98's first stride into the wall face is what bumped (107) / cancelled.
+//     A first version used vertical 97 → 98; the user found that hop far too
+//     high, so the arc is 98's own, only ≈280 taller.
+
+static constexpr int32_t k_water_none = 0x40000000;
+// Original 8005201c: <0x200 shallow/wade, [0x200,0x281) mid walk (controller
+// early-outs), ≥0x281 deep Square/176. Anim 70/71 in shallow water are tank
+// turns, not 3D swim — the crystal-2 turret corridor is depth 0x100.
+static constexpr int32_t k_free_swim_depth = 0x281;
+static constexpr int32_t k_swim_y_step = 96;
+static constexpr int32_t k_swim_root_step = 48; // D08AB original: fixed free-swim root
+static constexpr int32_t k_swim_floor_margin = 0x1e0; // standing body≈+0x1f4 above feet
+static constexpr int32_t k_stick_deflect = 0x60; // ≥ run threshold path (0x51)
+static constexpr double k_wade_hz_walk = 3600.0;
+static constexpr double k_wade_hz_run = 4800.0;
+static constexpr uint32_t k_pad_words = 0x800d1440;
+static constexpr uint32_t k_pad_word_stride = 21;
+static constexpr int32_t k_ledge_assist_rise = -256;  // ledge at least this far above the feet (Y-down)
+static constexpr int32_t k_ledge_assist_clear = 32;   // foot this far above the ledge top before XZ resumes (landing tolerates ~100 below)
+static constexpr int k_ledge_assist_holdoff = 40;     // swim_update calls (2 per tick) to keep +0x20c quiet
+static constexpr int32_t k_ledge_vy = -9000;          // 98's own takeoff ≈ −6900 (rise ≈560, g≈506/tick, Δy≈vy/96); this rises ≈840
+static constexpr int32_t k_ledge_hold_distance = 320; // probe offsets up to this: XZ held until the lip is cleared
+static constexpr double k_ledge_speed_hold = 3400.0;  // XZ once released near the apex when the jump started at the wall
+static constexpr double k_ledge_speed_hold_far = 4000.0; // … when the ledge was found one probe step out
+static constexpr double k_ledge_speed_base = 1900.0;  // XZ from takeoff otherwise (flight ≈40 ticks → travel ≈ speed/4)
+static constexpr double k_ledge_speed_per_unit = 3.5; // + per unit of probe distance
+static constexpr double k_ledge_speed_max = 6400.0;  // ≈ 98's own 6007
+static uint64_t swim_frame, swim_epoch;
+static unsigned swim_mantles, wade_jumps, swim_dives, ledge_assists;
+static int swim_water_holdoff;
+static int swim_boost_frames;
+static Vec2 swim_boost_dir{};
+static bool swim_boost_running;
+static double swim_boost_want; // >0: exact ledge-assist speed instead of walk/run top-up
+static bool swim_ledge_pending, swim_ledge_hold_xz;
+static int32_t swim_ledge_top;
+static Vec2 swim_ledge_dir{};
+static double swim_ledge_speed;
+static uint64_t swim_ledge_epoch;
+
+static bool swim_trace() {
+    static const bool enabled=std::getenv("DNTTK_SWIM_TRACE")!=nullptr;
+    return enabled;
+}
+
+static int32_t water_surface_y() {
+    return (int32_t)psx_mod_read_word(player+0x834);
+}
+static bool water_present() {
+    return psx_mod_read_word(player+0x834)!=(uint32_t)k_water_none;
+}
+static int32_t water_depth_units() {
+    if(!water_present())return 0;
+    return (int32_t)psx_mod_read_word(player+0x1c8)-water_surface_y();
+}
+static bool water_flagged() {
+    return water_present() && psx_mod_read_word(player+0x20c)!=0;
+}
+static bool water_submerged() {
+    if(!water_present())return false;
+    return (int32_t)psx_mod_read_word(player+8)>water_surface_y();
+}
+static bool in_water() {
+    return water_flagged();
+}
+static int32_t water_body_delta() {
+    return (int32_t)psx_mod_read_word(player+8)-water_surface_y();
+}
+static bool wade_anim(unsigned animation) {
+    return animation==63 || (animation>=72 && animation<=79) ||
+           animation==178 || animation==181;
+}
+static bool free_swim_anim(unsigned animation) {
+    return animation==70 || animation==80 || animation==81 ||
+           animation==175 || animation==177;
+}
+static bool airborne_jump_anim(unsigned animation) {
+    return animation==97 || animation==98 || animation==103;
+}
+static bool free_swimming() {
+    if(!water_flagged())return false;
+    const unsigned animation=psx_mod_read_half(player+0x60);
+    if(airborne_jump_anim(animation))return false;
+    const unsigned mode=psx_mod_read_byte(player+0x22c);
+    if(mode==4 || mode==5)return true;
+    if(water_depth_units()<k_free_swim_depth)return false;
+    if(free_swim_anim(animation))return true;
+    if(wade_anim(animation))return false;
+    return true;
+}
+static bool wading() {
+    if(!water_flagged() || free_swimming())return false;
+    return !airborne_jump_anim(psx_mod_read_half(player+0x60));
+}
+static bool shallow_land_water() {
+    if(!wading())return false;
+    const unsigned mode=psx_mod_read_byte(player+0x22c);
+    if(mode==4 || mode==5)return false;
+    return water_depth_units()<k_free_swim_depth;
+}
+// D08AB - SWIMMING modern (DNTTK_SWIMMING=modern, the Modernized default; the
+// launcher passes original for Vanilla) is D08AA's one walk/run pace in
+// every water state. original restores the pre-D08AA water speeds with modern
+// controls: the forced run in shallow and mid-depth water, the 2x wade band,
+// the fixed free-swim root and the fixed surface / underwater strokes.
+static bool swimming_modern() {
+    const char* v=ttk_live_env("DNTTK_SWIMMING");
+    return !v || std::strcmp(v,"original");
+}
+bool wade_full_speed_ready() {
+    return !swimming_modern() && input_modernized() && gameplay_context() && shallow_land_water();
+}
+// Native swim state machine (800455bc) — player+0x22c 4 = surface, 5 = under.
+static constexpr int32_t k_swim_pitch_max = 900;      // original ±clamp
+static constexpr int32_t k_swim_pitch_vertical = 900;
+static constexpr int32_t k_swim_pitch_diagonal = 640;
+static bool swim_surface_anim(unsigned animation) {
+    return animation>=122 && animation<=126;
+}
+static bool swim_underwater_anim(unsigned animation) {
+    return animation==127 || (animation>=128 && animation<=130) || animation==133;
+}
+static bool swim_native_surface() {
+    return water_flagged() && psx_mod_read_byte(player+0x22c)==4 &&
+           swim_surface_anim(psx_mod_read_half(player+0x60));
+}
+static bool swim_native_underwater() {
+    return water_flagged() && psx_mod_read_byte(player+0x22c)==5 &&
+           swim_underwater_anim(psx_mod_read_half(player+0x60));
+}
+static bool swim_lease_ready() {
+    if(!input_modernized() || !gameplay_context() || !independent_camera())return false;
+    if(!input_snapshot(Context::Gameplay).active)return false;
+    if((psx_mod_read_word(player)&0x20002) || (psx_mod_read_word(player+0x224)&0x20000000))return false;
+    if(psx_mod_read_word(camera+0xa4)!=player || psx_mod_read_word(player+0x7d4)!=camera)return false;
+    if(!identity() || !water_flagged())return false;
+    if(traversal_state_ready())return false;
+    return true;
+}
+bool swim_input_ready() {
+    if(!swim_lease_ready() || !free_swimming())return false;
+    if(traversal_input_ready() || airborne_input_ready())return false;
+    // Underwater the D-pad is pitch; thrust is injected by swim_thrust_input_ready.
+    if(swim_native_underwater())return false;
+    return true;
+}
+// Underwater (state 5): any WASD / Space / Ctrl becomes Square thrust; the host
+// has already pointed body yaw/pitch where that thrust should go.
+bool swim_thrust_input_ready() {
+    if(!swim_lease_ready() || !swim_native_underwater())return false;
+    if(traversal_input_ready() || airborne_input_ready())return false;
+    return true;
+}
+// Suppress Square for legacy wade jumps and free-swim vertical. D08AC
+// grounded Modern water uses the same buffered Square as dry-ground jumps.
+bool swim_host_owns_jump() {
+    return swim_lease_ready() && (free_swimming() || (wading() && !grounded_water_modern()));
+}
+
+static void swim_face_view_upright() {
+    face_view();
+    psx_mod_write_half(player+0x1e,0);
+    psx_mod_write_half(player+0x26,0);
+}
+
+// 8005201c reads the forward magnitude word through 800d1b48[player+0x233].
+// 800d1600 (stick X) is a turn axis in TTK — never fed from A/D.
+static void swim_feed_stick(const InputFrame& f) {
+    const unsigned idx=psx_mod_read_byte(player+0x233)&3u;
+    const uint32_t p_a=psx_mod_read_word(0x800d1b48+idx*4);
+    if(!p_a || (p_a&3))return;
+    if(p_a<0x80000000u || p_a>0x801ff000u)return;
+    const int32_t fwd=(int32_t)std::lround(f.move_y*k_stick_deflect);
+    psx_mod_write_word(p_a,fwd);
+}
+
+// Pad word pointer → PSX pad bit. Words live at 800d1440+4*(bit+1+21*pad).
+static int swim_pad_bit_from_word(uint32_t ptr,unsigned pad) {
+    if(ptr<k_pad_words || (ptr&3))return -1;
+    const int32_t index=(int32_t)((ptr-k_pad_words)/4)-(int32_t)(k_pad_word_stride*pad)-1;
+    return (index>=0 && index<16)?index:-1;
+}
+
+// Strafe pad masks for the active layout (fallback L2/R2 = default layout).
+void swim_strafe_pads(uint16_t& left,uint16_t& right) {
+    left=0x100;right=0x200;
+    const unsigned idx=psx_mod_read_byte(player+0x233)&3u;
+    const int l=swim_pad_bit_from_word(psx_mod_read_word(0x800d1a68+idx*4),idx);
+    const int r=swim_pad_bit_from_word(psx_mod_read_word(0x800d1b80+idx*4),idx);
+    if(l>=0 && r>=0 && l!=r) {
+        left=(uint16_t)(1u<<l);
+        right=(uint16_t)(1u<<r);
+    }
+}
+
+static void swim_rewrite_root(const InputFrame& f) {
+    // Body faces view; local X ≈ strafe, local Z ≈ forward for 8005201c.
+    if(!f.move_x && !f.move_y) {
+        psx_mod_write_half(player+0xfc,0);
+        psx_mod_write_half(player+0x100,0);
+        return;
+    }
+    // D08AA: the shared walk/run pace step, not a fixed 48 per update.
+    const double step=swimming_modern()?modern_pace_step(input_running()):k_swim_root_step;
+    psx_mod_write_half(player+0xfc,(int16_t)std::lround(f.move_x*step));
+    psx_mod_write_half(player+0xfe,0);
+    psx_mod_write_half(player+0x100,(int16_t)std::lround(f.move_y*step));
+}
+
+// Mid-depth wade (depth 0x200..0x281, crystal-2 flooded corridor / ledge):
+// the gait dispatcher (800486c8 and siblings) swaps every land gait for the
+// wade clips 80/81, whose state handler 800539f8 applies the animation root
+// (~22 units per frame, D-pad Forward only) after 800788e0 collision. The
+// root is rewritten at that handler's entry (modern_controls.cpp), the same
+// place the land run/walk handlers are owned; nothing here can help because
+// the track advance (80059d18..80059d88) re-extracts and rotates the root
+// after the player-update hook and before the handler.
+static bool mid_wade_anim(unsigned animation) { return animation==80 || animation==81; }
+static bool mid_wade_state() {
+    return wading() && psx_mod_read_byte(player+0x22c)==1 &&
+        mid_wade_anim(psx_mod_read_half(player+0x60)) &&
+        water_depth_units()>=0x200;
+}
+bool mid_wade_input_ready() {
+    return mid_wade_state() && swim_lease_ready() && locomotion_input_ready() &&
+        !(psx_mod_read_word(player+0x224)&0x202002c1);
+}
+
+// Standing probe ahead of the view. On success `rise` is the ledge floor
+// relative to the animated foot (+0x10): negative = above the feet.
+// The standing probe reaches only ~350 units. To see a ledge from a normal
+// run-up distance, repeat it from points shifted along the direction; the
+// world position is written back before returning (a query, not a move).
+static bool swim_probe_from(CPUState* cpu,Vec2 dir,int32_t ahead,int32_t& result,int32_t& floor) {
+    const uint32_t x=psx_mod_read_word(player+4),z=psx_mod_read_word(player+12);
+    if(ahead) {
+        psx_mod_write_word(player+4,(uint32_t)((int32_t)x+(int32_t)std::lround(dir.x*ahead)));
+        psx_mod_write_word(player+12,(uint32_t)((int32_t)z+(int32_t)std::lround(dir.z*ahead)));
+    }
+    const bool ok=terrain_probe(cpu,0x800797f4,dir,result,floor);
+    if(ahead) {psx_mod_write_word(player+4,x);psx_mod_write_word(player+12,z);}
+    return ok;
+}
+
+static bool swim_climb_ahead(CPUState* cpu,int32_t* rise=nullptr) {
+    if(!cpu)return false;
+    const float samples[][2]={{0,1},{-0.4f,0.9f},{0.4f,0.9f},{0,0.7f},{0,0.45f}};
+    for(auto& s:samples) {
+        auto dir=movement(view_yaw(),s[0],s[1]);
+        int32_t result=0,floor=0;
+        const bool ok=swim_probe_from(cpu,dir,0,result,floor);
+        if(swim_trace())std::fprintf(stderr,"ttk-climb dir=%.2f/%.2f ok=%d result=%d floor=%d foot=%d y=%d\n",s[0],s[1],ok,result,floor,
+            (int32_t)psx_mod_read_word(player+0x10),(int32_t)psx_mod_read_word(player+8));
+        if(!ok)continue;
+        if((result==0 || result==5) && floor>=-1792 && floor<=1280) {
+            if(rise)*rise=floor;
+            return true;
+        }
+    }
+    return false;
+}
+
+// Ledge search along the view: a step the standing probe refuses (result 1)
+// whose floor sits 256–1792 above the feet, within a run-up distance.
+// `blocked` reports a refused step right in front (a plain wall, no ledge).
+static bool swim_ledge_ahead(CPUState* cpu,Vec2 dir,int32_t& rise,int32_t& distance,bool* blocked=nullptr) {
+    if(!cpu)return false;
+    if(blocked)*blocked=false;
+    for(int32_t ahead: {0,320,640,960,1280}) {
+        int32_t result=0,floor=0;
+        const bool ok=swim_probe_from(cpu,dir,ahead,result,floor);
+        if(swim_trace())std::fprintf(stderr,"ttk-ledge probe ahead=%d ok=%d result=%d floor=%d\n",ahead,ok,result,floor);
+        if(!ok)return false;
+        if(result==1 && floor<=k_ledge_assist_rise && floor>=-1792) {rise=floor;distance=ahead;return true;}
+        if(ahead==0 && result==1 && blocked)*blocked=true;
+        if(result!=0 || floor<-128 || floor>256)return false; // not flat wading floor: stop scanning
+    }
+    return false;
+}
+
+
+static void swim_boost_horizontal(Vec2 dir,bool directed,bool running) {
+    if(!directed)return;
+    const bool exact=swim_boost_want>0;
+    const double want=exact?swim_boost_want:(running?k_wade_hz_run:k_wade_hz_walk);
+    const double vx=(int32_t)psx_mod_read_word(player+0x1f4);
+    const double vz=(int32_t)psx_mod_read_word(player+0x1fc);
+    const double mag=std::hypot(vx,vz);
+    // D08W: the original launch (0x8003e2d0) aims along Duke's facing. Keep its
+    // speed when it is already faster than the wade minimum, but always along
+    // the held camera-relative direction, as a dry-ground D08C jump does; the
+    // old rescale kept the facing, so strafe and backward wade jumps went forward.
+    const double speed=exact?want:std::max(mag,want);
+    psx_mod_write_word(player+0x1f4,(int32_t)std::lround(dir.x*speed));
+    psx_mod_write_word(player+0x1fc,(int32_t)std::lround(dir.z*speed));
+    swim_boost_dir=dir;
+    swim_boost_running=running;
+}
+
+static void swim_reassert_boost() {
+    if(swim_boost_frames<=0)return;
+    if(!airborne_jump_anim(psx_mod_read_half(player+0x60))) {
+        swim_boost_frames=0;swim_boost_want=0;return;
+    }
+    swim_boost_horizontal(swim_boost_dir,true,swim_boost_running);
+    --swim_boost_frames;
+}
+
+static bool swim_start_airborne_jump(CPUState* cpu,const InputFrame& f,Vec2 dir,bool directed) {
+    const unsigned jump_animation=directed?98:97;
+    const uint32_t water=psx_mod_read_word(player+0x20c);
+    if(water)psx_mod_write_word(player+0x20c,0);
+    if(!original_call(cpu,0x8003e2d0,jump_animation)) {
+        if(water)psx_mod_write_word(player+0x20c,water);
+        return false;
+    }
+    psx_mod_write_half(player+0x60,jump_animation);
+    psx_mod_write_half(player+0x68,0);
+    psx_mod_write_half(player+0x6a,0);
+    // Longer holdoff + XZ reassert reduces lip bounce-back on subway ledges.
+    if(water)swim_water_holdoff=22;
+    swim_boost_want=0;
+    swim_boost_horizontal(dir,directed,input_running());
+    if(directed)swim_boost_frames=12;
+    takeoff_intent=dir;
+    takeoff_epoch=f.epoch;takeoff_frame=f.sequence;
+    takeoff_valid=true;takeoff_obstacle=false;takeoff_direction=directed;
+    intent=dir;had_movement=directed;intent_epoch=f.epoch;movement_frame=f.sequence;
+    ground_frame=f.sequence;ground_epoch=f.epoch;
+    flight_intent=directed?dir:Vec2{0,0};
+    flight_epoch=f.epoch;
+    flight_valid=true;
+    // D08Z: wade jumps keep their own ledge/boost horizontal control; no
+    // manual air steering (it only acts on a seeded cap).
+    air_cap=0;
+    return true;
+}
+
+// Ledge assist, per ballistic update of the directed jump (8003ebf4 hook,
+// before the original integrates): hold the XZ speed at the distance-scaled
+// value — zero while still below the lip when the jump started at the wall —
+// and release once the animated foot has cleared the ledge top.
+static void swim_ledge_ballistic(const InputFrame& f) {
+    if(!swim_ledge_pending)return;
+    const unsigned animation=psx_mod_read_half(player+0x60);
+    const int32_t vy=(int32_t)psx_mod_read_word(player+0x1f8);
+    const int32_t foot=(int32_t)psx_mod_read_word(player+0x10);
+    const bool clear=foot<=swim_ledge_top-k_ledge_assist_clear;
+    if(swim_trace())std::fprintf(stderr,"ttk-ledge ballistic anim=%u/%u st=%u/%u vy=%d vz=%d y=%d foot=%d delayed=%d\n",animation,psx_mod_read_half(player+0x68),
+        psx_mod_read_byte(player+0x22c),psx_mod_read_byte(player+0x22d),vy,(int32_t)psx_mod_read_word(player+0x1fc),(int32_t)psx_mod_read_word(player+8),foot,delayed_takeoff);
+    if(animation!=98 || f.epoch!=swim_ledge_epoch || psx_mod_read_byte(player+0x22c)!=9 || (vy>=0 && !clear)) {
+        if(swim_trace())std::fprintf(stderr,"ttk-ledge abort anim=%u vy=%d foot=%d top=%d\n",animation,vy,foot,swim_ledge_top);
+        swim_ledge_pending=false;swim_ledge_hold_xz=false;return;
+    }
+    if(!clear && swim_ledge_hold_xz) {
+        psx_mod_write_word(player+0x1f4,0);psx_mod_write_word(player+0x1fc,0);
+        return;
+    }
+    swim_boost_want=swim_ledge_speed;
+    swim_boost_horizontal(swim_ledge_dir,true,false);
+    if(clear) {
+        swim_boost_frames=12;
+        swim_ledge_pending=false;swim_ledge_hold_xz=false;++ledge_assists;
+        if(swim_trace())std::fprintf(stderr,"ttk-ledge clear vy=%d foot=%d top=%d speed=%.0f\n",vy,foot,swim_ledge_top,swim_ledge_speed);
+    }
+}
+
+static void swim_try_wade_jump(CPUState* cpu,const InputFrame& f) {
+    if(!input_jump_pending())return;
+    const unsigned animation=psx_mod_read_half(player+0x60);
+    const bool standing=wade_anim(animation) || animation==70 || animation==175 ||
+        animation==176 || animation==177 || mid_wade_anim(animation);
+    int32_t rise=0,distance=0;bool blocked=false;
+    // D08W: the ledge and climb assists jump toward what lies ahead of the view,
+    // so they serve Space alone or a jump with W held. Strafing (A/D, also after
+    // running forward) or backing (S) is the ordinary directed jump below; the
+    // climb probe accepts flat water ahead, which used to turn every strafe or
+    // backward jump in the subway into a forward one.
+    const bool toward_view=(!f.move_x && !f.move_y) || f.move_y>0.05f;
+    if(standing && !(psx_mod_read_word(player+0x224)&0x202002c1) && !f.held[crouch] &&
+       toward_view && swim_ledge_ahead(cpu,movement(view_yaw(),0,1),rise,distance,&blocked)) {
+        // Ledge well above the feet: the ordinary directed jump toward it,
+        // a little more lift, XZ held while below the lip when at the wall.
+        if(!input_take_jump())return;
+        auto dir=movement(view_yaw(),0,1);
+        const int32_t foot=(int32_t)psx_mod_read_word(player+0x10);
+        if(swim_start_airborne_jump(cpu,f,dir,true)) {
+            // Close to the wall 98's first stride would bump it (107) before
+            // the feet are up, so XZ waits for the lip in the near buckets.
+            swim_ledge_pending=true;swim_ledge_top=foot+rise;swim_ledge_hold_xz=distance<=k_ledge_hold_distance;
+            // Speed scaled to the measured distance so Duke lands just past
+            // the lip instead of flying into whatever stands behind it.
+            swim_ledge_dir=dir;
+            swim_ledge_speed=swim_ledge_hold_xz?(distance==0?k_ledge_speed_hold:k_ledge_speed_hold_far):
+                std::clamp(k_ledge_speed_base+k_ledge_speed_per_unit*distance,k_ledge_speed_base,k_ledge_speed_max);
+            swim_ledge_epoch=f.epoch;
+            delayed_vertical=k_ledge_vy;delayed_takeoff=true;terrain_epoch=f.epoch;
+            // The generic wade boost must not fight the assist's speed/hold.
+            swim_boost_frames=0;swim_boost_want=swim_ledge_speed;
+            swim_water_holdoff=std::max(swim_water_holdoff,k_ledge_assist_holdoff);
+            ++standing_takeoffs;++wade_jumps;
+            if(swim_trace())std::fprintf(stderr,"ttk-ledge launch rise=%d distance=%d foot=%d top=%d hold=%d\n",rise,distance,foot,swim_ledge_top,swim_ledge_hold_xz);
+        }
+        return;
+    }
+    if(toward_view && swim_climb_ahead(cpu,&rise)) {
+        if(!input_take_jump())return;
+        auto dir=movement(view_yaw(),f.move_x,f.move_y>0.05f?f.move_y:1.0f);
+        if(swim_start_airborne_jump(cpu,f,dir,true)) {
+            ++standing_takeoffs;++wade_jumps;
+        }
+        return;
+    }
+    if(!standing)return;
+    if(psx_mod_read_word(player+0x224)&0x202002c1)return;
+    if(!input_take_jump())return;
+    // A directed 98 straight into a plain wall is cancelled by the original on
+    // its first frame (Duke just splashes); give the vertical hop instead.
+    const bool directed=(f.move_x || f.move_y) && !(blocked && f.move_y>0.05f);
+    auto dir=directed?movement(view_yaw(),f.move_x,f.move_y):Vec2{0,0};
+    if(swim_start_airborne_jump(cpu,f,dir,directed)) {
+        ++standing_takeoffs;++wade_jumps;
+    }
+}
+
+// Soft Y only while original water flag is set. Never clears fall VY, never
+// invents +0x20c, never rises through the free surface.
+static void swim_apply_vertical(const InputFrame& f) {
+    if(!water_flagged())return;
+    int32_t dy=0;
+    if(f.held[jump] && !f.held[crouch]) dy=-k_swim_y_step;
+    else if(f.held[crouch] && !f.held[jump]) dy=k_swim_y_step;
+    else if(water_body_delta()>0xa0 && (f.move_x || f.move_y)) {
+        dy=(int32_t)std::lround(-std::sin(pitch)*f.move_y*k_swim_y_step);
+    }
+    if(!dy)return;
+    int32_t y=(int32_t)psx_mod_read_word(player+8);
+    const int32_t surf=water_surface_y();
+    int32_t next=y+dy;
+    if(dy<0 && next<surf) next=surf;
+    if(dy>0) {
+        // Descend from the surface or mid-water, but keep a floor margin so
+        // Ctrl cannot pin Duke into unrecoverable ground (Space always recovers).
+        const int32_t floor_y=(int32_t)psx_mod_read_word(player+0x1c8);
+        const int32_t limit=std::min(floor_y-k_swim_floor_margin,surf+0x1800);
+        if(next>limit) next=limit;
+        if(next<=y)return;
+    }
+    psx_mod_write_word(player+8,next);
+}
+
+// Surface (state 4): Ctrl = the original dive transition (80045564 → state 5,
+// anim 133). Same guards the original applies before its Square dive.
+static void swim_try_dive(CPUState* cpu,const InputFrame& f) {
+    if(!cpu || !f.held[crouch] || f.held[jump])return;
+    if(psx_mod_read_word(player+0x224)&0x241)return;
+    if(psx_mod_read_half(player+0x244))return;
+    if(original_call(cpu,0x80045564,player+0x60))++swim_dives;
+}
+
+// D08O4: the dive 133 is a fixed ~30-update thrust whose root motion follows
+// body pitch and ignores Square, so after a short Ctrl it carried Duke along
+// the view (a 3-update tap drifted ~1470 units). Thrust 128 stops when its
+// injected Square goes; with no swim input left the dive now ends the way its
+// own handler (0x80046814) does: anim 127, track 0 (its +0x264 sound is unset
+// during 133). Runs before the original handler in the same update.
+static unsigned swim_dive_stops;
+static void swim_end_dive(const InputFrame& f) {
+    if(psx_mod_read_half(player+0x60)!=133)return;
+    if(f.move_x || f.move_y || f.held[jump] || f.held[crouch])return;
+    psx_mod_write_half(player+0x60,127);
+    psx_mod_write_half(player+0x68,0);
+    psx_mod_write_half(player+0x6a,0);
+    ++swim_dive_stops;
+}
+
+// Underwater (state 5): body yaw = camera-relative move direction (view yaw
+// when idle); body pitch = look pitch along the move axis, or ±vertical for
+// Space / Ctrl. The original thrust (Square, injected by input_pad) follows it.
+static void swim_steer_underwater(const InputFrame& f) {
+    const bool moving=f.move_x || f.move_y;
+    double heading_rad=view_yaw();
+    double forward_share=0.0;
+    if(moving) {
+        const auto dir=movement(view_yaw(),f.move_x,f.move_y);
+        heading_rad=std::atan2(dir.x,dir.z);
+        forward_share=f.move_y/std::hypot((double)f.move_x,(double)f.move_y);
+    }
+    const int heading=static_cast<int>(std::lround(heading_rad*4096/tau)) & 4095;
+    psx_mod_write_half(player+0x1c,heading);
+    psx_mod_write_half(player+0x24,heading);
+    psx_mod_write_half(player+0x2b4,0);
+    // Host view pitch is +down (forward.y = sin(pitch)); body pitch is +up.
+    const double look_up=std::clamp(-pitch*4096/tau,(double)-k_swim_pitch_max,(double)k_swim_pitch_max);
+    int32_t body_pitch;
+    if(f.held[jump] && !f.held[crouch]) body_pitch=moving?k_swim_pitch_diagonal:k_swim_pitch_vertical;
+    else if(f.held[crouch] && !f.held[jump]) body_pitch=moving?-k_swim_pitch_diagonal:-k_swim_pitch_vertical;
+    else if(moving) body_pitch=(int32_t)std::lround(look_up*forward_share);
+    else body_pitch=(int32_t)std::lround(look_up);
+    psx_mod_write_half(player+0x1e,(int16_t)body_pitch);
+    psx_mod_write_half(player+0x26,(int16_t)body_pitch);
+}
+
+// D08AA - surface and underwater strokes at the shared walk/run pace. The
+// swim tail (0x800455bc, from 0x80046e90) has 800451a0 write a body-local
+// velocity to player+0x1f4 from fixed speeds: surface forward 125 0x1333,
+// back 126 0xaaa, strafe 123/124 0x444 (local X), underwater thrust 128-130
+// 0x149f, each scaled down by the pad's pressure. 0x80066e34 (ra 0x80046ec8,
+// a0 = the stack copy of yaw / pitch / roll, a1 = player+0x1f4) then turns it
+// into world space, and the tail moves Duke by v*dt/1024 with the original
+// collision. Shift never reached it: the surface was ~26 units per vblank
+// forward and ~6 sideways, underwater ~28, whatever Shift said. With a WASD
+// direction held, the stroke's horizontal speed becomes modern_pace() (land
+// walk or run) in every direction, keeping the pressure share. Underwater the
+// view-pitched thrust keeps its slope; with Space or Ctrl (explicit vertical)
+// the original vertical speed stays and only the horizontal part changes,
+// through the pitch of the stack copy (the body pitch is not touched). No
+// direction (idle, Space / Ctrl alone), the dive 133 and Vanilla: original.
+static constexpr double k_swim_surface_forward=0x1333, k_swim_surface_back=0xaaa, k_swim_surface_strafe=0x444;
+static constexpr double k_swim_thrust=0x149f;
+static unsigned swim_paces;
+static void swim_pace(CPUState* cpu) {
+    if(cpu->gpr[5]!=player+0x1f4 || !swim_lease_ready() || !swimming_modern())return;
+    const auto& f=input_snapshot(Context::Gameplay);
+    if(!f.move_x && !f.move_y)return;
+    const uint32_t velocity=player+0x1f4,angles=cpu->gpr[4];
+    if(angles<0x80000000u || angles>0x801ffff8u || (angles&1))return;
+    const unsigned animation=psx_mod_read_half(player+0x60);
+    const double pace=modern_pace(input_running());
+    if(swim_native_surface()) {
+        // One local axis carries the stroke: Z forward / back, X sideways.
+        const bool sideways=animation==123 || animation==124;
+        const double base=sideways?k_swim_surface_strafe:animation==125?k_swim_surface_forward:animation==126?k_swim_surface_back:0;
+        const uint32_t axis=velocity+(sideways?0:8);
+        const double v=(int32_t)psx_mod_read_word(axis);
+        if(base<=0 || !v || std::fabs(v)>base)return;
+        psx_mod_write_word(axis,(int32_t)std::lround(v/base*pace));
+        ++swim_paces;
+        return;
+    }
+    if(!swim_native_underwater() || animation<128 || animation>130)return;
+    const double v=(int32_t)psx_mod_read_word(velocity+8);
+    if(v<=0 || v>k_swim_thrust || psx_mod_read_word(velocity) || psx_mod_read_word(velocity+4))return;
+    const double share=v/k_swim_thrust;
+    const bool vertical=f.held[jump]!=f.held[crouch];
+    if(!vertical) {
+        psx_mod_write_word(velocity+8,(int32_t)std::lround(share*pace));
+    } else {
+        const double p=(int16_t)psx_mod_read_half(angles+2)*tau/4096;
+        const double rise=v*std::sin(p),across=share*pace;
+        psx_mod_write_half(angles+2,(uint16_t)(int16_t)std::lround(std::atan2(rise,across)*4096/tau));
+        psx_mod_write_word(velocity+8,(int32_t)std::lround(std::hypot(rise,across)));
+    }
+    ++swim_paces;
+}
+
+// D08AF: the swim handler keeps fall displacement (flag 0x04000000) until native
+// drag finishes, even after selecting thrust 128. Blend horizontal intent into
+// the last part of that displacement at the sweep's first bone lookup,
+// before it reads horizontal root. The handler uses 0x60 bytes of stack and
+// the sweep uses 0x58; caller + stack + input epoch scope this single use.
+// Vertical velocity/root, drag accumulators, water ownership and completion
+// remain native. Nothing is retained in guest velocity after input release.
+static bool swim_plunge_pending;
+static uint32_t swim_plunge_sp;
+static uint64_t swim_plunge_epoch,swim_plunge_frame;
+static void swim_plunge_begin(CPUState* cpu) {
+    swim_plunge_pending=false;
+    if(cpu->gpr[4]!=player || cpu->gpr[31]!=0x8004b5bcu ||
+       !swimming_modern() || !swim_lease_ready() || !swim_native_underwater() ||
+       !(psx_mod_read_word(player)&0x04000000) ||
+       (psx_mod_read_word(player+0x224)&0x200241) ||
+       psx_mod_read_half(player+0x60)<127 || psx_mod_read_half(player+0x60)>130 ||
+       (int32_t)psx_mod_read_word(player+0x1f8)<=0)return;
+    const auto& f=input_snapshot(Context::Gameplay);
+    if(!f.move_x && !f.move_y)return;
+    swim_plunge_pending=true;swim_plunge_sp=cpu->gpr[29];
+    swim_plunge_epoch=f.epoch;swim_plunge_frame=f.sequence;
+}
+static void swim_plunge_sweep(CPUState* cpu) {
+    if(cpu->gpr[31]!=0x8007a9f8u)return;
+    const bool pending=swim_plunge_pending;swim_plunge_pending=false;
+    const auto& f=input_snapshot(Context::Gameplay);
+    if(!pending || cpu->gpr[4]!=player || cpu->gpr[29]+0xb8u!=swim_plunge_sp ||
+       f.epoch!=swim_plunge_epoch || f.sequence!=swim_plunge_frame ||
+       !swimming_modern() || !swim_lease_ready() || !swim_native_underwater() ||
+       (!f.move_x && !f.move_y))return;
+    const int dt=(int16_t)psx_mod_read_half(player+0xba);
+    if(dt<=0 || dt>64)return;
+    // Begin below 8192 native velocity units, reaching full intent at the
+    // native 1024 stop threshold. Smoothstep avoids a new acceleration corner at the gate.
+    const double vy=(int32_t)psx_mod_read_word(player+0x1f8);
+    const double t=std::clamp((8192.0-vy)/(8192.0-1024.0),0.0,1.0);
+    const double blend=t*t*(3-2*t);
+    if(blend<=0)return;
+    if(swim_trace())std::fprintf(stderr,"ttk-plunge vy=%.0f blend=%.3f dt=%d root=%d/%d/%d\n",vy,blend,dt,
+        (int16_t)psx_mod_read_half(player+0xfc),(int16_t)psx_mod_read_half(player+0xfe),(int16_t)psx_mod_read_half(player+0x100));
+    const auto dir=movement(view_yaw(),f.move_x,f.move_y);
+    const double slope=f.held[jump]!=f.held[crouch]?1.0:
+        std::cos((int16_t)psx_mod_read_half(player+0x1e)*tau/4096);
+    const double step=modern_pace(input_running())*slope*dt/1024.0;
+    const double desired[]={dir.x*step,dir.z*step};
+    for(unsigned i=0;i<2;++i) {
+        const uint32_t address=player+0xfc+4*i;
+        const double native=(int16_t)psx_mod_read_half(address);
+        psx_mod_write_half(address,(int16_t)std::lround(native+(desired[i]-native)*blend));
+    }
+}
+
+// D08O1 - fire while swimming underwater. The original state-5 handlers
+// (800455bc via table 80013ed8: idle 127 at 8004653c, thrust 128-130 at
+// 80046994) test the Cross action word before Square: with a weapon out, held
+// fire keeps Duke in, or returns him to, idle 127, so he stops to shoot. While
+// the player fires and holds a swim direction, bit 0 of that word (this tick)
+// is hidden from the swim handler only - its entry, called from 8004b594 - and
+// put back at the next player-update step, 80055e80 (callback table 800c2754
+// [3]), which 8005a210 always calls straight after; 800493a4 and the camera
+// update also restore it if that step does not run (other hooks do not: the
+// handler calls 0x80076330 before its fire test). The weapon still sees
+// fire; the original thrust then carries Duke where swim.inc points him.
+static unsigned swim_fire_masks, swim_fire_restores;
+static uint32_t swim_fire_word;
+static uint32_t swim_fire_value;
+static bool swim_fire_hidden;
+bool swim_weapon_ready() {
+    return swim_lease_ready() && (swim_native_underwater() || swim_native_surface());
+}
+// D08O3: E in water stows the weapon first, because the original climbs out
+// of water (surface, anims 134-142) only for an unarmed Cross; armed Cross
+// fires. The E redraw waited for ground movement, so without a ledge the
+// weapon stayed stowed. In the swim states it now redraws there too, under the
+// same settled conditions as on land; a climb-out leaves the swim states at
+// once and keeps the land redraw. The draw itself is the original weapon
+// request (select_weapon), as for the number keys: Circle there could end a
+// thrust stroke, and the original only restarts thrust from idle when ~425
+// units ahead are clear (0x8007c788), so Duke could stop near geometry.
+bool interaction_swim_restore_ready() {
+    return swim_weapon_ready() && psx_mod_read_byte(player+0x3b8)==0 &&
+        !(psx_mod_read_word(player+0x224)&4) && psx_mod_read_half(player+0x74)==psx_mod_read_half(player+0x60);
+}
+static void swim_fire_restore(uint32_t address=0) {
+    if(!swim_fire_hidden)return;
+    swim_fire_hidden=false;
+    if(swim_trace())std::fprintf(stderr,"ttk-swim-fire restore at %08x word=%08x anim=%u\n",address,psx_mod_read_word(swim_fire_word),psx_mod_read_half(player+0x60));
+    // Only undo our own write; a newer pad sample stays as the original made it.
+    if(psx_mod_read_word(swim_fire_word)==(swim_fire_value&~1u))psx_mod_write_word(swim_fire_word,swim_fire_value);
+    ++swim_fire_restores;
+}
+static void swim_fire_hide(CPUState* cpu,uint32_t ra) {
+    swim_fire_restore(0x800455bc);
+    const auto& f=input_snapshot(Context::Gameplay);
+    if(cpu->gpr[4]!=player || ra!=0x8004b5bc || !f.held[fire] || f.held[holster])return;
+    if(!(f.move_x || f.move_y || f.held[jump] || f.held[crouch]))return;
+    if(psx_mod_read_byte(player+0x3b8)!=2 || !swim_thrust_input_ready())return;
+    const uint32_t word=psx_mod_read_word(0x800d1b50+4*(psx_mod_read_byte(player+0x233)&3u));
+    if(word<k_pad_words || word>=k_pad_words+4*k_pad_word_stride*4 || (word&3))return;
+    const uint32_t value=psx_mod_read_word(word);
+    if(!(value&1u))return;
+    psx_mod_write_word(word,value&~1u);
+    if(swim_trace())std::fprintf(stderr,"ttk-swim-fire hide %08x=%08x anim=%u square=%08x\n",word,value,psx_mod_read_half(player+0x60),psx_mod_read_word(psx_mod_read_word(0x800d1b88+4*(psx_mod_read_byte(player+0x233)&3u))));
+    swim_fire_word=word;swim_fire_value=value;swim_fire_hidden=true;
+    ++swim_fire_masks;
+}
+
+// D08O2 / D08O2A - weapon points toward the crosshair while swimming and
+// firing. Firing while floating (idle 127) sets +0x224 0x100, so the player
+// update builds Duke with 0x80097c04, which gives the chest ([model+0x2d], parent
+// of both arms and the head) a world matrix facing the view through
+// 0x80097a44. The thrust handlers that D08O1 lets fire set no aim bit, so the
+// update uses the plain build 0x800987cc and the arms point down with the
+// stroke. v1 set 0x100 there, which stood the whole chest up to the view.
+// v2 leaves the build, the chest, the head and the legs on the original
+// stroke and changes only the shoulders (parts 0x0a and 0x0d). Duke is built by
+// 0x800987cc, or by 0x80097c04 without joint aims when only the +0x2b4 /
+// +0x2b8 / +0x358 bits pick it. At the shoulders' composition (0x800b42ec,
+// ra 0x8009899c with the record in s0, or ra 0x800980d0 with it in s1; a0 the
+// chest's world matrix P, a1 the shoulder's local L) L becomes P^T*A*L, where
+// A is the matrix 0x80097a44 builds from the view direction. The shoulder's
+// orientation is then A*L, the pose the arms take under the floating-fire
+// aim, while its position stays on the stroking chest; forearms and hands
+// follow through the original chain. Armed at the entry of 0x800411b8, the
+// last call before the build choice (ra 0x80042634), while Duke is
+// underwater, firing (or finishing the shot's upper animations, also after
+// reaching the surface) with a weapon
+// out and no original aim bit; no game memory is written for that. Disarmed
+// after the second shoulder or at the swim handler, the next update step, an
+// animation start, the camera update or the next entry.
+static unsigned swim_aims, swim_aim_restores, swim_arm_aims;
+static bool swim_aim_set;
+// Updates since fire was released (-1: no shot in progress).
+static int swim_aim_tail=-1;
+static constexpr int k_swim_aim_tail=90;
+static void swim_aim_restore() {
+    if(!swim_aim_set)return;
+    swim_aim_set=false;
+    ++swim_aim_restores;
+}
+// 0x800b42ec entry; a shared matrix routine, so the first test must be cheap.
+static void swim_aim_arm(CPUState* cpu) {
+    if(!swim_aim_set || (cpu->gpr[31]!=0x8009899cu && cpu->gpr[31]!=0x800980d0u) || cpu->gpr[21]!=player)return;
+    const uint32_t model=duke_model(),record=cpu->gpr[cpu->gpr[31]==0x8009899cu?16:17];
+    const uint32_t parent=cpu->gpr[4],local=cpu->gpr[5];
+    if(!model || record<model+0x44 || (record-(model+0x44))%0x28)return;
+    // D08O2B: costumes order their joints differently (the level 6 model has
+    // the chest at record 1 and the shoulders at 2 and 5, the level 2 sewer
+    // model at 10, 16 and 11), so the shoulders are found by part.
+    const int index=(int)((record-(model+0x44))/0x28);
+    const int left=duke_part_joint(model,part_left_shoulder),right=duke_part_joint(model,part_right_shoulder);
+    if(index!=left && index!=right)return;
+    if(index==std::max(left,right))swim_aim_restore();
+    // Both shoulders hang from the chest: the chest at depth 2, themselves at 3.
+    const int chest=duke_part_joint(model,part_spine);
+    if(chest<0 || chest>index || psx_mod_read_byte(model+0x44+0x28*chest+2)!=2 || psx_mod_read_byte(record+2)!=3 ||
+       parent!=0x1f800040u || cpu->gpr[6]!=0x1f800060u || local<0x1f800000u || local>0x1f8003e0u)return;
+    double d[3],n=0;
+    for(int i=0;i<3;++i){d[i]=(int16_t)psx_mod_read_half(camera+12+2*i);n+=d[i]*d[i];}
+    double r[3]={d[2],0,-d[0]};
+    const double rn=std::sqrt(r[0]*r[0]+r[2]*r[2]);
+    if(n<1 || rn<1)return;
+    n=std::sqrt(n);
+    for(double& v:d)v/=n;
+    for(double& v:r)v/=rn;
+    const double u[3]={d[1]*r[2]-d[2]*r[1],d[2]*r[0]-d[0]*r[2],d[0]*r[1]-d[1]*r[0]};
+    // A's columns are r, u, d as 0x80097a44 builds them; P and L are row-major Q12.
+    double A[3][3],P[3][3],L[3][3],PA[3][3];
+    for(int i=0;i<3;++i) {
+        A[i][0]=r[i];A[i][1]=u[i];A[i][2]=d[i];
+        for(int j=0;j<3;++j) {
+            P[i][j]=(int16_t)psx_mod_read_half(parent+2*(3*i+j))/4096.0;
+            L[i][j]=(int16_t)psx_mod_read_half(local+2*(3*i+j))/4096.0;
+        }
+    }
+    for(int i=0;i<3;++i)for(int j=0;j<3;++j){PA[i][j]=0;for(int k=0;k<3;++k)PA[i][j]+=P[k][i]*A[k][j];}
+    for(int i=0;i<3;++i)for(int j=0;j<3;++j) {
+        double v=0;for(int k=0;k<3;++k)v+=PA[i][k]*L[k][j];
+        psx_mod_write_half(local+2*(3*i+j),(uint16_t)(int16_t)std::lround(std::clamp(v,-1.0,1.0)*4096));
+    }
+    ++swim_arm_aims;
+}
+static void swim_aim_begin(CPUState* cpu,uint32_t ra) {
+    swim_aim_restore();
+    if(cpu->gpr[4]!=player || ra!=0x80042634)return;
+    const unsigned upper=psx_mod_read_half(player+0x74);
+    const auto& f=input_snapshot(Context::Gameplay);
+    const bool fire_held=f.held[fire] && !f.held[holster];
+    if(fire_held) swim_aim_tail=0;
+    // The tail also runs into the surface states: surfacing during the
+    // lowering left the gun pointing down for the frame a last shot can land
+    // on (user capture, 2026-10-07). Held fire at the surface keeps the
+    // original's own aim (0x100), which refuses below.
+    const bool water=swim_native_underwater() || (swim_aim_tail>=0 && swim_native_surface());
+    if(!water || !swim_weapon_ready() || psx_mod_read_byte(player+0x3b8)!=2 ||
+       !presentation_ready() || (psx_mod_read_word(player+0x224)&0x200100)) {
+        // Held fire can pass through original-aimed frames (floating, 0x100).
+        if(!fire_held)swim_aim_tail=-1;
+        return;
+    }
+    // After release, keep aiming while the original's upper animation table
+    // (0x800c2824, 149 guarded entries) marks the upper animation as part of
+    // a shot: raise, fire,
+    // lower and reload are 0x809 (Desert Eagle 9, 10, 12; shotgun 24-26;
+    // Gatling 33/34), while rest and ready poses carry 0x4 (stroke 5 / 20 /
+    // 29 0x200c, floating 8 0x80c). A single tap then keeps the arms up
+    // through its lowering, which plays after release.
+    if(!fire_held) {
+        const uint32_t flags=upper<149 ? psx_mod_read_word(0x800c2824+4*upper) : 0;
+        if(swim_aim_tail<0 || (flags&0x804)!=0x800 || ++swim_aim_tail>k_swim_aim_tail) {swim_aim_tail=-1;return;}
+    }
+    swim_aim_set=true;
+    ++swim_aims;
+}
+
+static void swim_update(CPUState* cpu,bool late) {
+    const auto& f=input_snapshot(Context::Gameplay);
+    // The assist runs at the ballistic hook (no swim lease in flight); drop it
+    // here if the jump never became airborne or the frame is gone.
+    if(!late && swim_ledge_pending &&
+       (!f.active || f.epoch!=swim_ledge_epoch || !identity() || (psx_mod_read_word(player)&0x20002) ||
+        psx_mod_read_half(player+0x60)!=98 || psx_mod_read_byte(player+0x22c)!=9)) {
+        swim_ledge_pending=false;swim_ledge_hold_xz=false;
+    }
+    if(!late && swim_trace() && (swim_ledge_pending || airborne_jump_anim(psx_mod_read_half(player+0x60))))
+        std::fprintf(stderr,"ttk-swim anim=%u st=%u x=%d z=%d y=%d foot=%d vy=%d vx=%d vz=%d water=%08x flags=%08x pending=%d top=%d lease=%d\n",
+            psx_mod_read_half(player+0x60),psx_mod_read_byte(player+0x22c),(int32_t)psx_mod_read_word(player+4),(int32_t)psx_mod_read_word(player+12),(int32_t)psx_mod_read_word(player+8),
+            (int32_t)psx_mod_read_word(player+0x10),(int32_t)psx_mod_read_word(player+0x1f8),(int32_t)psx_mod_read_word(player+0x1f4),
+            (int32_t)psx_mod_read_word(player+0x1fc),psx_mod_read_word(player+0x20c),psx_mod_read_word(player+0x224),
+            swim_ledge_pending,swim_ledge_top,swim_lease_ready());
+    if(!late && swim_trace() && airborne_jump_anim(psx_mod_read_half(player+0x60)))
+        std::fprintf(stderr,"ttk-swim early anim=%u/%u st=%u vy=%d vz=%d y=%d foot=%d pending=%d delayed=%d\n",psx_mod_read_half(player+0x60),psx_mod_read_half(player+0x68),
+            psx_mod_read_byte(player+0x22c),(int32_t)psx_mod_read_word(player+0x1f8),(int32_t)psx_mod_read_word(player+0x1fc),(int32_t)psx_mod_read_word(player+8),
+            (int32_t)psx_mod_read_word(player+0x10),swim_ledge_pending,delayed_takeoff);
+    if(!swim_lease_ready()) {
+        if(swim_water_holdoff>0)--swim_water_holdoff;
+        // In flight the water flag is clear, so the lease is not held; the XZ
+        // reassert must still run there or it never runs at all.
+        if(late && swim_boost_frames>0 && f.active && identity())swim_reassert_boost();
+        else if(swim_boost_frames>0)--swim_boost_frames;
+        return;
+    }
+    swim_frame=f.sequence;swim_epoch=f.epoch;
+
+    if(swim_water_holdoff>0 && airborne_jump_anim(psx_mod_read_half(player+0x60))) {
+        psx_mod_write_word(player+0x20c,0);
+        --swim_water_holdoff;
+    } else if(swim_water_holdoff>0) {
+        swim_water_holdoff=0;
+    }
+    if(late)swim_reassert_boost();
+
+    if(wading()) {
+        if(cpu && !grounded_water_modern())swim_try_wade_jump(cpu,f);
+        return;
+    }
+
+    if(swim_native_underwater()) {
+        if(!late)swim_end_dive(f);
+        swim_steer_underwater(f);
+        return;
+    }
+    if(swim_native_surface()) {
+        // Surface: original D-pad/L2/R2 swim (injected by input_pad); body
+        // upright facing the view; Ctrl dives; Space is inert; exit is mantle/E.
+        swim_face_view_upright();
+        swim_try_dive(cpu,f);
+        return;
+    }
+    if(free_swimming()) {
+        // Land-side water anims (70/80/81/175–177, mid depth) before the
+        // original hands over to its swim states. Space ascends, Ctrl dips.
+        swim_face_view_upright();
+        swim_feed_stick(f);
+        swim_rewrite_root(f);
+        if(late)swim_apply_vertical(f);
+        return;
+    }
+}

@@ -1,0 +1,731 @@
+// Included in the guarded controls adapter. Slot/name proof: 33-controls-shortcuts.md.
+static constexpr unsigned weapon_order[]={0,1,2,4,5,7,8,12,14,13,10,9,6,3,11};
+static constexpr unsigned group_start[]={0,3,4,5,6,7,10,11,12,14,15};
+static unsigned equipped=255,last_equipped=255,selected_item=5;
+static uint64_t command_seen;
+static bool guest_busy;
+// D08A4 portable steroids (steroids.inc, included after this file).
+static bool portable_steroids();
+static unsigned steroid_doses();
+static bool steroids_owned();
+static bool steroids_use(CPUState* cpu);
+static void steroids_poll();
+static void pickup_select_apply();
+// D08A33 new-weapon draw (pickup_select.inc).
+static unsigned pickup_weapon_due();
+static void pickup_weapon_drawn();
+static void pickup_weapon_cancel();
+// D08A12 next stick after a throw (dynamite.inc, included later).
+static bool dynamite_redraw_due(unsigned equipment,uint32_t flags);
+static bool dynamite_redraw;
+// D08J6A sidearm swap returned on the ground (climb_fire.inc, included later).
+static void climb_fire_ground_restore(const InputFrame& f,unsigned equipment,uint32_t flags);
+static void climb_swap_cancel(); // D08J7C
+static unsigned dynamite_redraws;
+static unsigned base_weapon(unsigned slot) {return slot==27?9:slot==28?7:slot==29?8:slot;}
+static bool usable_weapon(unsigned slot) {
+    if(slot>14)return false;
+    unsigned inventory=psx_mod_read_half(player+0x2c4+4*slot);
+    if(!(inventory&1) || !(psx_mod_read_half(0x800c4590+44*slot)&1))return false;
+    if(slot==0)return true;
+    unsigned actual=slot;
+    if(inventory&8)actual=slot==7?28:slot==8?29:slot==9?27:slot;
+    return (int16_t)psx_mod_read_half(player+0x2c6+4*actual)>0 ||
+        (slot==12 && (int32_t)psx_mod_read_word(player+0x254)>0);
+}
+// D08O1: in the swim states the original only completes a switch to weapons
+// whose table flags carry 0x04 (3/4/5/6/7/12 and the 28 variant); it remaps
+// others (1/2 -> 3, 8-11 -> 7, 13 -> 12) or leaves 14 pending, so underwater
+// choices skip them.
+static bool underwater_weapon(unsigned slot) {
+    if(slot>14)return false;
+    unsigned actual=slot;
+    if(psx_mod_read_half(player+0x2c4+4*slot)&8)actual=slot==7?28:slot==8?29:slot==9?27:slot;
+    return psx_mod_read_byte(0x800c4590+44*actual)&4;
+}
+// D08O5: the weapon fire draws in water. A holster keeps its weapon in
+// +0x3ba; one the original cannot use there takes the original swim remap
+// (1/2 -> 3, 8-11 -> 7, 13 -> 12) when that weapon is owned and loaded.
+static unsigned swim_fire_draw_weapon() {
+    unsigned slot=base_weapon(psx_mod_read_byte(player+0x3ba));
+    if(slot==0 || slot>14)return 0;
+    if(!underwater_weapon(slot))slot=slot<=2?3:slot>=8 && slot<=11?7:slot==13?12:0;
+    return slot && usable_weapon(slot) && underwater_weapon(slot)?slot:0;
+}
+bool swim_fire_draw_ready() {
+    return interaction_swim_restore_ready() && !(psx_mod_read_word(player+0x224)&0x2cd) && swim_fire_draw_weapon();
+}
+// While stowed, fire must not reach the swim handler as unarmed Cross: at a
+// surface ledge that is the climb-out. The draw sets equipment 2 directly;
+// equipment 1 (a thrown pipe bomb's detonator) keeps its own Cross.
+bool swim_fire_cross_masked() {
+    return swim_weapon_ready() && psx_mod_read_byte(player+0x3b8)==0 && swim_fire_draw_weapon();
+}
+// Original callable item path, on an isolated CPU/stack, never an input/fire macro.
+static bool original_call(CPUState* source,uint32_t address,uint32_t a1,int32_t* result=nullptr,int64_t a2=-1,int64_t a0=-1) {
+    uint32_t top=source->gpr[29];
+    if(guest_busy || top<0x801f4000 || top>0x801ffff0 || g_precise_mode || g_ls_mode || g_psx_call_bail)return false;
+    uint32_t saved[1024],scratch[256];
+    // Word copies: every guest access goes through the runtime's checked
+    // path, so bytewise copies of these 5 KiB dominated a call's cost.
+    const uint32_t base=(top-4096)&~3u;
+    for(unsigned i=0;i<1024;++i)saved[i]=psx_mod_read_word(base+4*i);
+    for(unsigned i=0;i<256;++i)scratch[i]=psx_mod_read_word(0x1f800000+4*i);
+    CPUState cpu=*source;cpu.pc=0;cpu.gpr[29]=top-0x100;cpu.gpr[31]=0x800000fc;
+    cpu.gpr[4]=a0>=0?(uint32_t)a0:player;cpu.gpr[5]=a1; // a0: Duke unless given
+    if(a2>=0)cpu.gpr[6]=(uint32_t)a2;
+    guest_busy=true;psx_dispatch_call(&cpu,address,0x800000fc);guest_busy=false;
+    // Restore only what the call changed: guest writes are the costly part
+    // (the runtime traces every store), and most of the 5 KiB is untouched.
+    for(unsigned i=0;i<1024;++i)if(psx_mod_read_word(base+4*i)!=saved[i])psx_mod_write_word(base+4*i,saved[i]);
+    for(unsigned i=0;i<256;++i)if(psx_mod_read_word(0x1f800000+4*i)!=scratch[i])psx_mod_write_word(0x1f800000+4*i,scratch[i]);
+    if(result)*result=(int32_t)cpu.gpr[2];
+    return cpu.pc==0 && !g_psx_call_bail;
+}
+static bool usable_item(unsigned item) {
+    // D08A4/D08A8: held, or running (selected like a jetpack that is on, so the
+    // HUD box counts them down in place); R / Enter use only a held one.
+    if(item==4)return steroids_owned();
+    if(item<1 || item>5)return false;
+    if(psx_mod_read_half(0x800c2710+4*item)!=(item==1?1:item==5?2:3))return false;
+    unsigned v=psx_mod_read_half(player+0x354+item*4);
+    return (v&1) && !(v&0x8000) && ((v&2) || (int16_t)psx_mod_read_half(player+0x356+item*4)>0);
+}
+// Share the original menu's remembered ID. Its list rebuild maps this ID to
+// the cursor at885e0; browsing writes it at893c8. Never rewrite its list/cursor.
+static void inventory_feedback(bool announce) {
+    uint16_t flags[6]{},capacities[6]{};int16_t amounts[6]{};
+    for(unsigned i:{5u,1u,2u,3u}) {
+        capacities[i]=psx_mod_read_half(0x800c2712+4*i);
+        flags[i]=psx_mod_read_half(player+0x354+4*i);
+        amounts[i]=(int16_t)psx_mod_read_half(player+0x356+4*i);
+    }
+    // D08A4: held steroids (bit 0), shown with the active mark and the
+    // draining amount while they run, as EDuke32 shows them.
+    if(portable_steroids()) {
+        capacities[4]=psx_mod_read_half(0x800c2722);
+        flags[4]=psx_mod_read_half(player+0x364);
+        amounts[4]=(int16_t)psx_mod_read_half(player+0x366);
+    }
+    inventory_update(selected_item,flags,amounts,capacities,announce);
+    // D08A5: mission items are inventory items 6..16 (the Select list's flags).
+    uint16_t mission[17]{};
+    for(unsigned i=6;i<17;++i)mission[i]=psx_mod_read_half(player+0x354+4*i);
+    mission_update(psx_mod_read_word(0x800be570),mission);
+}
+// D08A19: mark a mission item used. The original uses it up at animation 47
+// (8004e494): bit 0 of its flag is cleared as Duke takes it in hand
+// (+0x3b8 = 1, +0x3b9 = item) and is never set again; the lock's mode 3 then
+// empties the hand. A use given back (91fc4) or a new pickup sets bit 0 again
+// and drops the marker, so only a held, cleared item counts as used.
+static void mission_used_track() {
+    const bool holding=psx_mod_read_byte(player+0x3b8)==1;
+    const unsigned held=psx_mod_read_byte(player+0x3b9);
+    for(unsigned i=6;i<17;++i) {
+        const uint32_t address=player+0x354+4*i;
+        const unsigned v=psx_mod_read_half(address);
+        if((v&1) && (v&mission_used_bit))psx_mod_write_half(address,v&~mission_used_bit);
+        else if(!(v&(1|mission_used_bit)) && holding && held==i)psx_mod_write_half(address,v|mission_used_bit);
+    }
+}
+static void remember_item(unsigned item) {
+    selected_item=item;
+    if(psx_mod_read_half(0x800c3f94)!=item)psx_mod_write_half(0x800c3f94,item);
+}
+// D08A18: Enter / U on the browsed mission item. The original has no inventory
+// use for mission items (its Select list's check 88134 rejects items >= 6):
+// Duke uses one by action at its lock, which names the item it wants. Ask the
+// lock in front of Duke, as the action press does (51890: finder 77f28 ->
+// +0x174; item-lock types carry type flag 0x01000000 without 0x08000000,
+// 0x00400000 or 0x00800000), its handler's mode 2 (wanted item) and mode 0
+// (0 = usable now). Right item: the normal E interaction, so the original
+// pulls it out (animation 47), opens the lock and uses it up. Otherwise only a
+// notice; nothing in the level changes.
+static void mission_use(CPUState* cpu,int item) {
+    if(item<6 || item>16)return;
+    const unsigned owned=psx_mod_read_half(player+0x354+4*item);
+    if(!(owned&1)) {input_notice(owned&mission_used_bit?"ALREADY USED":"NOT FOUND YET");return;}
+    if(!original_call(cpu,0x80077f28,0)) {
+        std::fprintf(stderr,"[TTK mission] use of item %d skipped: no nested call here\n",item);return;
+    }
+    const uint32_t object=psx_mod_read_word(player+0x174);
+    bool usable=false;
+    if(object>=0x80010000 && object<0x80200000) {
+        const unsigned type=psx_mod_read_half(object+0x2c);
+        const uint32_t type_flags=psx_mod_read_word(psx_mod_read_word(0x800d2660)+28*type);
+        const uint32_t handler=psx_mod_read_word(psx_mod_read_word(0x800dd84c)+4*psx_mod_read_byte(object+0x19));
+        int32_t wanted=-1,blocked=1;
+        if((type_flags&0x01000000) && !(type_flags&0x08c00000) && handler>=0x80010000 && handler<0x80200000 &&
+           original_call(cpu,handler,object,&wanted,2) && wanted==item &&
+           original_call(cpu,handler,object,&blocked,0) && blocked==0)usable=true;
+        std::fprintf(stderr,"[TTK mission] item %d at object %08x type %u wants %d blocked %d -> %s\n",
+                     item,object,type,wanted,blocked,usable?"use":"refuse");
+    }
+    if(usable)input_request_interaction();
+    else input_notice("CAN'T USE THIS HERE");
+}
+static void use_item(CPUState* cpu,unsigned item) {
+    if(item==5) {
+        // M: report charge only — never open the bracket switcher (EDuke32-style).
+        unsigned owned=psx_mod_read_half(player+0x354+4*5);
+        if(!(owned&1))return; // no medkit: silent, like EDuke32
+        unsigned cap=psx_mod_read_half(0x800c2712+4*5);
+        int16_t raw=(int16_t)psx_mod_read_half(player+0x356+4*5);
+        unsigned charge=raw>0?(unsigned)raw:0;
+        unsigned pct=cap?charge*100/cap:charge;
+        char text[32];std::snprintf(text,sizeof text,"MEDKIT %u%%",pct);
+        input_notice(text);
+        if(!usable_item(5))return;
+        remember_item(5);
+    } else {
+        if(!usable_item(item))return;
+        remember_item(item);inventory_feedback(false);
+    }
+    // Same requests as inventory confirmation at 89474 / 89494 / 894cc.
+    if(psx_mod_read_half(0x800c2712+4*item)==0) {
+        psx_mod_write_byte(player+0x3bb,item);
+        psx_mod_write_word(player+0x224,psx_mod_read_word(player+0x224)|0xc);
+        return;
+    }
+    // The native jetpack cannot be switched on in water; the normal-state
+    // lease excludes it. D08Q10: switching an open pack off always works.
+    if(item==1 && !(psx_mod_read_half(player+0x358)&2) && psx_mod_read_word(player+0x834)!=0x40000000 &&
+       (int32_t)psx_mod_read_word(player+8)>(int32_t)psx_mod_read_word(player+0x834))return;
+    // Do not mutate a request unless nested execution is available.
+    if(guest_busy || cpu->gpr[29]<0x801f4000 || cpu->gpr[29]>0x801ffff0 || g_precise_mode || g_ls_mode || g_psx_call_bail)return;
+    for(unsigned i=1;i<=5;++i)if(psx_mod_read_half(player+0x354+4*i)&0x8000)return;
+    auto address=player+0x354+4*item;
+    unsigned value=psx_mod_read_half(address);
+    if(psx_mod_read_half(0x800c2710+4*item)&1)value^=2;
+    psx_mod_write_half(address,value|0x8000);
+    original_call(cpu,0x800402d0,item);
+    if(item==1 || item==2 || item==3) {
+        const bool on=!!(psx_mod_read_half(player+0x354+4*item)&2);
+        if(item==1)input_notice(on?"JETPACK ON":"JETPACK OFF");
+        else if(item==2)input_notice(on?"BIO MASK ON":"BIO MASK OFF");
+        else input_notice(on?"NIGHT VISION ON":"NIGHT VISION OFF");
+    }
+}
+// D08A24: native gas is damage type 12; the area query tests the
+// head joint in +0x88c. Only native item/model endpoints are changed.
+static bool bio_mask_suppressed, bio_mask_exposed;
+static unsigned bio_mask_clear_updates;
+static uint64_t bio_mask_loads;
+static bool bio_mask_auto() {
+    const char* v=ttk_live_env("DNTTK_AUTO_BIO_MASK");
+    return input_modernized() && (!v || std::strcmp(v,"off"));
+}
+static bool bio_mask_gas() {
+    const uint32_t model=psx_mod_read_word(player+0x40);
+    if(model<0x80010000 || model>0x801fffcb || (model&3))return false;
+    const unsigned joint=psx_mod_read_byte(model+0x34);
+    return joint<32 && (psx_mod_read_word(player+0x88c)&(1u<<joint));
+}
+static bool bio_mask_toggle(bool automatic=false) {
+    if(!bio_mask_auto() || !interaction_alive() || !gameplay_context() ||
+       psx_mod_read_byte(player+0x233)!=0 || (int16_t)psx_mod_read_half(player+0x32)<=0)return false;
+    const unsigned item=psx_mod_read_half(player+0x35c);
+    const bool on=!(item&2);
+    if(automatic && (!on || bio_mask_suppressed))return false;
+    if(!(item&1) || (on && (int16_t)psx_mod_read_half(player+0x35e)<=0))return false;
+    for(unsigned i=1;i<=5;++i)if(psx_mod_read_half(player+0x354+4*i)&0x8000)return false;
+    auto valid=[](uint32_t a,unsigned n) {return a>=0x80010000u && a<=0x80200000u-n && !(a&3);};
+    const uint32_t model=psx_mod_read_word(player+0x40);
+    if(!valid(model,0x35))return false;
+    const unsigned joint=40*psx_mod_read_byte(model+0x34);
+    const uint32_t target=model+joint+0x68;
+    if(!valid(target,4))return false;
+    const uint32_t table=psx_mod_read_word(on?0x800ddb18:0x800ddb14);
+    if(!valid(table,on?0x1034:8))return false;
+    const uint32_t base=on?table:psx_mod_read_word(table+4);
+    if(!valid(base,on?0x1034:joint+0x6c))return false;
+    const uint32_t mesh=psx_mod_read_word(base+(on?0x1030:joint+0x68));
+    if(!valid(mesh,4))return false;
+    if(on) {
+        psx_mod_write_half(player+0x360,psx_mod_read_half(player+0x360)&~2u);
+        psx_mod_write_word(player+0x224,psx_mod_read_word(player+0x224)&~0x80000u);
+    }
+    psx_mod_write_word(target,mesh);
+    psx_mod_write_half(player+0x854,on?2:0);
+    psx_mod_write_half(player+0x35c,item^2);
+    bio_mask_suppressed=!on && bio_mask_gas();
+    remember_item(2);inventory_feedback(false);
+    bio_mask_sound();
+    input_notice(on?"BIO MASK ON":"BIO MASK OFF");
+    return true;
+}
+// Only normal player-update calls count exit grace. A damage callback can
+// observe entry but must never count as a second dry update or remove a mask.
+static void bio_mask_boundary(bool update_exit=false) {
+    const uint64_t loads=psx_mod_savestate_loads();
+    if(loads!=bio_mask_loads) {
+        bio_mask_suppressed=false;bio_mask_clear_updates=0;
+        // A loaded active mask outside gas should settle off too; do not carry
+        // the previous timeline's exposure or pending exit into the loaded one.
+        bio_mask_exposed=(psx_mod_read_half(player+0x35c)&2) && psx_mod_read_half(player+0x854)==2;
+    }
+    bio_mask_loads=loads;
+    if(!bio_mask_auto()) {
+        bio_mask_suppressed=bio_mask_exposed=false;bio_mask_clear_updates=0;return;
+    }
+    if(!interaction_alive() || !gameplay_context() || psx_mod_read_byte(player+0x233)!=0 ||
+       (int16_t)psx_mod_read_half(player+0x32)<=0)return;
+    if(bio_mask_gas()) {bio_mask_exposed=true;bio_mask_clear_updates=0;return;}
+    bio_mask_suppressed=false;
+    if(!update_exit || !bio_mask_exposed)return;
+    if(!(psx_mod_read_half(player+0x35c)&2) || psx_mod_read_half(player+0x854)!=2) {
+        bio_mask_exposed=false;bio_mask_clear_updates=0;return;
+    }
+    // Three consecutive native updates outside head exposure prevent the
+    // boundary/head animation from chattering. Entry protection stays instant.
+    if(bio_mask_clear_updates<3)++bio_mask_clear_updates;
+    if(bio_mask_clear_updates==3 && bio_mask_toggle()) {
+        bio_mask_exposed=false;bio_mask_clear_updates=0;
+    }
+}
+static void bio_mask_damage_entry(CPUState* cpu) {
+    if(cpu->gpr[4]!=player)return;
+    if(std::getenv("DNTTK_BIO_MASK_TRACE"))
+        std::fprintf(stderr,"ttk-biomask damage type=%u amount=%u ra=%08x health=%u mask=%u head=%d\n",
+            cpu->gpr[7],cpu->gpr[6],cpu->gpr[31],psx_mod_read_half(player+0x32),
+            psx_mod_read_half(player+0x35c),bio_mask_gas()?1:0);
+    if(cpu->gpr[7]!=12 || cpu->gpr[31]!=0x80040ad0 || !bio_mask_auto() || !bio_mask_gas())return;
+    // The area call is already past its native head-exposure test. Other
+    // damage types, liquids and non-player actors never activate the mask.
+    bio_mask_boundary();
+    bio_mask_toggle(true);
+}
+// D08A23: reproduce only the native goggles effect/model endpoints
+// (8004e94c..8004ea20), never its hand equipment or animation writes.
+static bool night_vision_modern() {
+    const char* v=ttk_live_env("DNTTK_NIGHT_VISION");
+    return input_modernized() && (!v || std::strcmp(v,"original"));
+}
+static bool night_vision_toggle() {
+    if(!night_vision_modern() || !interaction_alive() || !gameplay_context() ||
+       (int16_t)psx_mod_read_half(player+0x32)<=0) return false;
+    const unsigned item=psx_mod_read_half(player+0x360);
+    const bool on=!(item&2);
+    if(!(item&1) || (on && (int16_t)psx_mod_read_half(player+0x362)<=0))return false;
+    // Do not hijack an original gadget equip already in flight (e.g. a
+    // savestate or changing the preference midway through the original action).
+    for(unsigned i=1;i<=5;++i)if(psx_mod_read_half(player+0x354+4*i)&0x8000)return false;
+    auto valid=[](uint32_t a,unsigned n) {return a>=0x80010000u && a<=0x80200000u-n && !(a&3);};
+    const uint32_t model=psx_mod_read_word(player+0x40);
+    if(!valid(model,0x35))return false;
+    const unsigned joint=40*psx_mod_read_byte(model+0x34);
+    const uint32_t target=model+joint+0x68;
+    if(!valid(target,4))return false;
+    const uint32_t table=psx_mod_read_word(on?0x800ddb18:0x800ddb14);
+    if(!valid(table,on?0x10c8:8))return false;
+    const uint32_t base=on?table:psx_mod_read_word(table+4);
+    if(!valid(base,on?0x10c8:joint+0x6c))return false;
+    const uint32_t mesh=psx_mod_read_word(base+(on?0x10c4:joint+0x68));
+    if(!valid(mesh,4))return false;
+    const uint32_t flags=psx_mod_read_word(player+0x224);
+    // Native face equipment is exclusive: goggles replace the Bio Mask.
+    // Preserve charge and respect this manual replacement until gas re-entry.
+    if(on && psx_mod_read_half(player+0x854)==2) {
+        psx_mod_write_half(player+0x35c,psx_mod_read_half(player+0x35c)&~2u);
+        bio_mask_suppressed=bio_mask_gas();
+    }
+    psx_mod_write_word(target,mesh);
+    psx_mod_write_half(player+0x854,on?3:0);
+    psx_mod_write_word(player+0x224,on?flags|0x80000u:flags&~0x80000u);
+    psx_mod_write_half(player+0x360,item^2);
+    remember_item(3);inventory_feedback(false);
+    night_vision_sound();
+    input_notice(on?"NIGHT VISION ON":"NIGHT VISION OFF");
+    return true;
+}
+static unsigned swim_redraws; // D08O3
+static unsigned swim_fire_draws; // D08O5
+// D08A37: Modernized weapon commands (group keys, previous/next, last) are
+// queued instead of dropped when the weapon is not ready: held fire (every
+// weapon stays on its fire tracks), a draw, a landing, a reload. While one
+// waits the game's fire input is released (switch_fire_masked, pc_input),
+// so the current shot finishes through the original's own release (the
+// Gatling's spin-down and loop stop included) and the upper body settles;
+// the request (+0x3ba, flag 4) is then written as from rest. The mask stays
+// until the new weapon reaches its ready loop; held fire then reaches it
+// (EDuke32 style). Expires after 1.5 s waiting / 3 s drawing, or when the
+// weapons lease is lost (a mantle, a climb, E). Dynamite keeps its charged
+// throw: no mask while it is out (the queue still waits for its rest).
+static unsigned switch_target=255;   // queued weapon, not yet requested
+static unsigned switch_drawing=255;  // requested, waiting for its ready loop
+static double switch_wait_ms;
+static std::chrono::steady_clock::time_point switch_clock;
+static std::atomic<bool> switch_mask{false};
+static unsigned switch_cuts,switch_queued,switch_served,switch_expired,switch_dropped,switch_ready,switch_masked_updates;
+bool switch_fire_masked() {return switch_mask.load(std::memory_order_relaxed);}
+static void switch_clear(bool expired=false) {
+    if(expired && (switch_target<=14 || switch_drawing<=14))++switch_expired;
+    switch_target=switch_drawing=255;switch_wait_ms=0;switch_mask.store(false,std::memory_order_relaxed);
+}
+// The weapon one command gives from cursor (255: none usable).
+static unsigned weapon_command_target(int action,unsigned cursor,bool swim) {
+    auto ok=[&](unsigned c){return usable_weapon(c) && (!swim || underwater_weapon(c));};
+    if(action>=weapon_group_1 && action<=weapon_group_0) {
+        unsigned group=action-weapon_group_1,begin=group_start[group],end=group_start[group+1];
+        unsigned start=begin;
+        for(unsigned i=begin;i<end;++i)if(weapon_order[i]==cursor)start=i+1==end?begin:i+1;
+        for(unsigned j=0;j<end-begin;++j) {
+            unsigned candidate=weapon_order[begin+(start-begin+j)%(end-begin)];
+            if(ok(candidate))return candidate;
+        }
+    } else if(action==weapon_previous || action==weapon_next) {
+        unsigned start=0;for(unsigned i=0;i<15;++i)if(weapon_order[i]==cursor)start=i;
+        for(unsigned j=1;j<=15;++j) {
+            unsigned candidate=weapon_order[(start+(action==weapon_next?j:15-j))%15];
+            if(ok(candidate))return candidate;
+        }
+    } else if(action==weapon_last) {
+        if(ok(last_equipped))return last_equipped;
+    }
+    return 255;
+}
+static const char* weapon_switch_debug_json() {
+    static char b[256];
+    std::snprintf(b,sizeof b,"{\"target\":%u,\"drawing\":%u,\"mask\":%s,\"queued\":%u,\"served\":%u,\"ready\":%u,\"expired\":%u,\"dropped\":%u,\"masked_updates\":%u,\"cuts\":%u}",
+        switch_target,switch_drawing,switch_fire_masked()?"true":"false",switch_queued,switch_served,switch_ready,switch_expired,switch_dropped,switch_masked_updates,switch_cuts);
+    return b;
+}
+static void select_weapon(CPUState* cpu) {
+    const auto& f=input_snapshot(Context::Gameplay);
+    input_ack_commands(f.command_serial);
+    if(!interaction_alive()) {equipped=last_equipped=255;command_seen=f.command_serial;switch_clear();return;}
+    // Only primary single-player ownership; no writes into player two's menu.
+    if(psx_mod_read_byte(player+0x233)!=0)return;
+    mission_used_track(); // D08A19: also while input is released (no capture)
+    if(!f.active || !gameplay_context())return;
+    // D08Q2: Continue can reset the jetpack model/transition while retaining
+    // its pending item bit. The original completion at 8004010c clears that
+    // bit only while the open/close updater runs. Recover its closed, off
+    // endpoint only; never finish an active transition or grant fuel/ownership.
+    const unsigned jet=psx_mod_read_half(player+0x358);
+    if((jet&0x8003)==0x8001 && movement_ready() &&
+       (int16_t)psx_mod_read_half(player+0x32)>0 &&
+       psx_mod_read_byte(player+0x22c)==0 && psx_mod_read_byte(player+0x22d)==0 &&
+       !(psx_mod_read_word(player+0x224)&0x1000100c) &&
+       psx_mod_read_half(player+0x84c)==0 && psx_mod_read_word(player+0x884)==1)
+        psx_mod_write_half(player+0x358,jet&~0x8000u);
+    pickup_select_apply(); // D08A9: a pickup that waited for an activation
+    unsigned menu_item=psx_mod_read_half(0x800c3f94);
+    static uint32_t selection_loads=0;
+    const uint32_t loads=psx_mod_savestate_loads();
+    const bool restored=loads!=selection_loads;
+    if(restored) {
+        selection_loads=loads;selected_item=menu_item;
+        command_seen=f.command_serial; // No queued command from the old world.
+        switch_clear();
+    }
+    bool changed=false;
+    steroids_poll();
+    if(menu_item!=selected_item && usable_item(menu_item)) {selected_item=menu_item;changed=true;}
+    // D08A6: the HUD box reads this guest ID (high-refresh redraws run on a
+    // copy of guest memory, never host state), so keep it on the selection
+    // when the original menu left it on something else (a key, an unowned
+    // item), unless that item is mid-activation.
+    else if(menu_item!=selected_item && usable_item(selected_item) &&
+            !(menu_item>=1 && menu_item<=5 && (psx_mod_read_half(player+0x354+4*menu_item)&0x8000)))
+        remember_item(selected_item);
+    // Pending original activation is still visible; depletion chooses the next
+    // eligible gadget and leaves U harmless when the inventory is empty.
+    unsigned selected_flags=selected_item<=5 && selected_item!=4?psx_mod_read_half(player+0x354+4*selected_item):0;
+    if(!usable_item(selected_item) && !(selected_flags&0x8000)) {
+        unsigned replacement=0;
+        for(unsigned i:{5u,4u,1u,2u,3u})if(usable_item(i)){replacement=i;break;}
+        if(selected_item!=replacement){remember_item(replacement);changed=true;}
+    }
+    inventory_feedback(changed && !restored);
+    unsigned equipment=psx_mod_read_byte(player+0x3b8),flags=psx_mod_read_word(player+0x224);
+    unsigned actual=psx_mod_read_byte(player+0x3b9),current=base_weapon(actual);
+    bool remote=equipment==1 && actual==0 && psx_mod_read_byte(player+0x3ba)==12 &&
+        (int32_t)psx_mod_read_word(player+0x254)>0;
+    if(remote)current=12;
+    unsigned upper=psx_mod_read_half(player+0x74);
+    // D08A29: 18/19 are the two-handed run-ready loop, not an attack.
+    // Native 4ee84 accepts the same flag-4 switch here; 50344 alternates
+    // 18 <-> 19. Include them in both selection history and eligibility.
+    bool weapon_idle=upper==5 || upper==18 || upper==19 || upper==20 || upper==29 || upper==35 || upper==39;
+    if(equipment==0 && psx_mod_read_byte(player+0x3ba)==0)current=0;
+    // Original boot selection holsters and retains the previous drawn weapon byte.
+    // Observe successful original equipment changes, including inventory selection.
+    if(!(flags&4) && (((equipment==2 || remote) && current<=14 && weapon_idle) ||
+        (equipment==0 && psx_mod_read_byte(player+0x3ba)==0))) {
+        if(equipped!=current) {last_equipped=equipped;equipped=current;}
+    }
+    // D08O3: E's redraw in water draws the weapon it stowed through the same
+    // original request as the number keys (see interaction_swim_restore_ready).
+    if(swim_weapon_ready() && !movement_ready() && equipment==0 && !(flags&0x2cd) &&
+       !f.held[fire] && !f.held[original_aim] && input_take_swim_redraw() &&
+       equipped>0 && equipped<=14 && usable_weapon(equipped) && underwater_weapon(equipped)) {
+        psx_mod_write_byte(player+0x3ba,equipped);
+        psx_mod_write_word(player+0x224,flags|4);++selections;++swim_redraws;
+    }
+    // D08O5: fire draws a holstered weapon in water, as on land (D08E) and in
+    // flight (D08Q7), through the same original request as D08O3: a Circle tap
+    // could end a thrust stroke. Held fire then reaches the drawn weapon; a
+    // tap only draws, and nothing is buffered after release.
+    if(f.held[fire] && !f.held[holster] && !f.held[interact] && !movement_ready() && swim_fire_draw_ready() &&
+       switch_target>14 && switch_drawing>14) {
+        psx_mod_write_byte(player+0x3ba,swim_fire_draw_weapon());
+        psx_mod_write_word(player+0x224,psx_mod_read_word(player+0x224)|4);++selections;++swim_fire_draws;
+    }
+    // D08J7C: the player's own weapon choice cancels the sidearm's pending return.
+    bool weapon_choice=false;
+    if(f.command_serial && command_seen!=f.command_serial)for(unsigned n=0;n<f.command_count && n<32;++n) {
+        const int action=f.commands[n];
+        if((action>=weapon_group_1 && action<=weapon_group_0) || action==weapon_previous ||
+           action==weapon_next || action==weapon_last) weapon_choice=true;
+    }
+    if(weapon_choice)climb_swap_cancel();
+    climb_fire_ground_restore(f,equipment,flags);
+    // D08A12: the next stick after a throw, once fire is let go and Duke can
+    // take a weapon request (ground or jetpack flight).
+    if(dynamite_redraw_due(equipment,flags) && !f.held[fire] && !f.held[original_aim] && !(flags&0x2c5) &&
+       (movement_ready() || jetpack_input_ready()) && usable_weapon(14)) {
+        psx_mod_write_byte(player+0x3ba,14);
+        psx_mod_write_word(player+0x224,flags|4);++selections;++dynamite_redraws;dynamite_redraw=false;
+    }
+    // D08A33: the player's own weapon choice, taken or not, drops a waiting pickup draw.
+    if(weapon_choice)pickup_weapon_cancel();
+    // D08A33: EQUIP PICKUPS IF NEW draws a newly owned weapon through the same
+    // request and gate as the number keys, once fire is let go.
+    if(const unsigned fresh=pickup_weapon_due();fresh<=14) {
+        const bool jet_ready=jetpack_input_ready();
+        const bool swim_ready=!jet_ready && !movement_ready() && swim_weapon_ready();
+        const unsigned now_flags=psx_mod_read_word(player+0x224);
+        if((equipment==2 || remote) && current==fresh && weapon_idle) pickup_weapon_cancel();
+        else if((movement_ready() || jet_ready || swim_ready) && (equipment==0 || equipment==2 || remote) &&
+                (!(equipment==2 || remote) || weapon_idle) && !f.held[fire] && !f.held[original_aim] &&
+                !f.held[interact] && !(now_flags&0x2cd) && usable_weapon(fresh) &&
+                (!swim_ready || underwater_weapon(fresh))) {
+            psx_mod_write_byte(player+0x3ba,fresh);
+            psx_mod_write_word(player+0x224,now_flags|4);++selections;pickup_weapon_drawn();
+        }
+    }
+    // D08A37: queue Modernized weapon commands; serve them once the weapon is ready.
+    const bool modern_switch=input_modernized();
+    {
+        const auto now=std::chrono::steady_clock::now();
+        double dt=std::chrono::duration<double,std::milli>(now-switch_clock).count();
+        switch_clock=now;
+        if(!(dt>=0 && dt<=100))dt=34;
+        auto lease=[&](bool& swim) {
+            const bool jet=jetpack_input_ready();
+            swim=!jet && !movement_ready() && swim_weapon_ready();
+            const bool air=!jet && !swim && !movement_ready() && airborne_shot_ready() && !roll_state_early();
+            return movement_ready() || jet || swim || air;
+        };
+        bool swim=false;
+        const bool has_lease=lease(swim);
+        const unsigned now_flags=psx_mod_read_word(player+0x224);
+        const bool drawn=equipment==2 || remote;
+        // The request is spent and a weapon is in its ready loop (the one
+        // asked for, or the original's remap of it, e.g. in water): the
+        // switch is over, before this update's commands are read.
+        if(switch_drawing<=14 && !(now_flags&4) && ((drawn && weapon_idle) ||
+           (equipment==0 && psx_mod_read_byte(player+0x3ba)==0))) {++switch_ready;switch_clear();}
+        if(!modern_switch)switch_clear();
+        else if(weapon_choice) {
+            unsigned cursor=switch_target<=14?switch_target:switch_drawing<=14?switch_drawing:equipped;
+            for(unsigned n=0;n<f.command_count && n<32;++n) {
+                const unsigned t=weapon_command_target(f.commands[n],cursor,swim);
+                if(t<=14)cursor=t;
+            }
+            const bool same=switch_drawing<=14 ? cursor==switch_drawing :
+                drawn && !(now_flags&4) && cursor==equipped && current==equipped;
+            if(same) {
+                if(switch_target<=14)++switch_dropped;
+                if(switch_drawing<=14)switch_target=255;else switch_clear();
+            }
+            else if(cursor<=14 && cursor!=switch_target) {
+                switch_target=cursor;switch_wait_ms=0;switch_masked_updates=0;++switch_queued;
+                if(switch_drawing<=14)switch_drawing=255; // a new choice during a draw takes over
+            }
+        }
+        if(switch_target<=14 || switch_drawing<=14) {
+            switch_wait_ms+=dt;
+            const bool dynamite_out=drawn && current==14;
+            if(f.held[interact] || f.held[holster]) {++switch_dropped;switch_clear();}
+            else if(switch_target<=14) {
+                const bool mask=has_lease && !dynamite_out;
+                switch_mask.store(mask,std::memory_order_relaxed);
+                if(mask)++switch_masked_updates;
+                // Finish the shot, not the lowering: once the round is out
+                // and the fire input released, the gun-up / pump tracks
+                // after it (Desert Eagle 14, Gatling and Freezer 32, shotgun
+                // pump 26 and 23) are cut to the rest pose, from which the
+                // original starts the holster. The Gatling's loop and spin
+                // already ended when it left its fire track (34 -> 32).
+                uint32_t cut_flags=now_flags;
+                if(mask && has_lease && drawn && !weapon_idle && switch_masked_updates>=2 && !(cut_flags&0x2cd)) {
+                    const unsigned rest=current==4?5:current==5?20:current==7 || current==11?29:0;
+                    const bool recover=(current==4 && upper==14) || ((current==7 || current==11) && upper==32) ||
+                        (current==5 && (upper==26 || upper==23));
+                    if(rest && recover) {
+                        psx_mod_write_half(player+0x74,rest);psx_mod_write_half(player+0x7c,0);psx_mod_write_half(player+0x7e,0);
+                        cut_flags&=~0x110u;psx_mod_write_word(player+0x224,cut_flags);
+                        upper=rest;weapon_idle=true;++switch_cuts;
+                    }
+                }
+                if(!usable_weapon(switch_target) || (swim && !underwater_weapon(switch_target))) {++switch_dropped;switch_clear();}
+                else if(switch_wait_ms>1500)switch_clear(true);
+                else if(has_lease && (equipment==0 || drawn) && !f.held[original_aim] && !(cut_flags&0x2cd) &&
+                        (!drawn || weapon_idle) && (!f.held[fire] || switch_masked_updates>=2)) {
+                    psx_mod_write_byte(player+0x3ba,switch_target);
+                    psx_mod_write_word(player+0x224,cut_flags|4);++selections;++switch_served;
+                    switch_drawing=switch_target;switch_target=255;switch_wait_ms=0;
+                }
+            } else {
+                // Drawing: the fire input stays released until the ready loop.
+                if(!has_lease || switch_wait_ms>3000)switch_clear(true);
+                else {switch_mask.store(true,std::memory_order_relaxed);++switch_masked_updates;}
+            }
+        }
+    }
+    if(!f.command_serial || command_seen==f.command_serial)return;
+    command_seen=f.command_serial;
+    // D08A5: Enter / U while the mission inventory shows never toggle a gadget.
+    // D08A18: they close it and try the browsed mission item (mission_use).
+    bool mission_enter=false;
+    if(mission_visible())for(unsigned n=0;n<f.command_count && n<32;++n)if(f.commands[n]==item_use)mission_enter=true;
+    if(mission_enter) {const int item=mission_browsed_item();mission_close();mission_use(cpu,item);}
+    // D08S: Modern starts on ground or in a jump/fall. Its accepted in-flight
+    // off toggle stays intact; EDuke32 uses its immediate toggle in both states.
+    // D08Q10: both also start while swimming (surface 4, underwater 5), and
+    // Modern switches off under water the same way (straight to swimming).
+    const unsigned jet_mode=psx_mod_read_byte(player+0x22c);
+    const bool jet_submerged=jet_mode==10 && psx_mod_read_word(player+0x834)!=0x40000000 &&
+        (int32_t)psx_mod_read_word(player+8)>(int32_t)psx_mod_read_word(player+0x834);
+    if(jetpack_eduke32() || (!jetpack_classic() && (jet_mode==0 || jet_mode==9 || jet_mode==4 || jet_mode==5 || jet_submerged)))for(unsigned n=0;n<f.command_count && n<32;++n)
+        if(f.commands[n]==jetpack || (f.commands[n]==item_use && selected_item==1 && !mission_enter)) {
+            if(jet_instant_toggle(cpu)) {remember_item(1);inventory_feedback(false);}
+            return;
+        }
+    // D12A: in the eye view Q is the quick kick (kick.inc), with any weapon,
+    // moving or in the air; it never touches the original equipment or animation.
+    // D12E1: in third person (KICK QUICK) the legs-only quick kick (tp_kick.inc).
+    bool eye_kick=false;
+    for(unsigned n=0;n<f.command_count && n<32;++n)
+        if(f.commands[n]==quick_kick && (kick_request(true) || tp_kick_request(true))) eye_kick=true;
+    // D08Q: J in flight is the original inventory toggle (358 bit1 → 800402d0
+    // → 8003ff6c closing), which the mode-10 handler turns into the 108 fall.
+    // D08R: jetpack_input_ready() covers both schemes.
+    // D08Q5: mode 10 completes the same weapon request (+0x3ba, flag 4) with
+    // the normal upper-body holster/draw while the flight pose and handler
+    // continue, so weapon choices are taken in flight too; other items and the
+    // quick kick keep their ground lease.
+    // D08A6: [ / ] only move the selection ("hover"); Enter / U use it. Take
+    // them in every live gameplay state (flight, swimming, firing, weapon
+    // animations), so the strip and HUD box always follow the keys.
+    for(unsigned n=0;n<f.command_count && n<32;++n) {
+        const int action=f.commands[n];
+        if(action!=item_previous && action!=item_next) continue;
+        constexpr unsigned items[]={5,4,1,2,3},count=5;unsigned start=0;
+        for(unsigned i=0;i<count;++i)if(items[i]==selected_item)start=i;
+        for(unsigned j=1;j<=count;++j){unsigned next=items[(start+(action==item_next?j:count-j))%count];
+            if(usable_item(next)){remember_item(next);break;}}
+        inventory_feedback(true);
+    }
+    // Toggle outside the fire/weapon-idle gates. Continue processing weapon
+    // commands in this same snapshot; never toggle again in the legacy loop.
+    if(night_vision_modern())for(unsigned n=0;n<f.command_count && n<32;++n)
+        if(f.commands[n]==goggles || (f.commands[n]==item_use && selected_item==3 && !mission_enter)) {
+            night_vision_toggle();break;
+        }
+    if(bio_mask_auto())for(unsigned n=0;n<f.command_count && n<32;++n)
+        if(f.commands[n]==biomask || (f.commands[n]==item_use && selected_item==2 && !mission_enter)) {
+            bio_mask_toggle();break;
+        }
+    // D08A4: R, or Enter / U on steroids, takes a stored dose in every live
+    // gameplay state (it only sets the original effect bit and timer), the
+    // way the bracket keys are taken.
+    for(unsigned n=0;n<f.command_count && n<32;++n)
+        if(f.commands[n]==steroids || (f.commands[n]==item_use && selected_item==4 && !mission_enter)) {
+            if(steroid_doses()) {remember_item(4);steroids_use(cpu);inventory_feedback(false);}
+            break;
+        }
+    // D08A34: M, or Enter / U on the medkit, heals in every live gameplay
+    // state (swimming on the surface or under water, flight, firing), as R
+    // takes steroids. With its live capacity set, 800402d0's medkit branch only
+    // moves charge into health, with no movement-state check; the ground lease
+    // below dropped it in water. A zero capacity (boot table) is the original
+    // equipment request and keeps that lease.
+    const bool medkit_direct=psx_mod_read_half(0x800c2712+4*5)!=0;
+    if(medkit_direct)for(unsigned n=0;n<f.command_count && n<32;++n)
+        if(f.commands[n]==medkit || (f.commands[n]==item_use && selected_item==5 && !mission_enter)) {
+            if((int16_t)psx_mod_read_half(player+0x32)>0)use_item(cpu,5);
+            break;
+        }
+    const bool jet_select=jetpack_input_ready();
+    if(jet_select) {
+        for(unsigned n=0;n<f.command_count && n<32;++n)
+            if(f.commands[n]==jetpack || (f.commands[n]==item_use && selected_item==1 && !mission_enter)) {use_item(cpu,1);return;}
+    }
+    // D08O1: the original swim states switch weapons through the same request
+    // (+0x3ba, flag 4) as the ground; there only weapon choices are taken,
+    // items and the quick kick keep their ground lease.
+    const bool swim_select=!jet_select && !movement_ready() && swim_weapon_ready();
+    // D08A36: jumps and falls (mode 9, the D07F air-shot lease) take the same
+    // request; the original plays holster, empty and draw over the jump pose.
+    // Dodge rolls keep their own ownership.
+    const bool air_select=!jet_select && !swim_select && !movement_ready() &&
+        airborne_shot_ready() && !roll_state_early();
+    const bool weapons_only=swim_select || jet_select || air_select;
+    if(!(movement_ready() || weapons_only) || (equipment!=0 && equipment!=2 && !remote) || f.held[original_aim] ||
+       f.held[fire] || f.held[interact] || (flags&0x2c5))return;
+    // Stable original upper-body ready loops. Draw, attack and charged-throw
+    // animations retain ownership (4e840 dispatch / 50344 completion tables).
+    if((equipment==2 || remote) && !weapon_idle)return;
+    unsigned cursor=equipped,requested=255;
+    for(unsigned n=0;n<f.command_count && n<32;++n) {
+        int action=f.commands[n];
+        // D08A37: Modernized weapon commands were queued above.
+        if(modern_switch && ((action>=weapon_group_1 && action<=weapon_group_0) || action==weapon_previous ||
+           action==weapon_next || action==weapon_last)) continue;
+        if(weapons_only && !(action>=weapon_group_1 && action<=weapon_group_0) &&
+           action!=weapon_previous && action!=weapon_next && action!=weapon_last) continue;
+        if(action>=weapon_group_1 && action<=weapon_group_0) {
+            unsigned group=action-weapon_group_1,begin=group_start[group],end=group_start[group+1];
+            unsigned start=begin;
+            for(unsigned i=begin;i<end;++i)if(weapon_order[i]==cursor)start=i+1==end?begin:i+1;
+            for(unsigned j=0;j<end-begin;++j) {
+                unsigned candidate=weapon_order[begin+(start-begin+j)%(end-begin)];
+                if(usable_weapon(candidate) && (!swim_select || underwater_weapon(candidate))){requested=cursor=candidate;break;}
+            }
+        } else if(action==weapon_previous || action==weapon_next) {
+            unsigned start=0;for(unsigned i=0;i<15;++i)if(weapon_order[i]==cursor)start=i;
+            for(unsigned j=1;j<=15;++j) {
+                unsigned candidate=weapon_order[(start+(action==weapon_next?j:15-j))%15];
+                if(usable_weapon(candidate) && (!swim_select || underwater_weapon(candidate))){requested=cursor=candidate;break;}
+            }
+        } else if(action==weapon_last) {
+            if(usable_weapon(last_equipped) && (!swim_select || underwater_weapon(last_equipped)))requested=cursor=last_equipped;
+        } else if(action==item_previous || action==item_next) {
+            continue;  // taken above in every state
+        } else if(action==quick_kick) {
+            if(eye_kick)break;
+            // 517a4 checks equipment/selected bytes with mask 00ff00ff; the
+            // stale drawn-weapon byte is intentionally irrelevant. Never disarm.
+            if(requested==255 && equipment==0 && psx_mod_read_byte(player+0x3ba)==0 &&
+               psx_mod_read_half(player+0x60)==63 && upper==63 && !f.move_x && !f.move_y && !f.held[jump])
+                original_call(cpu,0x800517a4,0);
+            break;
+        } else {
+            unsigned item=action==medkit?5:action==jetpack?1:action==biomask?2:action==goggles?3:
+                action==item_use?(mission_enter || selected_item==4?0:selected_item):0;
+            if(item==2 && bio_mask_auto())continue;
+            if(item==3 && night_vision_modern())continue; // already handled without owning the weapon
+            if(item==5 && medkit_direct)continue; // D08A34: taken above in every state
+            if(item) {use_item(cpu,item);break;} // one item activation per guest update
+            // R (and Enter / U on steroids) were taken above, in every state.
+        }
+    }
+    if(requested<=14 && !(psx_mod_read_word(player+0x224)&0xc) &&
+       (requested!=equipped || equipment==0 && requested!=0)) {
+        psx_mod_write_byte(player+0x3ba,requested);
+        psx_mod_write_word(player+0x224,psx_mod_read_word(player+0x224)|4);++selections;
+    }
+}
