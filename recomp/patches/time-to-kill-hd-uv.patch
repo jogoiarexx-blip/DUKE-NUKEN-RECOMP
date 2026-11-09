@@ -57,7 +57,7 @@ diff --git a/runtime/src/gpu_gl_renderer.c b/runtime/src/gpu_gl_renderer.c
 +    }
 +    return 0;
 +}
-  
+ 
  /* Diagnostic (debug server "gl_vram_diff"): full-VRAM comparison of the
 diff --git a/runtime/src/ttk_texture_pack.h b/runtime/src/ttk_texture_pack.h
 --- a/runtime/src/ttk_texture_pack.h
