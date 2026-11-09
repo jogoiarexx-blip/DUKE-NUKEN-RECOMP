@@ -50,6 +50,11 @@ rom.cfg
 *.VMP
 memcard*
 
+# Local HD texture packs contain exact bytes from retail VRAM/CLUT.
+# They must remain private even when generated inside the source checkout.
+*.ttktex
+*.ttkpack
+
 # --- Recomp source is tracked; local inputs and outputs are not ---
 /recomp/disc/
 /recomp/generated/
