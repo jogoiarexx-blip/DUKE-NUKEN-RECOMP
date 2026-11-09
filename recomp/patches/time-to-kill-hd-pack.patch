@@ -1,0 +1,274 @@
+diff --git a/runtime/src/gpu_gl_renderer.c b/runtime/src/gpu_gl_renderer.c
+--- a/runtime/src/gpu_gl_renderer.c
++++ b/runtime/src/gpu_gl_renderer.c
+@@ -430,16 +430,20 @@
+ static GLuint        s_hr_tex = 0, s_hr_fbo = 0, s_hr_rb = 0;
+ /* Native raw-1555 sampling mirror + readback source. */
+ static GLuint        s_raw_tex = 0, s_raw_fbo = 0;
+-#include "ttk_texture_sample.h"
+-static TtkTextureSample s_d16;
+-static GLuint s_d16_tex;
++#include "ttk_texture_pack.h"
++static TtkHdPack s_hd;
++static GLuint s_d16_tex[TTK_HD_MAX];
+ static GLint s_uD16Tex, s_uD16On, s_uD16Rect;
+-static int s_d16_valid=-1, s_tb_d16;
++static signed char s_d16_valid[TTK_HD_MAX];
++static int s_tb_d16;
+ static uint64_t s_d16_checks, s_d16_hits;
+ static void d16_invalidate(int x0,int y0,int x1,int y1) {
+-    if(ttk_texture_sample_intersects(&s_d16,x0,y0,x1,y1)) s_d16_valid=-1;
++    for(unsigned i=0;i<s_hd.count;i++)
++        if(ttk_texture_sample_intersects(&s_hd.sample[i],x0,y0,x1,y1)) s_d16_valid[i]=-1;
+ }
+ static int d16_match(int bx,int by,int depth,int cx,int cy,int twin);
++static void d16_validate(unsigned i);
++
+ static GLuint s_biomask_tex;
+ static GLint s_uBiomask;
+ extern const uint16_t* ttk_biomask_texture(void);
+@@ -2189,13 +2193,13 @@
+                 p_glActiveTexture(PSXGL_TEXTURE0 + 3);
+                 glBindTexture(GL_TEXTURE_2D, s_foreign_tex);
+                 p_glUniform1i(s_uForeign, 3);
+-                p_glActiveTexture(PSXGL_TEXTURE0 + 2);
+-                glBindTexture(GL_TEXTURE_2D, s_d16_tex);
+                 p_glUniform1i(s_uD16Tex, 2);
+-                p_glActiveTexture(PSXGL_TEXTURE0);
+                 tex_ready = 1;
+             }
+-            p_glUniform1i(s_uD16On, o->d16);
++            p_glActiveTexture(PSXGL_TEXTURE0 + 2);
++            glBindTexture(GL_TEXTURE_2D, o->d16 && o->d16 <= s_hd.count ? s_d16_tex[o->d16-1] : 0);
++            p_glActiveTexture(PSXGL_TEXTURE0);
++            p_glUniform1i(s_uD16On, !!o->d16);
+             p_glUniform4i(s_uD16Rect, o->d16r[0], o->d16r[1], o->d16r[2], o->d16r[3]);
+             p_glUniform4i(s_uTwin, o->twin[0], o->twin[1], o->twin[2], o->twin[3]);
+             p_glUniform1i(s_uMaskset, o->mask);
+@@ -2266,10 +2270,11 @@
+     glBindTexture(GL_TEXTURE_2D, s_foreign_tex);
+     p_glUniform1i(s_uForeign, 3);
+     p_glActiveTexture(PSXGL_TEXTURE0 + 2);
+-    glBindTexture(GL_TEXTURE_2D, s_d16_tex);
++    glBindTexture(GL_TEXTURE_2D, s_tb_d16 && s_tb_d16 <= (int)s_hd.count ? s_d16_tex[s_tb_d16-1] : 0);
+     p_glUniform1i(s_uD16Tex, 2);
+-    p_glUniform1i(s_uD16On, s_tb_d16);
+-    p_glUniform4i(s_uD16Rect,s_d16.u,s_d16.v,s_d16.w,s_d16.h);
++    p_glUniform1i(s_uD16On, !!s_tb_d16);
++    const TtkTextureSample *tex = s_tb_d16 && s_tb_d16 <= (int)s_hd.count ? &s_hd.sample[s_tb_d16-1] : NULL;
++    p_glUniform4i(s_uD16Rect,tex ? (int)tex->u : 0,tex ? (int)tex->v : 0,tex ? (int)tex->w : 0,tex ? (int)tex->h : 0);
+     p_glActiveTexture(PSXGL_TEXTURE0);
+     p_glUniform4i(s_uTwin, s_tb_twin[0], s_tb_twin[1], s_tb_twin[2], s_tb_twin[3]);
+     p_glUniform1i(s_uMaskset, s_tb_mask);
+@@ -2318,7 +2323,9 @@
+             o->dx = wide_dx(); o->ay1 = s_area_y1; o->ay2 = s_area_y2;
+             o->twin[0] = s_tb_twin[0]; o->twin[1] = s_tb_twin[1]; o->twin[2] = s_tb_twin[2]; o->twin[3] = s_tb_twin[3];
+             o->filter = (unsigned char)s_tb_filter; o->d16 = (unsigned char)s_tb_d16;
+-            o->d16r[0] = s_d16.u; o->d16r[1] = s_d16.v; o->d16r[2] = s_d16.w; o->d16r[3] = s_d16.h;
++            const TtkTextureSample *t = s_tb_d16 && s_tb_d16 <= (int)s_hd.count ? &s_hd.sample[s_tb_d16-1] : NULL;
++            o->d16r[0] = t ? t->u : 0; o->d16r[1] = t ? t->v : 0;
++            o->d16r[2] = t ? t->w : 0; o->d16r[3] = t ? t->h : 0;
+             o->end_depth = 0; o->wide_suppress = 0;
+             if (o->hz) sim = o->hz == 3; else if (sim) sim = 0;
+             last = s_mo_n - 1; s_mir_logged++;
+@@ -3371,18 +3378,27 @@
+     s_uD16Tex=p_glGetUniformLocation(s_tex_prog,"u_d16_tex");
+     s_uD16On=p_glGetUniformLocation(s_tex_prog,"u_d16_on");
+     s_uD16Rect=p_glGetUniformLocation(s_tex_prog,"u_d16_rect");
+-    const char *d16_path=getenv("DNTTK_TEXTURE_SAMPLE"), *d16_mode=getenv("DNTTK_INPUT_MODE");
+-    if(d16_path && d16_mode && !strcmp(d16_mode,"modernized")) {
+-        if(ttk_texture_sample_load(d16_path,&s_d16)) {
+-            s_d16_tex=make_tex(GL_RGB8,s_d16.iw,s_d16.ih,GL_RGB,GL_UNSIGNED_BYTE);
+-            glBindTexture(GL_TEXTURE_2D,s_d16_tex);
++    const char *d16_path=getenv("DNTTK_TEXTURE_SAMPLE"), *hd_path=getenv("DNTTK_TEXTURE_PACK");
++    const char *d16_mode=getenv("DNTTK_INPUT_MODE");
++    if(d16_mode && !strcmp(d16_mode,"modernized")) {
++        if(hd_path && *hd_path) {
++            if(!ttk_hd_pack_load(hd_path,&s_hd))
++                fprintf(stderr,"ttk-texture: invalid HD pack, original textures retained\n");
++        } else if(d16_path && *d16_path) {
++            if(ttk_texture_sample_load(d16_path,&s_hd.sample[0])) s_hd.count=1;
++            else fprintf(stderr,"ttk-texture: invalid legacy specimen, original textures retained\n");
++        }
++        for(unsigned i=0;i<s_hd.count;i++) {
++            TtkTextureSample *t=&s_hd.sample[i];
++            s_d16_tex[i]=make_tex(GL_RGB8,t->iw,t->ih,GL_RGB,GL_UNSIGNED_BYTE);
++            glBindTexture(GL_TEXTURE_2D,s_d16_tex[i]);
+             glPixelStorei(GL_UNPACK_ALIGNMENT,1);
+-            glTexSubImage2D(GL_TEXTURE_2D,0,0,0,s_d16.iw,s_d16.ih,GL_RGB,GL_UNSIGNED_BYTE,s_d16.rgb);
++            glTexSubImage2D(GL_TEXTURE_2D,0,0,0,t->iw,t->ih,GL_RGB,GL_UNSIGNED_BYTE,t->rgb);
+             glPixelStorei(GL_UNPACK_ALIGNMENT,4);
+-            free(s_d16.rgb); s_d16.rgb=NULL;
+-            s_d16_valid=-1;
+-            fprintf(stderr,"ttk-texture: sample ready %ux%u -> %ux%u\n",s_d16.w,s_d16.h,s_d16.iw,s_d16.ih);
+-        } else fprintf(stderr,"ttk-texture: invalid/missing sample; original textures retained\n");
++            free(t->rgb); t->rgb=NULL;
++            s_d16_valid[i]=-1;
++            fprintf(stderr,"ttk-texture: HD slot=%u ready %ux%u -> %ux%u\n",i+1,t->w,t->h,t->iw,t->ih);
++        }
+     }
+     s_uTpage = p_glGetUniformLocation(s_tex_prog, "u_tpage");
+     s_uClut  = p_glGetUniformLocation(s_tex_prog, "u_clut");
+@@ -3611,13 +3627,14 @@
+ }
+ 
+ void gl_renderer_shutdown(void) {
+-    if(s_d16.source) fprintf(stderr,"ttk-texture: checks=%llu matched_triangles=%llu\n",(unsigned long long)s_d16_checks,(unsigned long long)s_d16_hits);
++    if(s_hd.count) fprintf(stderr,"ttk-texture: pack entries=%u checks=%llu matched_triangles=%llu\n",s_hd.count,(unsigned long long)s_d16_checks,(unsigned long long)s_d16_hits);
+     psx_rt_shutdown();   /* the render threads use contexts shared with this one */
+     if (s_ctx) {
+         ensure_cpu();
+         SDL_GL_DeleteContext(s_ctx); s_ctx = NULL;
+     }
+-    ttk_texture_sample_free(&s_d16); s_d16_tex=0; s_d16_valid=-1; s_tb_d16=0;
++    ttk_hd_pack_free(&s_hd); memset(s_d16_tex,0,sizeof(s_d16_tex));
++    memset(s_d16_valid,0,sizeof(s_d16_valid)); s_tb_d16=0;
+     free(s_conv); s_conv = NULL;
+     s_raster_ok = 0;
+     /* New context regenerates s_present_tex empty; a stale size makes
+@@ -3767,7 +3784,7 @@
+ 
+ static void rp_live_after_load(void);
+ void gl_renderer_restage_vram_after_savestate(void) {
+-    s_d16_valid=-1;
++    for(unsigned i=0;i<s_hd.count;i++) s_d16_valid[i]=-1;
+     psx_rt_drop();   /* the render thread's queued redraws belong to the old state */
+     rp_live_after_load();
+     if (!s_raster_ok || !s_vram) return;
+@@ -3853,26 +3870,24 @@
+  * fills/copies, state restoration and replay restoration. No guest VRAM edits. */
+ /* The 128 KiB readback buffer lives in this out-of-line check only: in the
+  * per-primitive caller its stack-clash probes touched 32 pages every call. */
+-static __attribute__((noinline)) void d16_validate(void) {
+-    {
+-        uint16_t words[256*256],palette[256];
+-        s_d16_checks++;
+-        int ok=gl_renderer_fbo_peek(s_d16.x,s_d16.y,s_d16.words_w,s_d16.h,words);
+-        if(ok&&s_d16.palette_n) ok=gl_renderer_fbo_peek(s_d16.cx,s_d16.cy,s_d16.palette_n,1,palette);
+-        s_d16_valid=ok&&ttk_texture_sample_equal(&s_d16,words,palette);
+-        if(ok && s_d16_checks<=4) {
+-            size_t i=0,n=s_d16.words_w*s_d16.h; while(i<n&&words[i]==s_d16.source[i])i++;
+-            unsigned j=0; while(j<s_d16.palette_n&&palette[j]==s_d16.palette[j])j++;
+-            fprintf(stderr,"ttk-texture: check=%llu match=%d source_equal=%d palette_equal=%d\n",(unsigned long long)s_d16_checks,s_d16_valid,i==n,j==s_d16.palette_n);
+-        }
+-    }
++static __attribute__((noinline)) void d16_validate(unsigned slot) {
++    const TtkTextureSample *t=&s_hd.sample[slot];
++    uint16_t words[256*256], palette[256];
++    s_d16_checks++;
++    int ok=gl_renderer_fbo_peek(t->x,t->y,t->words_w,t->h,words);
++    if(ok&&t->palette_n) ok=gl_renderer_fbo_peek(t->cx,t->cy,t->palette_n,1,palette);
++    s_d16_valid[slot]=ok && ttk_texture_sample_equal(t,words,palette);
+ }
+ static int d16_match(int bx,int by,int depth,int cx,int cy,int twin) {
+-    if(!s_d16.source||twin||depth!=(int)s_d16.depth||bx!=(int)s_d16.page_x||by!=(int)s_d16.page_y||
+-       (s_d16.palette_n&&(cx!=(int)s_d16.cx||cy!=(int)s_d16.cy))) return 0;
+-    if(s_d16_valid<0) d16_validate();
+-    if(s_d16_valid) s_d16_hits++;
+-    return s_d16_valid;
++    if(twin || depth > 2) return 0;
++    for(unsigned slot=0;slot<s_hd.count;slot++) {
++        const TtkTextureSample *t=&s_hd.sample[slot];
++        if(depth!=(int)t->depth || bx!=(int)t->page_x || by!=(int)t->page_y ||
++           (t->palette_n&&(cx!=(int)t->cx || cy!=(int)t->cy))) continue;
++        if(s_d16_valid[slot]<0) d16_validate(slot);
++        if(s_d16_valid[slot]) {s_d16_hits++;return (int)slot+1;}
++    }
++    return 0;
+ }
+ 
+ /* Diagnostic (debug server "gl_vram_diff"): full-VRAM comparison of the
+@@ -5160,7 +5175,7 @@
+  * renderer state synchronization, not a new guest frame. Undo only the
+  * synthetic clear request, preserving a genuine pending live-frame clear. */
+ void gl_replay_resume(void) {
+-    s_d16_valid=-1;
++    for(unsigned i=0;i<s_hd.count;i++) s_d16_valid[i]=-1;
+     s_hz_clear_pending=s_rr_st.hz_clear_pending;
+ }
+ 
+@@ -6515,7 +6530,7 @@
+     s_pack_dirty.x1 = s->pack_dirty[3]; s_pack_dirty.y1 = s->pack_dirty[4];
+     s_rp_path = s->rp_path; s_rp_w = s->rp_w; s_rp_h = s->rp_h; s_rp_base_x = s->rp_base_x;
+     s_rp_linear = s->rp_linear; s_rp_force_4_3 = s->rp_force_4_3;
+-    s_d16_valid = -1;
++    for(unsigned i=0;i<s_hd.count;i++) s_d16_valid[i] = -1;
+     sw_set_draw_offset(s_off_x, s_off_y);
+     return 1;
+ }
+diff --git a/runtime/src/ttk_texture_pack.h b/runtime/src/ttk_texture_pack.h
+new file mode 100644
+--- a/runtime/src/ttk_texture_pack.h
++++ b/runtime/src/ttk_texture_pack.h
+@@ -0,0 +1,71 @@
++/* Optional HD texture pack list for D16 exact-identity samples.
++ * TTKPACK1 (LF/CRLF) followed by 1..8 simple .ttktex filenames.
++ * No retail image bytes belong in Git. Invalid packs fail closed.
++ */
++#ifndef TTK_TEXTURE_PACK_H
++#define TTK_TEXTURE_PACK_H
++#include "ttk_texture_sample.h"
++#define TTK_HD_MAX 8
++
++typedef struct TtkHdPack {
++    TtkTextureSample sample[TTK_HD_MAX];
++    unsigned count;
++} TtkHdPack;
++
++static void ttk_hd_pack_free(TtkHdPack *pack) {
++    for (unsigned i = 0; i < pack->count; ++i)
++        ttk_texture_sample_free(&pack->sample[i]);
++    memset(pack, 0, sizeof(*pack));
++}
++
++static int ttk_hd_valid_filename(const char *name) {
++    size_t n = strlen(name);
++    if (n < 7 || n > 120 || name[0] == '.' || strcmp(name+n-7, ".ttktex")) return 0;
++    for (size_t i = 0; i < n; i++) {
++        char c = name[i];
++        if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
++              (c >= '0' && c <= '9') || c == '_' || c == '-' || c == '.')) return 0;
++    }
++    return 1;
++}
++
++static int ttk_hd_pack_load(const char *manifest, TtkHdPack *out) {
++    TtkHdPack temp = {0};
++    char line[256], folder[1024], path[1280];
++    int ok = 0;
++    FILE *f = fopen(manifest, "rb");
++    if (!f) return 0;
++    const char *last1 = strrchr(manifest, '/'), *last2 = strrchr(manifest, '\\');
++    const char *slash = !last1 ? last2 : !last2 ? last1 : (last1 > last2 ? last1 : last2);
++    size_t prefix = slash ? (size_t)(slash - manifest + 1) : 0;
++    if (prefix >= sizeof(folder)) goto done;
++    memcpy(folder, manifest, prefix); folder[prefix] = 0;
++    if (!fgets(line, sizeof(line), f) || (strcmp(line, "TTKPACK1\n") && strcmp(line, "TTKPACK1\r\n"))) goto done;
++    while (fgets(line, sizeof(line), f)) {
++        size_t n = strlen(line);
++        if (n && line[n-1] == '\n') line[--n] = 0;
++        else if (!feof(f)) goto done; /* refuse truncated overlong line */
++        if (n && line[n-1] == '\r') line[--n] = 0;
++        if (!ttk_hd_valid_filename(line) || temp.count >= TTK_HD_MAX) goto done;
++        if (snprintf(path, sizeof(path), "%s%s", folder, line) >= (int)sizeof(path)) goto done;
++        if (!ttk_texture_sample_load(path, &temp.sample[temp.count])) goto done;
++        const TtkTextureSample *cur = &temp.sample[temp.count];
++        for (unsigned i = 0; i < temp.count; ++i) {
++            const TtkTextureSample *prev = &temp.sample[i];
++            if (prev->depth == cur->depth && prev->page_x == cur->page_x &&
++                prev->page_y == cur->page_y && prev->cx == cur->cx && prev->cy == cur->cy) {
++                ttk_texture_sample_free(&temp.sample[temp.count]); goto done;
++            }
++        }
++        ++temp.count;
++    }
++    if (ferror(f) || !temp.count) goto done;
++    *out = temp;
++    memset(&temp, 0, sizeof(temp));
++    ok = 1;
++done:
++    fclose(f);
++    ttk_hd_pack_free(&temp);
++    return ok;
++}
++#endif
