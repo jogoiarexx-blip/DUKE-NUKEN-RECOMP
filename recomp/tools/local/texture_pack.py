@@ -24,7 +24,7 @@ def compile_pack(spec_path, output_dir):
     if output_dir.exists():
         raise ValueError('output directory already exists; refusing to overwrite')
     prepared = []
-    ids, locators = set(), set()
+    ids, locators = set(), []
     for item in entries:
         if not isinstance(item,dict) or set(item) != {'id','capture','image'}:
             raise ValueError('each entry needs id, capture and image')
@@ -49,9 +49,14 @@ def compile_pack(spec_path, output_dir):
         if digest != meta['source_sha256']:
             raise ValueError('source fingerprint mismatch')
         locator = tuple(meta[k] for k in ('depth','page_x','page_y','cx','cy'))
-        if locator in locators:
-            raise ValueError('same texture page/CLUT appears twice; split into separate packs')
-        locators.add(locator)
+        rect = (meta['u'], meta['v'], meta['u']+meta['w'], meta['v']+meta['h'])
+        for previous_locator, previous_rect in locators:
+            if locator == previous_locator and (
+                rect[0] < previous_rect[2] and previous_rect[0] < rect[2] and
+                rect[1] < previous_rect[3] and previous_rect[1] < rect[3]
+            ):
+                raise ValueError('overlapping UV regions on the same texture page/CLUT')
+        locators.append((locator, rect))
         from PIL import Image
         with Image.open(image) as picture:
             if 'A' in picture.getbands() and picture.getchannel('A').getextrema() != (255,255):

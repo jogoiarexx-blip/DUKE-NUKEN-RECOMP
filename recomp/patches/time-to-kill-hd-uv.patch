@@ -1,0 +1,93 @@
+diff --git a/runtime/src/gpu_gl_renderer.c b/runtime/src/gpu_gl_renderer.c
+--- a/runtime/src/gpu_gl_renderer.c
++++ b/runtime/src/gpu_gl_renderer.c
+@@ -440,6 +440,7 @@
+ static void d16_invalidate(int x0,int y0,int x1,int y1) {
+     for(unsigned i=0;i<s_hd.count;i++)
+         if(ttk_texture_sample_intersects(&s_hd.sample[i],x0,y0,x1,y1)) s_d16_valid[i]=-1;
+ }
+-static int d16_match(int bx,int by,int depth,int cx,int cy,int twin);
++static int d16_match(int bx,int by,int depth,int cx,int cy,int twin,
++                     const int *us, const int *vs);
+ static void d16_validate(unsigned i);
+@@ -2611,3 +2612,3 @@
+     if (texpage != 0x8000 && !foreign) flush_pack_if_sampling(base_x, base_y, depth, clut_x, clut_y);  /* flushes batch iff it must pack */
+-    int d16 = d16_match(base_x,base_y,depth,clut_x,clut_y,s_tw_mask_x|s_tw_mask_y);
++    int d16 = d16_match(base_x,base_y,depth,clut_x,clut_y,s_tw_mask_x|s_tw_mask_y,us,vs);
+     mark_prim_dirty(xs, ys, 3, 1 /* textured */);
+@@ -3877,15 +3878,32 @@
+     s_d16_valid[slot]=ok && ttk_texture_sample_equal(t,words,palette);
+ }
+-static int d16_match(int bx,int by,int depth,int cx,int cy,int twin) {
+-    if(twin || depth > 2) return 0;
+-    for(unsigned slot=0;slot<s_hd.count;slot++) {
+-        const TtkTextureSample *t=&s_hd.sample[slot];
+-        if(depth!=(int)t->depth || bx!=(int)t->page_x || by!=(int)t->page_y ||
+-           (t->palette_n&&(cx!=(int)t->cx || cy!=(int)t->cy))) continue;
+-        if(s_d16_valid[slot]<0) d16_validate(slot);
+-        if(s_d16_valid[slot]) {s_d16_hits++;return (int)slot+1;}
+-    }
+-    return 0;
+-}
++static int d16_match(int bx,int by,int depth,int cx,int cy,int twin,
++                     const int *us, const int *vs) {
++    if(twin || depth > 2) return 0;
++    /* Require every vertex to lie within one non-wrapping UV rectangle.
++     * Border-crossing triangles keep PS1 sampling rather than choosing a
++     * neighbouring HD slot for the whole draw. Shader still clips per texel. */
++    float lo_u = s_puv_valid ? s_puv_u[0] : (float)us[0];
++    float hi_u = lo_u;
++    float lo_v = s_puv_valid ? s_puv_v[0] : (float)vs[0];
++    float hi_v = lo_v;
++    for(int i=1;i<3;i++) {
++        float u=s_puv_valid ? s_puv_u[i] : (float)us[i];
++        float v=s_puv_valid ? s_puv_v[i] : (float)vs[i];
++        if(u<lo_u) lo_u=u;
++        if(u>hi_u) hi_u=u;
++        if(v<lo_v) lo_v=v;
++        if(v>hi_v) hi_v=v;
++    }
++    for(unsigned slot=0;slot<s_hd.count;slot++) {
++        const TtkTextureSample *t=&s_hd.sample[slot];
++        if(depth!=(int)t->depth || bx!=(int)t->page_x || by!=(int)t->page_y ||
++           (t->palette_n&&(cx!=(int)t->cx || cy!=(int)t->cy))) continue;
++        if(!ttk_hd_uv_contains(t,lo_u,lo_v,hi_u,hi_v)) continue;
++        if(s_d16_valid[slot]<0) d16_validate(slot);
++        if(s_d16_valid[slot]) {s_d16_hits++;return (int)slot+1;}
++    }
++    return 0;
++}
+  
+ /* Diagnostic (debug server "gl_vram_diff"): full-VRAM comparison of the
+diff --git a/runtime/src/ttk_texture_pack.h b/runtime/src/ttk_texture_pack.h
+--- a/runtime/src/ttk_texture_pack.h
++++ b/runtime/src/ttk_texture_pack.h
+@@ -24,5 +24,18 @@
+     return 1;
+ }
+ 
+-static int ttk_hd_pack_load(const char *manifest, TtkHdPack *out) {
++static int ttk_hd_uv_contains(const TtkTextureSample *t,
++                              float lo_u, float lo_v, float hi_u, float hi_v) {
++    return lo_u >= (float)t->u && lo_v >= (float)t->v &&
++           hi_u <= (float)(t->u+t->w) && hi_v <= (float)(t->v+t->h);
++}
++
++static int ttk_hd_regions_overlap(const TtkTextureSample *a,
++                                  const TtkTextureSample *b) {
++    if(a->depth!=b->depth || a->page_x!=b->page_x || a->page_y!=b->page_y ||
++       a->cx!=b->cx || a->cy!=b->cy) return 0;
++    return a->u<b->u+b->w && b->u<a->u+a->w &&
++           a->v<b->v+b->h && b->v<a->v+a->h;
++}
++static int ttk_hd_pack_load(const char *manifest, TtkHdPack *out) {
+     TtkHdPack temp = {0};
+@@ -50,7 +65,6 @@
+         const TtkTextureSample *cur = &temp.sample[temp.count];
+         for (unsigned i = 0; i < temp.count; ++i) {
+             const TtkTextureSample *prev = &temp.sample[i];
+-            if (prev->depth == cur->depth && prev->page_x == cur->page_x &&
+-                prev->page_y == cur->page_y && prev->cx == cur->cx && prev->cy == cur->cy) {
++            if (ttk_hd_regions_overlap(prev,cur)) {
+                 ttk_texture_sample_free(&temp.sample[temp.count]); goto done;
+             }
