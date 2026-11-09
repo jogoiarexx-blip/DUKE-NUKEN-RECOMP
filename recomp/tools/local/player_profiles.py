@@ -164,6 +164,33 @@ DEFAULT_PROFILE = {'presentation': DEFAULT_PRESENTATION, 'bindings': pc_input.DE
 # Modernized renders at four times the original resolution (user choice after
 # the D13 playtest: 60 fps on a GTX 1080 Ti); Vanilla keeps the original.
 MODE_PRESENTATION = {'vanilla': {}, 'modernized': {'internal_scale': 4}}
+
+# Graphics-only presets. These combine already implemented presentation paths.
+# They do not add new HD retail art, edit gameplay or change Vanilla.
+GRAPHICS_PRESETS = ('original', 'balanced', 'remastered')
+GRAPHICS_PRESET_VALUES = {
+    'original': {
+        'presentation': {'renderer': 'opengl', 'internal_scale': 1, 'output_filter': 'nearest'},
+        'controls': {'widescreen': 'off', 'frame_rate': '60',
+                     'geometry_precision': 'original', 'texture_precision': 'original',
+                     'world_renderer': 'classic', 'draw_distance': 'original',
+                     'dynamic_lights': 'off'},
+    },
+    'balanced': {
+        'presentation': {'renderer': 'opengl', 'internal_scale': 2, 'output_filter': 'nearest'},
+        'controls': {'widescreen': '16:9', 'frame_rate': '60',
+                     'geometry_precision': 'corrected', 'texture_precision': 'corrected',
+                     'world_renderer': 'polymorph', 'draw_distance': 'extended',
+                     'dynamic_lights': 'on'},
+    },
+    'remastered': {
+        'presentation': {'renderer': 'opengl', 'internal_scale': 4, 'output_filter': 'linear'},
+        'controls': {'widescreen': '16:9', 'frame_rate': 'auto',
+                     'geometry_precision': 'corrected', 'texture_precision': 'corrected',
+                     'world_renderer': 'polymorph', 'draw_distance': 'extended',
+                     'dynamic_lights': 'on'},
+    },
+}
 PREVIEW = ('Modernized first-map preview: captured WASD is camera-relative; mouse orbits the '
            'third-person camera. Unavailable hooks never switch the selected control scheme. '
            'View aiming covers supported weapons, with AUTO AIM HITSCAN for the Desert Eagle, Combat Shotgun, Buffalo Rifle and Gatling; others retain original aiming. Gameplay captures automatically on first entry; Escape pauses and frees the mouse; resume captures automatically. OPTIONS > CONTROLS selects Modern or Legacy; F10 has no action.')
@@ -237,6 +264,17 @@ def validate_presentation(value):
                          'fullscreen mode borderless/exclusive; '
                          'window width 0 (fit the display) or 640..7680; output filter linear/nearest.')
     return dict(value)
+
+
+def apply_graphics_preset(profile, name):
+    """Atomically validate and apply graphics settings, preserving all nonvisual options."""
+    if name not in GRAPHICS_PRESETS:
+        raise ValueError('graphics preset must be original, balanced or remastered')
+    spec = GRAPHICS_PRESET_VALUES[name]
+    presentation = validate_presentation({**profile['presentation'], **spec['presentation']})
+    controls = validate_controls({**profile['controls'], **spec['controls']})
+    profile['presentation'] = presentation
+    profile['controls'] = controls
 
 
 def default_profile(mode):

@@ -18,6 +18,7 @@ def main(argv=None):
     p.add_argument('--diagnostics', action='store_true', help='retain dispatch and stopped guest diagnostics')
     p.add_argument('--debug-port', type=int, default=9123)
     p.add_argument('--renderer', choices=profiles.RENDERERS, help='save renderer for the selected profile')
+    p.add_argument('--graphics-preset', choices=profiles.GRAPHICS_PRESETS, help='save Modernized visual settings: original (1x), balanced (2x), remastered (4x); not an HD texture pack')
     p.add_argument('--internal-scale', type=int, choices=profiles.INTERNAL_SCALES, help='save internal 3D resolution for the selected profile: 1 original, 2..4 times')
     p.add_argument('--display', choices=profiles.DISPLAYS, help='save how the selected profile opens; a fullscreen choice is also the F11 target')
     p.add_argument('--window-width', type=int, metavar='0|640..7680', help='save window width for the selected profile; 0 fits the display')
@@ -100,6 +101,12 @@ def main(argv=None):
             settings['active'] = 'vanilla'
         if a.reset_profile:
             profiles.reset(settings, a.reset_profile)
+            changed = True
+        # Apply visual presets first; explicit flags can override each setting.
+        if a.graphics_preset is not None:
+            if settings['active'] != 'modernized':
+                raise ValueError('--graphics-preset edits Modernized only; remove --vanilla.')
+            profiles.apply_graphics_preset(settings['profiles']['modernized'], a.graphics_preset)
             changed = True
         if a.renderer or a.internal_scale is not None or a.display or a.window_width is not None or a.output_filter:
             presentation = dict(settings['profiles'][settings['active']]['presentation'])
