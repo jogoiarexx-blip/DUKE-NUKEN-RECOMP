@@ -1,0 +1,38 @@
+{
+  "schema": 1,
+  "asset_id": "duke-db00-pilot",
+  "target": {
+    "group": "DB00",
+    "hierarchy": 1,
+    "joints": 19
+  },
+  "model": {
+    "file": "duke-pilot.glb",
+    "sha256": "50dfc2b017b83ff827398098784e2647f8c94a7826a312f56e06a0b9c8ef2d76",
+    "max_triangles": 12000
+  },
+  "rig": {
+    "mode": "rigid-parts",
+    "parts": {
+      "0": "part_00_pelvis",
+      "9": "part_09_chest",
+      "10": "part_10_left_shoulder",
+      "11": "part_11_left_forearm",
+      "12": "part_12_left_hand",
+      "13": "part_13_right_shoulder",
+      "14": "part_14_right_forearm",
+      "15": "part_15_right_hand",
+      "20": "part_20_jetpack_mount",
+      "16": "part_16_head",
+      "1": "part_01_leg_a_1",
+      "2": "part_02_leg_a_2",
+      "3": "part_03_leg_a_3",
+      "4": "part_04_leg_a_4",
+      "5": "part_05_leg_b_1",
+      "6": "part_06_leg_b_2",
+      "7": "part_07_leg_b_3",
+      "8": "part_08_leg_b_4",
+      "21": "part_21_leg_attachment"
+    }
+  }
+}
