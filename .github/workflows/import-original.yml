@@ -1,0 +1,48 @@
+name: Importar arquivos restantes da recompilacao
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/import-original.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  importar:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout do repositorio de destino
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          persist-credentials: true
+
+      - name: Buscar fonte original em revisao verificada
+        shell: bash
+        run: |
+          set -euo pipefail
+          git remote add origem https://github.com/MusicMonsterMod/duke-nukem-time-to-kill-recomp.git
+          git fetch --depth=1 origem d3af175ee20d3b6fc4324836c0615bf31edea551
+          git checkout FETCH_HEAD -- .
+          test -f recomp/src/ttk/game_menu.cpp
+          test -f recomp/tools/local/build.py
+          test -f documentation/00-status.md
+          test -f .gitmodules
+          test -f index.html
+
+      - name: Publicar somente arquivos do codigo-fonte
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "Arquivos ja sincronizados; nada a publicar."
+          else
+            git commit -m "Importar arquivos ausentes do port nativo (revisao fixada)"
+            git push origin HEAD:main
+          fi
