@@ -92,7 +92,7 @@ def make_geometry():
         box(d,"sole",(0,-.125,.14),(.43,.065,.70))
     # Nodes 20 and 21 remain empty attachment joints.
 
-def glb():
+def glb(assembled=False):
     buf=bytearray();views=[];accessors=[];meshes=[];nodes=[]
     colors=list(COLORS);count=0
     def append(data):
@@ -113,9 +113,12 @@ def glb():
                    u[2]*v[0]-u[0]*v[2],u[0]*v[1]-u[1]*v[0])
                 length=math.sqrt(sum(t*t for t in n)) or 1.0
                 for p in (a,b,c):
-                    xyz.extend(struct.pack("<3f",*p))
+                    # Review-only assembled GLB bakes approximate T-pose offsets
+                    # into positions; the true rig asset keeps local-pivot data.
+                    point=tuple(p[k]+POSE[part][k] for k in range(3)) if assembled else p
+                    xyz.extend(struct.pack("<3f",*point))
                     normals.extend(struct.pack("<3f",*(t/length for t in n)))
-                    for k in range(3):lo[k]=min(lo[k],p[k]);hi[k]=max(hi[k],p[k])
+                    for k in range(3):lo[k]=min(lo[k],point[k]);hi[k]=max(hi[k],point[k])
             pos=append(xyz);normal=append(normals);first=len(accessors)
             accessors.extend([
                 {"bufferView":pos,"componentType":5126,"count":3*len(faces),
@@ -153,7 +156,7 @@ def preview(output):
         draw.rounded_rectangle((x0+10,12,x0+490,628),radius=14,
                                fill=(37,43,53),outline=(79,92,102),width=2)
         draw.text((x0+30,30),label,fill=(235,237,239))
-        screen=[];cx=x0+250;cy=306;scale=217
+        screen=[];cx=x0+250;cy=332;scale=135
         for part,groups in parts.items():
             offset=POSE[part]
             for color,faces in groups.items():
@@ -182,6 +185,8 @@ def build(out):
     make_geometry()
     binary,count=glb()
     (out/"duke-pilot.glb").write_bytes(binary)
+    assembled,_=glb(assembled=True)
+    (out/"duke-pilot-assembled-preview.glb").write_bytes(assembled)
     manifest={"schema":1,"asset_id":"duke-db00-pilot",
       "target":{"group":"DB00","hierarchy":1,"joints":19},
       "model":{"file":"duke-pilot.glb",
@@ -197,7 +202,8 @@ def build(out):
         **report,"original_geometry":True,
         "uses_retail_assets":False,
         "game_hie_pivots_calibrated":False,
-        "runtime_override_active":False
+        "runtime_override_active":False,
+        "assembled_preview_only":"duke-pilot-assembled-preview.glb"
     },indent=2)+"\n")
     return report
 
